@@ -1,0 +1,21 @@
+[workspace]
+members = [
+  # generic utilities
+  "bounded-utils",
+  "hugepage-buffer",
+  "lsb-bitwriter",
+  "safe-arch",
+  "safe-arch-macro",
+  # brotli-specific
+  "lib",
+  "bin",
+  "clib",
+]
+resolver = "2"
+
+[profile.release]
+debug = true
+
+[workspace.lints.clippy]
+missing_safety_doc = "deny"
+undocumented_unsafe_blocks = "deny"

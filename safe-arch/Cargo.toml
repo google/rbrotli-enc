@@ -1,0 +1,18 @@
+[package]
+name = "safe-arch"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+paste = "1.0.14"
+safe-arch-macro = { path = "../safe-arch-macro" }
+zerocopy = "0.7.32"
+bounded-utils = { path = "../bounded-utils" }
+
+[features]
+nightly = ["safe-arch-macro/nightly"]
+
+[lints]
+workspace = true
