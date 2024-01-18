@@ -1,0 +1,6 @@
+[workspace]
+members = ["lib", "hugepage-slice", "bin"]
+resolver = "2"
+
+[profile.release]
+debug = true
