@@ -104,6 +104,23 @@ fn longest_match(data: &[u8], pos1: u32, pos2: usize) -> usize {
     max
 }
 
+fn gain_from_len_and_dist(len: u32, dist: u32) -> i32 {
+    LEN_MULT * len as i32 - (dist.checked_ilog2().unwrap_or(0) << DIST_SHIFT) as i32 - GAIN_OFF
+}
+
+#[inline]
+#[target_feature(enable = "avx,avx2")]
+#[safe_arch]
+fn gain_from_len_and_dist_simd(len: __m256i, dist: __m256i) -> __m256i {
+    _mm256_sub_epi32(
+        _mm256_mullo_epi32(len, _mm256_set1_epi32(LEN_MULT)),
+        _mm256_add_epi32(
+            _mm256_slli_epi32::<DIST_SHIFT>(_mm256_ilog2_epi32(dist)),
+            _mm256_set1_epi32(GAIN_OFF),
+        ),
+    )
+}
+
 #[inline]
 #[target_feature(enable = "avx,avx2")]
 #[safe_arch]
@@ -121,7 +138,7 @@ fn update_with_long_matches<const ENTRY_SIZE: usize>(
         len12p_mask &= len12p_mask - 1;
         let len = longest_match(data, table.pos[p], pos) as u32;
         let dist = pos as u32 - table.pos[p];
-        let gain = LEN_MULT * len as i32 - (dist.ilog2() << DIST_SHIFT) as i32 - GAIN_OFF;
+        let gain = gain_from_len_and_dist(len, dist);
         if gain > g {
             (d, l, g) = (dist, len, gain);
         }
@@ -201,13 +218,7 @@ fn table_search<const ENTRY_SIZE: usize, const ENTRY_SIZE_MINUS_SEVEN: usize>(
         let len_is_12 = _mm256_movemask_ps(_mm256_castsi256_ps(len_is_12_v)) as u32;
         len12p_mask |= (len_is_12 as u64) << i.get();
 
-        let gain = _mm256_sub_epi32(
-            _mm256_mullo_epi32(len, _mm256_set1_epi32(LEN_MULT)),
-            _mm256_add_epi32(
-                _mm256_slli_epi32::<DIST_SHIFT>(_mm256_ilog2_epi32(dist)),
-                _mm256_set1_epi32(GAIN_OFF),
-            ),
-        );
+        let gain = gain_from_len_and_dist_simd(len, dist);
 
         let better_gain = _mm256_cmpgt_epi32(gain, best_gain);
         best_gain = _mm256_max_epi32(gain, best_gain);
@@ -215,14 +226,21 @@ fn table_search<const ENTRY_SIZE: usize, const ENTRY_SIZE_MINUS_SEVEN: usize>(
         best_distance = _mm256_blendv_epi8(best_distance, dist, better_gain);
     }
 
-    let max = _mm256_max_epi32(best_gain, _mm256_shuffle_epi32::<0b10110001>(best_gain));
+    // best_gain fits in 24 bits at most (with a good margin), so we can stuff in its lowest byte
+    // the index of the element.
+
+    let best_gain_and_index = _mm256_or_si256(
+        _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7),
+        _mm256_slli_epi32::<8>(best_gain),
+    );
+
+    let max = _mm256_max_epi32(
+        best_gain_and_index,
+        _mm256_shuffle_epi32::<0b10110001>(best_gain_and_index),
+    );
     let max = _mm256_max_epi32(max, _mm256_shuffle_epi32::<0b01001110>(max));
     let max = _mm256_max_epi32(max, _mm256_permute4x64_epi64::<0b01001110>(max));
-    let not_max = _mm256_cmpgt_epi32(max, best_gain);
-    let max_pos = _mm256_or_si256(not_max, _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
-    let max_pos = _mm256_max_epi32(max_pos, _mm256_shuffle_epi32::<0b10110001>(max_pos));
-    let max_pos = _mm256_max_epi32(max_pos, _mm256_shuffle_epi32::<0b01001110>(max_pos));
-    let max_pos = _mm256_max_epi32(max_pos, _mm256_permute4x64_epi64::<0b01001110>(max_pos));
+    let max_pos = _mm256_and_si256(max, _mm256_set1_epi32(0xff));
     let d = _mm256_extract_epi32::<0>(_mm256_permutevar8x32_epi32(best_distance, max_pos)) as u32;
     let l = _mm256_extract_epi32::<0>(_mm256_permutevar8x32_epi32(best_len, max_pos)) as u32;
     let g = _mm256_extract_epi32::<0>(_mm256_permutevar8x32_epi32(best_gain, max_pos));
@@ -730,7 +748,10 @@ impl<
 
 #[cfg(test)]
 mod test {
-    use super::{_mm256_ilog2_epi32, compute_context, CONTEXT_LUT0, CONTEXT_LUT1, PRECOMPUTE_SIZE};
+    use super::{
+        _mm256_ilog2_epi32, compute_context, gain_from_len_and_dist, gain_from_len_and_dist_simd,
+        CONTEXT_LUT0, CONTEXT_LUT1, PRECOMPUTE_SIZE,
+    };
     use crate::constants::*;
     use bounded_utils::{BoundedSlice, BoundedU8};
     use safe_arch::{
@@ -745,6 +766,20 @@ mod test {
             let simd =
                 _mm256_extract_epi32::<0>(_mm256_ilog2_epi32(_mm256_set1_epi32(i as i32))) as u32;
             assert_eq!(simd, i.ilog2());
+        }
+    }
+
+    #[test]
+    #[safe_arch_entrypoint("avx", "avx2")]
+    fn test_gain() {
+        for dist in 1..1024 {
+            for len in 4..2048 {
+                let vdist = _mm256_set1_epi32(dist as i32);
+                let vlen = _mm256_set1_epi32(len as i32);
+                let vgain = gain_from_len_and_dist_simd(vlen, vdist);
+                let gain = gain_from_len_and_dist(len, dist);
+                assert_eq!(_mm256_extract_epi32::<0>(vgain), gain);
+            }
         }
     }
 
