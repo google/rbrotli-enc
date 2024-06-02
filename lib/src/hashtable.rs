@@ -472,7 +472,7 @@ impl<
         count: usize,
         metablock_data: &mut MetablockData,
     ) -> usize {
-        let end_upper_bound = data.len() - INTERIOR_MARGIN - CONTEXT_OFFSET + 1;
+        let end_upper_bound = data.len() - INTERIOR_MARGIN + 1;
         let end = end_upper_bound.min(count + start);
         const LAZY_SENTINEL: u32 = 0xFFFFFFFF;
 
