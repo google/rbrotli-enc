@@ -52,7 +52,7 @@ pub struct MetablockData {
     num_syms: BoundedUsize<SYMBOL_BUF_LIMIT>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct LiteralHistogram {
     data: [u32; MAX_LIT],
     total: u32,
@@ -583,7 +583,12 @@ impl MetablockData {
             lh.total = lh.data.iter().copied().sum::<u32>();
         }
 
-        let (clusters, cmap) = cluster_histograms(lit_hist);
+        let (mut clusters, cmap) = cluster_histograms(lit_hist);
+        if clusters.len() == 1 {
+            if clusters[0].data.iter().sum::<u32>() == 0 {
+                clusters[0].data[0] += 1;
+            }
+        }
 
         assert!(self.total_icd <= ICD_BUF_SIZE as u32 + 16);
 
