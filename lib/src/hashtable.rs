@@ -20,12 +20,14 @@ use bounded_utils::{
 use hugepage_buffer::BoxedHugePageArray;
 use safe_arch::{safe_arch, x86_64::*};
 
-const LOG_TABLE_SIZE: u32 = 16;
+const LOG_TABLE_SIZE: usize = 16;
 const PREFETCH_OFFSET: usize = 4;
 const LEN_MULT: i32 = 129;
 const GAIN_OFF: i32 = 177;
 const DIST_SHIFT: i32 = 5;
 const GAIN_FOR_LAZY: i32 = 77;
+const LD_MAXDIFF: i32 = 3;
+const LD_OFF: i32 = 150;
 
 const INTERIOR_MARGIN: usize = 32;
 const CONTEXT_OFFSET: usize = 2;
@@ -104,19 +106,57 @@ fn longest_match(data: &[u8], pos1: u32, pos2: usize) -> usize {
     max
 }
 
-fn gain_from_len_and_dist(len: u32, dist: u32) -> i32 {
-    LEN_MULT * len as i32 - (dist.checked_ilog2().unwrap_or(0) << DIST_SHIFT) as i32 - GAIN_OFF
+#[inline]
+fn gain_from_len_and_dist<const USE_LAST_DISTANCES: bool>(
+    len: u32,
+    dist: u32,
+    last_distances: [u32; 2],
+) -> i32 {
+    let distance_penalty = (dist.checked_ilog2().unwrap_or(0) << DIST_SHIFT) as i32 + GAIN_OFF;
+    LEN_MULT * len as i32
+        - if USE_LAST_DISTANCES
+            && last_distances
+                .into_iter()
+                .any(|ld| (ld as i32 - dist as i32).abs() < LD_MAXDIFF)
+        {
+            LD_OFF
+        } else {
+            distance_penalty
+        }
 }
 
 #[inline]
 #[target_feature(enable = "avx,avx2")]
 #[safe_arch]
-fn gain_from_len_and_dist_simd(len: __m256i, dist: __m256i) -> __m256i {
+fn gain_from_len_and_dist_simd<const USE_LAST_DISTANCES: bool>(
+    len: __m256i,
+    dist: __m256i,
+    ld0: __m256i,
+    ld1: __m256i,
+) -> __m256i {
+    let distance_penalty = _mm256_add_epi32(
+        _mm256_slli_epi32::<DIST_SHIFT>(_mm256_ilog2_epi32(dist)),
+        _mm256_set1_epi32(GAIN_OFF),
+    );
+
+    let is_last_distance = if USE_LAST_DISTANCES {
+        _mm256_cmpgt_epi32(
+            _mm256_set1_epi32(LD_MAXDIFF),
+            _mm256_min_epi32(
+                _mm256_abs_epi32(_mm256_sub_epi32(dist, ld0)),
+                _mm256_abs_epi32(_mm256_sub_epi32(dist, ld1)),
+            ),
+        )
+    } else {
+        _mm256_setzero_si256()
+    };
+
     _mm256_sub_epi32(
         _mm256_mullo_epi32(len, _mm256_set1_epi32(LEN_MULT)),
-        _mm256_add_epi32(
-            _mm256_slli_epi32::<DIST_SHIFT>(_mm256_ilog2_epi32(dist)),
-            _mm256_set1_epi32(GAIN_OFF),
+        _mm256_blendv_epi8(
+            distance_penalty,
+            _mm256_set1_epi32(LD_OFF),
+            is_last_distance,
         ),
     )
 }
@@ -124,10 +164,11 @@ fn gain_from_len_and_dist_simd(len: __m256i, dist: __m256i) -> __m256i {
 #[inline]
 #[target_feature(enable = "avx,avx2")]
 #[safe_arch]
-fn update_with_long_matches<const ENTRY_SIZE: usize>(
+fn update_with_long_matches<const ENTRY_SIZE: usize, const USE_LAST_DISTANCES: bool>(
     data: &[u8],
     pos: usize,
     table: &mut HashTableEntry<ENTRY_SIZE>,
+    last_distances: [u32; 2],
     mut len12p_mask: u64,
     mut d: u32,
     mut l: u32,
@@ -138,7 +179,7 @@ fn update_with_long_matches<const ENTRY_SIZE: usize>(
         len12p_mask &= len12p_mask - 1;
         let len = longest_match(data, table.pos[p], pos) as u32;
         let dist = pos as u32 - table.pos[p];
-        let gain = gain_from_len_and_dist(len, dist);
+        let gain = gain_from_len_and_dist::<USE_LAST_DISTANCES>(len, dist, last_distances);
         if gain > g {
             (d, l, g) = (dist, len, gain);
         }
@@ -165,12 +206,17 @@ fn _mm256_ilog2_epi32(x: __m256i) -> __m256i {
 #[inline]
 #[target_feature(enable = "avx,avx2")]
 #[safe_arch]
-fn table_search<const ENTRY_SIZE: usize, const ENTRY_SIZE_MINUS_SEVEN: usize>(
+fn table_search<
+    const ENTRY_SIZE: usize,
+    const ENTRY_SIZE_MINUS_SEVEN: usize,
+    const USE_LAST_DISTANCES: bool,
+>(
     pos: usize,
     chunk1: u32,
     chunk2: u32,
     chunk3: u32,
     table: &mut HashTableEntry<ENTRY_SIZE>,
+    last_distances: [u32; 2],
 ) -> (u32, u32, i32, u64) {
     let mut best_distance = _mm256_setzero_si256();
     let mut best_len = _mm256_setzero_si256();
@@ -180,6 +226,9 @@ fn table_search<const ENTRY_SIZE: usize, const ENTRY_SIZE_MINUS_SEVEN: usize>(
     let vchunk1 = _mm256_set1_epi32(chunk1 as i32);
     let vchunk2 = _mm256_set1_epi32(chunk2 as i32);
     let vchunk3 = _mm256_set1_epi32(chunk3 as i32);
+
+    let ld0 = _mm256_set1_epi32(last_distances[0] as i32);
+    let ld1 = _mm256_set1_epi32(last_distances[1] as i32);
 
     let mut len12p_mask = 0u64;
 
@@ -218,7 +267,7 @@ fn table_search<const ENTRY_SIZE: usize, const ENTRY_SIZE_MINUS_SEVEN: usize>(
         let len_is_12 = _mm256_movemask_ps(_mm256_castsi256_ps(len_is_12_v)) as u32;
         len12p_mask |= (len_is_12 as u64) << i.get();
 
-        let gain = gain_from_len_and_dist_simd(len, dist);
+        let gain = gain_from_len_and_dist_simd::<USE_LAST_DISTANCES>(len, dist, ld0, ld1);
 
         let better_gain = _mm256_cmpgt_epi32(gain, best_gain);
         best_gain = _mm256_max_epi32(gain, best_gain);
@@ -394,6 +443,8 @@ fn compute_hash_at(
     }
 }
 
+const TABLE_SIZE: usize = 1 << LOG_TABLE_SIZE;
+
 #[inline]
 #[target_feature(enable = "sse2,ssse3,sse4.1,avx,avx2")]
 #[safe_arch]
@@ -408,8 +459,6 @@ fn compute_hash_and_context_at(
     );
     compute_context(data_slice, context);
 }
-
-const TABLE_SIZE: usize = 1 << LOG_TABLE_SIZE;
 
 pub struct HashTable<
     const ENTRY_SIZE: usize,
@@ -426,7 +475,7 @@ impl<
         const ENTRY_SIZE_MINUS_SEVEN: usize,
     > HashTable<ENTRY_SIZE, ENTRY_SIZE_PLUS_ONE, ENTRY_SIZE_MINUS_SEVEN>
 {
-    pub fn new() -> HashTable<ENTRY_SIZE, ENTRY_SIZE_PLUS_ONE, ENTRY_SIZE_MINUS_SEVEN> {
+    pub fn new() -> Self {
         HashTable {
             table: BoxedHugePageArray::new(HashTableEntry {
                 pos: [0x80000000; ENTRY_SIZE],
@@ -465,7 +514,7 @@ impl<
     #[target_feature(enable = "sse,sse2,ssse3,sse4.1,avx,avx2,bmi1,bmi2")]
     #[safe_arch]
     #[inline(never)]
-    fn parse_and_emit_interior(
+    fn parse_and_emit_interior<const MIN_GAIN_FOR_GREEDY: i32, const USE_LAST_DISTANCES: bool>(
         &mut self,
         data: &[u8],
         start: usize,
@@ -474,17 +523,20 @@ impl<
     ) -> usize {
         let end_upper_bound = data.len() - INTERIOR_MARGIN + 1;
         let end = end_upper_bound.min(count + start);
-        const LAZY_SENTINEL: u32 = 0xFFFFFFFF;
 
         let mut context = [BoundedU8::constant::<0>(); PRECOMPUTE_SIZE];
         let mut hashes = [BoundedU32::constant::<0>(); PRECOMPUTE_SIZE];
 
+        let zero_ctx = BoundedU8::constant::<0>();
+
         let mut last_dist = 0;
         let mut last_len = 0;
         let mut last_gain = 0;
-        let zero_ctx = BoundedU8::constant::<0>();
         let mut last_ctx = zero_ctx;
         let mut last_lit = 0;
+        let mut has_lazy = false;
+
+        let mut last_distances = [0; 2];
 
         debug_assert!(start >= CONTEXT_OFFSET);
 
@@ -515,96 +567,117 @@ impl<
             let replacement_idx =
                 BoundedSlice::new_from_equal_array_mut(&mut self.replacement_idx).get_mut(hash);
 
-            if (skip as i32) < 1 {
+            if skip == 0 {
                 let (dist, len, gain) = if replacement_idx.get() == 0 {
                     (0, 0, 0)
                 } else {
                     let (dist, len, gain, len12p_mask) =
-                        table_search::<ENTRY_SIZE, ENTRY_SIZE_MINUS_SEVEN>(
-                            pos, chunk1, chunk2, chunk3, table,
+                        table_search::<ENTRY_SIZE, ENTRY_SIZE_MINUS_SEVEN, USE_LAST_DISTANCES>(
+                            pos,
+                            chunk1,
+                            chunk2,
+                            chunk3,
+                            table,
+                            last_distances,
                         );
-                    update_with_long_matches(data, pos, table, len12p_mask, dist, len, gain)
+                    update_with_long_matches::<ENTRY_SIZE, USE_LAST_DISTANCES>(
+                        data,
+                        pos,
+                        table,
+                        last_distances,
+                        len12p_mask,
+                        dist,
+                        len,
+                        gain,
+                    )
                 };
                 let ctx = *BoundedSlice::new_from_equal_array(&context).get(po);
                 let lit = *data_slice.get(BoundedUsize::<{ CONTEXT_OFFSET + 1 }>::constant::<
                     CONTEXT_OFFSET,
                 >());
-                let (lit_params, copy_params) = if skip == 0 {
-                    if len >= 12 {
-                        skip = len - 1;
-                        ((zero_ctx, 0, false), (len, dist, true))
-                    } else if len >= 4 {
-                        last_lit = lit;
-                        last_ctx = ctx;
-                        last_dist = dist;
-                        last_len = len;
-                        last_gain = gain;
-                        skip = LAZY_SENTINEL;
-                        ((zero_ctx, 0, false), (0, 0, false))
-                    } else {
-                        ((ctx, lit, true), (0, 0, false))
-                    }
-                } else if gain >= last_gain + GAIN_FOR_LAZY {
-                    skip = len - 1;
-                    ((last_ctx, last_lit, true), (len, dist, true))
-                } else {
+
+                let (lit_params, copy_params) = if has_lazy && gain <= last_gain + GAIN_FOR_LAZY {
+                    let val = ((zero_ctx, 0, false), (last_len, last_dist, true));
                     skip = last_len - 2;
-                    ((zero_ctx, 0, false), (last_len, last_dist, true))
+                    has_lazy = false;
+                    val
+                } else if gain > MIN_GAIN_FOR_GREEDY {
+                    let val = ((last_ctx, last_lit, has_lazy), (len, dist, true));
+                    skip = len - 1;
+                    has_lazy = false;
+                    val
+                } else if len >= 4 {
+                    let val = ((last_ctx, last_lit, has_lazy), (0, 0, false));
+                    last_lit = lit;
+                    last_ctx = ctx;
+                    last_dist = dist;
+                    last_len = len;
+                    last_gain = gain;
+                    has_lazy = true;
+                    val
+                } else {
+                    debug_assert!(!has_lazy);
+                    ((ctx, lit, true), (0, 0, false))
                 };
                 metablock_data.add_literal(lit_params.0, lit_params.1, lit_params.2);
                 metablock_data.add_copy(copy_params.0, copy_params.1, copy_params.2);
+                if USE_LAST_DISTANCES {
+                    last_distances = if copy_params.2 {
+                        [copy_params.1, last_distances[0]]
+                    } else {
+                        last_distances
+                    };
+                }
             } else {
                 skip -= 1;
             }
             fill_entry_inner(pos, chunk1, chunk2, chunk3, table, replacement_idx);
         }
 
-        match skip {
-            0 => end - start,
-            LAZY_SENTINEL => {
-                metablock_data.add_literal(last_ctx, last_lit, true);
-                end - start
-            }
-            _ => {
-                // Populate the hash table with the remaining copied bytes.
-                let skip_end = end_upper_bound.min(end + skip as usize);
-                for pos in end..skip_end {
-                    let data_slice =
-                        BoundedSlice::<_, { INTERIOR_MARGIN + CONTEXT_OFFSET }>::new_at_offset(
-                            data,
-                            pos - CONTEXT_OFFSET,
-                        )
-                        .unwrap();
-
-                    let po = BoundedUsize::<{ PRECOMPUTE_SIZE / 2 }>::new_masked(pos - start);
-                    if po.get() == 0 {
-                        compute_hash_and_context_at(data_slice, &mut context, &mut hashes);
-                    }
-
-                    self.prefetch_pos(
-                        (*BoundedSlice::new_from_equal_array(&hashes)
-                            .get(po.add::<PRECOMPUTE_SIZE, PREFETCH_OFFSET>()))
-                        .into(),
-                    );
-
-                    let (chunk1, chunk2, chunk3) =
-                        get_chunks(data_slice.offset::<INTERIOR_MARGIN, CONTEXT_OFFSET>());
-                    let hash = (*BoundedSlice::new_from_equal_array(&hashes).get(po)).into();
-                    let table =
-                        BoundedSlice::new_from_equal_array_mut(&mut self.table).get_mut(hash);
-                    let replacement_idx =
-                        BoundedSlice::new_from_equal_array_mut(&mut self.replacement_idx)
-                            .get_mut(hash);
-                    fill_entry_inner(pos, chunk1, chunk2, chunk3, table, replacement_idx);
-                }
-                end + skip as usize - start
-            }
+        if has_lazy {
+            metablock_data.add_copy(last_len, last_dist, true);
+            skip = last_len - 1;
         }
+
+        // Populate the hash table with the remaining copied bytes.
+        let skip_end = end_upper_bound.min(end + skip as usize);
+        for pos in end..skip_end {
+            let data_slice =
+                BoundedSlice::<_, { INTERIOR_MARGIN + CONTEXT_OFFSET }>::new_at_offset(
+                    data,
+                    pos - CONTEXT_OFFSET,
+                )
+                .unwrap();
+
+            let po = BoundedUsize::<{ PRECOMPUTE_SIZE / 2 }>::new_masked(pos - start);
+            if po.get() == 0 {
+                compute_hash_and_context_at(data_slice, &mut context, &mut hashes);
+            }
+
+            self.prefetch_pos(
+                (*BoundedSlice::new_from_equal_array(&hashes)
+                    .get(po.add::<PRECOMPUTE_SIZE, PREFETCH_OFFSET>()))
+                .into(),
+            );
+
+            let (chunk1, chunk2, chunk3) =
+                get_chunks(data_slice.offset::<INTERIOR_MARGIN, CONTEXT_OFFSET>());
+            let hash = (*BoundedSlice::new_from_equal_array(&hashes).get(po)).into();
+            let table = BoundedSlice::new_from_equal_array_mut(&mut self.table).get_mut(hash);
+            let replacement_idx =
+                BoundedSlice::new_from_equal_array_mut(&mut self.replacement_idx).get_mut(hash);
+            fill_entry_inner(pos, chunk1, chunk2, chunk3, table, replacement_idx);
+        }
+        end + skip as usize - start
     }
 
     #[target_feature(enable = "sse,sse2,ssse3,sse4.1,avx,avx2,bmi1,bmi2")]
     #[safe_arch]
-    pub fn parse_and_emit_metablock<const FAST_MATCHING: bool>(
+    pub fn parse_and_emit_metablock<
+        const FAST_MATCHING: bool,
+        const MIN_GAIN_FOR_GREEDY: i32,
+        const USE_LAST_DISTANCES: bool,
+    >(
         &mut self,
         data: &[u8],
         start: usize,
@@ -612,7 +685,12 @@ impl<
         metablock_data: &mut MetablockData,
     ) -> usize {
         if FAST_MATCHING {
-            return self.parse_and_emit_metablock_fast(data, start, count, metablock_data);
+            return self.parse_and_emit_metablock_fast::<USE_LAST_DISTANCES>(
+                data,
+                start,
+                count,
+                metablock_data,
+            );
         }
         // TODO(veluca): for some reason, not enabling target features on this function results in
         // slightly faster code.
@@ -622,7 +700,7 @@ impl<
             metablock_data.add_literal(CONTEXT_LUT0[data[0] as usize], data[1], true);
             bpos += 2;
         }
-        bpos += self.parse_and_emit_interior(
+        bpos += self.parse_and_emit_interior::<MIN_GAIN_FOR_GREEDY, USE_LAST_DISTANCES>(
             data,
             bpos,
             (bpos + count).min(data.len() - INTERIOR_MARGIN) - bpos,
@@ -643,7 +721,7 @@ impl<
     #[target_feature(enable = "sse,sse2,ssse3,sse4.1,avx,avx2,bmi1,bmi2")]
     #[safe_arch]
     #[inline(never)]
-    fn parse_and_emit_interior_fast(
+    fn parse_and_emit_interior_fast<const USE_LAST_DISTANCES: bool>(
         &mut self,
         data: &[u8],
         start: usize,
@@ -656,6 +734,8 @@ impl<
         let mut hashes = [BoundedU32::constant::<0>(); PRECOMPUTE_SIZE];
 
         let mut last_pc = 1;
+
+        let mut last_distances = [0; 2];
 
         let mut pos = start;
         while pos < end {
@@ -689,10 +769,24 @@ impl<
                 (0, 0, 0)
             } else {
                 let (dist, len, gain, len12p_mask) =
-                    table_search::<ENTRY_SIZE, ENTRY_SIZE_MINUS_SEVEN>(
-                        pos, chunk1, chunk2, chunk3, table,
+                    table_search::<ENTRY_SIZE, ENTRY_SIZE_MINUS_SEVEN, USE_LAST_DISTANCES>(
+                        pos,
+                        chunk1,
+                        chunk2,
+                        chunk3,
+                        table,
+                        last_distances,
                     );
-                update_with_long_matches(data, pos, table, len12p_mask, dist, len, gain)
+                update_with_long_matches::<ENTRY_SIZE, USE_LAST_DISTANCES>(
+                    data,
+                    pos,
+                    table,
+                    last_distances,
+                    len12p_mask,
+                    dist,
+                    len,
+                    gain,
+                )
             };
             fill_entry_inner(pos, chunk1, chunk2, chunk3, table, replacement_idx);
             let lit = *data_slice.get(BoundedUsize::<1>::constant::<0>());
@@ -717,6 +811,13 @@ impl<
             };
             metablock_data.add_literal(BoundedU8::constant::<0>(), lit_params.0, lit_params.1);
             metablock_data.add_copy(copy_params.0, copy_params.1, copy_params.2);
+            if USE_LAST_DISTANCES {
+                last_distances = if copy_params.2 {
+                    [copy_params.1, last_distances[0]]
+                } else {
+                    last_distances
+                };
+            }
         }
 
         pos - start
@@ -724,7 +825,7 @@ impl<
 
     #[target_feature(enable = "sse,sse2,ssse3,sse4.1,avx,avx2,bmi1,bmi2")]
     #[safe_arch]
-    pub fn parse_and_emit_metablock_fast(
+    pub fn parse_and_emit_metablock_fast<const USE_LAST_DISTANCES: bool>(
         &mut self,
         data: &[u8],
         start: usize,
@@ -732,7 +833,7 @@ impl<
         metablock_data: &mut MetablockData,
     ) -> usize {
         let mut bpos = start;
-        bpos += self.parse_and_emit_interior_fast(
+        bpos += self.parse_and_emit_interior_fast::<USE_LAST_DISTANCES>(
             data,
             bpos,
             (bpos + count).min(data.len() - INTERIOR_MARGIN) - bpos,
@@ -774,10 +875,16 @@ mod test {
     fn test_gain() {
         for dist in 1..1024 {
             for len in 4..2048 {
+                let last_distances = [(dist + len) % 1024, (dist - len) % 1024];
                 let vdist = _mm256_set1_epi32(dist as i32);
                 let vlen = _mm256_set1_epi32(len as i32);
-                let vgain = gain_from_len_and_dist_simd(vlen, vdist);
-                let gain = gain_from_len_and_dist(len, dist);
+                let vgain = gain_from_len_and_dist_simd::<true>(
+                    vlen,
+                    vdist,
+                    _mm256_set1_epi32(last_distances[0] as i32),
+                    _mm256_set1_epi32(last_distances[1] as i32),
+                );
+                let gain = gain_from_len_and_dist::<true>(len, dist, last_distances);
                 assert_eq!(_mm256_extract_epi32::<0>(vgain), gain);
             }
         }

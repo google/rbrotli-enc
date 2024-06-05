@@ -24,7 +24,7 @@ use crate::{
 use bounded_utils::{BoundedIterable, BoundedSlice, BoundedU8, BoundedUsize};
 use hugepage_buffer::BoxedHugePageArray;
 use lsb_bitwriter::BitWriter;
-use safe_arch::{safe_arch_entrypoint, safe_arch, x86_64::*};
+use safe_arch::{safe_arch, safe_arch_entrypoint, x86_64::*};
 use std::mem::MaybeUninit;
 use zerocopy::{transmute, transmute_mut, AsBytes};
 
@@ -631,6 +631,8 @@ struct EncoderInternal<
     const ENTRY_SIZE_PLUS_ONE: usize,
     const ENTRY_SIZE_MINUS_SEVEN: usize,
     const FAST_MATCHING: bool,
+    const MIN_GAIN_FOR_GREEDY: i32,
+    const USE_LAST_DISTANCES: bool,
 > {
     ht: HashTable<ENTRY_SIZE, ENTRY_SIZE_PLUS_ONE, ENTRY_SIZE_MINUS_SEVEN>,
     md: MetablockData,
@@ -662,6 +664,8 @@ fn compress_one_metablock<
     const ENTRY_SIZE_PLUS_ONE: usize,
     const ENTRY_SIZE_MINUS_SEVEN: usize,
     const FAST_MATCHING: bool,
+    const MIN_GAIN_FOR_GREEDY: i32,
+    const USE_LAST_DISTANCES: bool,
 >(
     data: &[u8],
     pos: usize,
@@ -670,7 +674,10 @@ fn compress_one_metablock<
     md: &mut MetablockData,
 ) -> usize {
     let count = (data.len() - pos).min(METABLOCK_SIZE);
-    let count = ht.parse_and_emit_metablock::<FAST_MATCHING>(data, pos, count, md);
+    let count = ht
+        .parse_and_emit_metablock::<FAST_MATCHING, MIN_GAIN_FOR_GREEDY, USE_LAST_DISTANCES>(
+            data, pos, count, md,
+        );
     md.write(bw, count);
     count
 }
@@ -680,7 +687,17 @@ impl<
         const ENTRY_SIZE_PLUS_ONE: usize,
         const ENTRY_SIZE_MINUS_SEVEN: usize,
         const FAST_MATCHING: bool,
-    > EncoderInternal<ENTRY_SIZE, ENTRY_SIZE_PLUS_ONE, ENTRY_SIZE_MINUS_SEVEN, FAST_MATCHING>
+        const MIN_GAIN_FOR_GREEDY: i32,
+        const USE_LAST_DISTANCES: bool,
+    >
+    EncoderInternal<
+        ENTRY_SIZE,
+        ENTRY_SIZE_PLUS_ONE,
+        ENTRY_SIZE_MINUS_SEVEN,
+        FAST_MATCHING,
+        MIN_GAIN_FOR_GREEDY,
+        USE_LAST_DISTANCES,
+    >
 {
     fn new() -> Self {
         EncoderInternal {
@@ -705,8 +722,17 @@ impl<
         const ENTRY_SIZE_PLUS_ONE: usize,
         const ENTRY_SIZE_MINUS_SEVEN: usize,
         const FAST_MATCHING: bool,
+        const MIN_GAIN_FOR_GREEDY: i32,
+        const USE_LAST_DISTANCES: bool,
     > EncoderImpl
-    for EncoderInternal<ENTRY_SIZE, ENTRY_SIZE_PLUS_ONE, ENTRY_SIZE_MINUS_SEVEN, FAST_MATCHING>
+    for EncoderInternal<
+        ENTRY_SIZE,
+        ENTRY_SIZE_PLUS_ONE,
+        ENTRY_SIZE_MINUS_SEVEN,
+        FAST_MATCHING,
+        MIN_GAIN_FOR_GREEDY,
+        USE_LAST_DISTANCES,
+    >
 {
     fn max_required_size(&self, input_len: usize) -> usize {
         // A byte can either be represented by a literal (15 bits max) or by a
@@ -781,6 +807,8 @@ impl<
                 ENTRY_SIZE_PLUS_ONE,
                 ENTRY_SIZE_MINUS_SEVEN,
                 FAST_MATCHING,
+                MIN_GAIN_FOR_GREEDY,
+                USE_LAST_DISTANCES,
             >(
                 &data[virtual_start..],
                 pos - virtual_start,
@@ -811,10 +839,19 @@ impl Encoder {
     pub fn new(quality: u32) -> Encoder {
         match quality {
             0..=3 => Encoder {
-                inner: Box::new(EncoderInternal::<8, 9, 1, true>::new()),
+                inner: Box::new(EncoderInternal::<8, 9, 1, true, 0, false>::new()),
+            },
+            4 => Encoder {
+                inner: Box::new(EncoderInternal::<8, 9, 1, false, 768, false>::new()),
+            },
+            5 => Encoder {
+                inner: Box::new(EncoderInternal::<16, 17, 9, false, 768, false>::new()),
+            },
+            6 => Encoder {
+                inner: Box::new(EncoderInternal::<16, 17, 9, false, { i32::MAX }, true>::new()),
             },
             _ => Encoder {
-                inner: Box::new(EncoderInternal::<16, 17, 9, false>::new()),
+                inner: Box::new(EncoderInternal::<32, 33, 25, false, { i32::MAX }, true>::new()),
             },
         }
     }
