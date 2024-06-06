@@ -842,13 +842,13 @@ impl Encoder {
                 inner: Box::new(EncoderInternal::<8, 9, 1, true, 0, false>::new()),
             },
             4 => Encoder {
-                inner: Box::new(EncoderInternal::<8, 9, 1, false, 768, false>::new()),
+                inner: Box::new(EncoderInternal::<8, 9, 1, false, 0, false>::new()),
             },
             5 => Encoder {
-                inner: Box::new(EncoderInternal::<16, 17, 9, false, 768, false>::new()),
+                inner: Box::new(EncoderInternal::<16, 17, 9, false, 2560, false>::new()),
             },
             6 => Encoder {
-                inner: Box::new(EncoderInternal::<16, 17, 9, false, { i32::MAX }, true>::new()),
+                inner: Box::new(EncoderInternal::<16, 17, 9, false, 4096, true>::new()),
             },
             _ => Encoder {
                 inner: Box::new(EncoderInternal::<32, 33, 25, false, { i32::MAX }, true>::new()),
