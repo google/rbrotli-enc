@@ -23,19 +23,15 @@ use crate::{
     metablock::{self, ContextMode},
 };
 use hugepage_slice::BoxedHugePageSlice;
-use std::{mem::size_of, ptr::copy_nonoverlapping};
 
 use crate::constants::*;
 
-#[derive(Debug, Clone, Copy)]
-#[repr(C)]
-struct Literal {
-    value: u8,
-    context: u8,
-}
+use std::simd::prelude::*;
+use std::simd::ToBytes;
 
 pub struct MetablockData {
-    literals: BoxedHugePageSlice<Literal>,
+    literals_ctx: BoxedHugePageSlice<u8>,
+    literals_val: BoxedHugePageSlice<u8>,
     total_literals: u32,
     copy_len: BoxedHugePageSlice<u32>,
     insert_len: BoxedHugePageSlice<u32>,
@@ -55,62 +51,37 @@ struct LiteralHistogram {
     total: u32,
 }
 
-#[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2,bmi1,bmi2,popcnt,fma")]
-unsafe fn histogram_distance_impl(a: &LiteralHistogram, b: &LiteralHistogram) -> i32 {
-    use std::arch::x86_64::*;
+fn histogram_distance(a: &LiteralHistogram, b: &LiteralHistogram) -> i32 {
     if a.total == 0 || b.total == 0 {
         return 0;
     }
-    let inv_a = _mm256_set1_ps(1.0 / a.total as f32);
-    let inv_b = _mm256_set1_ps(1.0 / b.total as f32);
-    let inv_total = _mm256_set1_ps(1.0 / (a.total + b.total) as f32);
-    let mut total_distance0 = _mm256_setzero_si256();
-    let mut total_distance1 = _mm256_setzero_si256();
-    let mut total_distance2 = _mm256_setzero_si256();
-    let ceil_nlog2 = |x| {
-        _mm256_sub_epi32(
-            _mm256_set1_epi32(127),
-            _mm256_srli_epi32::<23>(_mm256_castps_si256(x)),
-        )
-    };
+    let inv_a = f32x8::splat(1.0 / a.total as f32);
+    let inv_b = f32x8::splat(1.0 / b.total as f32);
+    let inv_total = f32x8::splat(1.0 / (a.total + b.total) as f32);
+    let mut total_distance0 = i32x8::splat(0);
+    let mut total_distance1 = i32x8::splat(0);
+    let mut total_distance2 = i32x8::splat(0);
+    let ceil_nlog2 =
+        |x: f32x8| -> i32x8 { i32x8::splat(127) - (x.to_bits() >> u32x8::splat(23)).cast::<i32>() };
     for i in 0..32 {
-        let av = _mm256_loadu_si256((a.data.as_ptr() as *const __m256i).offset(i));
-        let bv = _mm256_loadu_si256((b.data.as_ptr() as *const __m256i).offset(i));
-        let totv = _mm256_add_epi32(av, bv);
-        let af32 = _mm256_cvtepi32_ps(av);
-        let bf32 = _mm256_cvtepi32_ps(bv);
-        let totf32 = _mm256_cvtepi32_ps(totv);
-        let proba = _mm256_mul_ps(af32, inv_a);
-        let probb = _mm256_mul_ps(bf32, inv_b);
-        let probtot = _mm256_mul_ps(totf32, inv_total);
+        let av = u32x8::from_slice(&a.data[i * 8..]);
+        let bv = u32x8::from_slice(&b.data[i * 8..]);
+        let totv = av + bv;
+        let af32 = av.cast::<f32>();
+        let bf32 = bv.cast::<f32>();
+        let totf32 = totv.cast::<f32>();
+        let proba = af32 * inv_a;
+        let probb = bf32 * inv_b;
+        let probtot = totf32 * inv_total;
         let nbitsa = ceil_nlog2(proba);
         let nbitsb = ceil_nlog2(probb);
         let nbitstot = ceil_nlog2(probtot);
-        total_distance0 = _mm256_add_epi32(_mm256_mullo_epi32(nbitstot, totv), total_distance0);
-        total_distance1 = _mm256_add_epi32(_mm256_mullo_epi32(nbitsa, av), total_distance1);
-        total_distance2 = _mm256_add_epi32(_mm256_mullo_epi32(nbitsb, bv), total_distance2);
+        total_distance0 = nbitstot * totv.cast::<i32>() + total_distance0;
+        total_distance1 = nbitsa * av.cast::<i32>() + total_distance1;
+        total_distance2 = nbitsb * bv.cast::<i32>() + total_distance2;
     }
-    let mut total_distance = _mm256_sub_epi32(
-        total_distance0,
-        _mm256_add_epi32(total_distance1, total_distance2),
-    );
-    total_distance = _mm256_add_epi32(
-        total_distance,
-        _mm256_shuffle_epi32::<0b10110001>(total_distance),
-    );
-    total_distance = _mm256_add_epi32(
-        total_distance,
-        _mm256_shuffle_epi32::<0b01001110>(total_distance),
-    );
-    total_distance = _mm256_add_epi32(
-        total_distance,
-        _mm256_permute4x64_epi64::<0b01001110>(total_distance),
-    );
-    _mm256_extract_epi32::<0>(total_distance)
-}
-
-fn histogram_distance(a: &LiteralHistogram, b: &LiteralHistogram) -> i32 {
-    unsafe { histogram_distance_impl(a, b) }
+    let total_distance = total_distance0 - (total_distance1 + total_distance2);
+    total_distance.reduce_sum()
 }
 
 fn cluster_histograms(histograms: [LiteralHistogram; 64]) -> (Vec<LiteralHistogram>, Vec<u8>) {
@@ -189,12 +160,9 @@ fn cluster_histograms(histograms: [LiteralHistogram; 64]) -> (Vec<LiteralHistogr
 
 impl MetablockData {
     fn new() -> MetablockData {
-        let trivial_literal = Literal {
-            context: 0,
-            value: 0,
-        };
         MetablockData {
-            literals: BoxedHugePageSlice::new(trivial_literal, LITERAL_BUF_SIZE),
+            literals_ctx: BoxedHugePageSlice::new(0, LITERAL_BUF_SIZE),
+            literals_val: BoxedHugePageSlice::new(0, LITERAL_BUF_SIZE),
             total_literals: 0,
             insert_len: BoxedHugePageSlice::new(0, ICD_BUF_SIZE),
             copy_len: BoxedHugePageSlice::new(2, ICD_BUF_SIZE),
@@ -219,86 +187,81 @@ impl MetablockData {
     }
 
     #[inline]
-    pub unsafe fn add_literal(&mut self, context: u8, value: u8) {
-        *self
-            .literals
-            .get_unchecked_mut(self.total_literals as usize) = Literal { context, value };
+    pub fn add_literal(&mut self, context: u8, value: u8) {
+        self.literals_ctx[self.total_literals as usize] = context;
+        self.literals_val[self.total_literals as usize] = value;
         self.total_literals += 1;
     }
 
     #[inline]
-    pub unsafe fn add_copy(&mut self, copy_len: u32, distance: u32) {
+    pub fn add_copy(&mut self, copy_len: u32, distance: u32) {
         let num_lits = self.total_literals - self.iac_literals;
         self.iac_literals = self.total_literals;
         let pos = self.total_icd as usize;
         self.total_icd += 1;
-        *self.insert_len.get_unchecked_mut(pos) = num_lits;
-        *self.copy_len.get_unchecked_mut(pos) = copy_len;
-        *self.distance.get_unchecked_mut(pos + 2) = distance;
+        self.insert_len[pos] = num_lits;
+        self.copy_len[pos] = copy_len;
+        self.distance[pos + 2] = distance;
     }
 
     #[inline]
-    #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2,bmi1,bmi2,popcnt,fma")]
-    unsafe fn add_raw_bits<T>(&mut self, nbits_pat: T, nbits_count: usize, bits: T) {
-        const _: () = assert!(cfg!(target_endian = "little"));
-        copy_nonoverlapping(
-            (&nbits_pat) as *const T as *const u8,
-            self.symbol_or_nbits.as_mut_ptr().add(self.num_syms) as *mut u8,
-            size_of::<T>(),
-        );
-        copy_nonoverlapping(
-            (&bits) as *const T as *const u8,
-            self.bits.as_mut_ptr().add(self.num_syms) as *mut u8,
-            size_of::<T>(),
-        );
+    fn add_raw_bits32(&mut self, nbits_pat: u32, nbits_count: usize, bits: u32) {
+        self.symbol_or_nbits[self.num_syms] = (nbits_pat & 0xFFFF) as u16;
+        self.symbol_or_nbits[self.num_syms + 1] = (nbits_pat >> 16) as u16;
+        self.bits[self.num_syms] = (bits & 0xFFFF) as u16;
+        self.bits[self.num_syms + 1] = (bits >> 16) as u16;
         self.num_syms += nbits_count;
     }
 
     #[inline]
-    #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2,bmi1,bmi2,popcnt,fma")]
-    unsafe fn add_literals(&mut self, count: usize, literals_cmap: &[u8; 64]) {
-        use core::arch::x86_64::*;
+    fn add_raw_bits64(&mut self, nbits_pat: u64, nbits_count: usize, bits: u64) {
+        self.symbol_or_nbits[self.num_syms] = (nbits_pat & 0xFFFF) as u16;
+        self.symbol_or_nbits[self.num_syms + 1] = ((nbits_pat >> 16) & 0xFFFF) as u16;
+        self.symbol_or_nbits[self.num_syms + 2] = ((nbits_pat >> 32) & 0xFFFF) as u16;
+        self.symbol_or_nbits[self.num_syms + 3] = (nbits_pat >> 48) as u16;
+        self.bits[self.num_syms] = (bits & 0xFFFF) as u16;
+        self.bits[self.num_syms + 1] = ((bits >> 16) & 0xFFFF) as u16;
+        self.bits[self.num_syms + 2] = ((bits >> 32) & 0xFFFF) as u16;
+        self.bits[self.num_syms + 3] = (bits >> 48) as u16;
+        self.num_syms += nbits_count;
+    }
+
+    #[inline]
+    fn add_literals(&mut self, count: usize, literals_cmap: &[u8; 64]) {
         if count == 0 {
             return;
         }
-        let tbl0 =
-            _mm256_broadcastsi128_si256(_mm_loadu_si128(literals_cmap.as_ptr().add(0).cast()));
-        let tbl1 =
-            _mm256_broadcastsi128_si256(_mm_loadu_si128(literals_cmap.as_ptr().add(16).cast()));
-        let tbl2 =
-            _mm256_broadcastsi128_si256(_mm_loadu_si128(literals_cmap.as_ptr().add(32).cast()));
-        let tbl3 =
-            _mm256_broadcastsi128_si256(_mm_loadu_si128(literals_cmap.as_ptr().add(48).cast()));
+        let tbl0 = u8x16::from_slice(&literals_cmap[0..]);
+        let tbl1 = u8x16::from_slice(&literals_cmap[16..]);
+        let tbl2 = u8x16::from_slice(&literals_cmap[32..]);
+        let tbl3 = u8x16::from_slice(&literals_cmap[48..]);
 
         for i in 0..(count + 15) / 16 {
             let idx = self.iac_literals as usize + i * 16;
             let out_idx = self.num_syms as usize + i * 16;
-            let lits = _mm256_loadu_si256(self.literals.as_ptr().add(idx).cast());
-            let ctx_lookup_idx = _mm256_and_si256(_mm256_set1_epi8(0xF), lits);
-            let ctx0 = _mm256_shuffle_epi8(tbl0, ctx_lookup_idx);
-            let ctx1 = _mm256_shuffle_epi8(tbl1, ctx_lookup_idx);
-            let ctx2 = _mm256_shuffle_epi8(tbl2, ctx_lookup_idx);
-            let ctx3 = _mm256_shuffle_epi8(tbl3, ctx_lookup_idx);
-            let is13 = _mm256_slli_epi16::<3>(lits);
-            let is23 = _mm256_slli_epi16::<2>(lits);
-            let ctx01 = _mm256_blendv_epi8(ctx0, ctx1, is13);
-            let ctx23 = _mm256_blendv_epi8(ctx2, ctx3, is13);
-            let ctx_shifted = _mm256_and_si256(
-                _mm256_set1_epi16(0xFF00u16 as i16),
-                _mm256_blendv_epi8(ctx01, ctx23, is23),
-            );
-            let val = _mm256_and_si256(lits, _mm256_set1_epi16(0xFF));
-            let off = _mm256_set1_epi16((LIT_BASE + SYMBOL_MASK) as i16);
-            let res = _mm256_add_epi16(_mm256_add_epi16(off, val), ctx_shifted);
-            _mm256_storeu_si256(self.symbol_or_nbits.as_mut_ptr().add(out_idx).cast(), res);
+            let ctx = u8x16::from_slice(&self.literals_ctx[idx..]);
+            let vals = u8x16::from_slice(&self.literals_val[idx..]);
+            let ctx_lookup_idx = ctx & u8x16::splat(0xF);
+            let ctx0 = tbl0.swizzle_dyn(ctx_lookup_idx);
+            let ctx1 = tbl1.swizzle_dyn(ctx_lookup_idx);
+            let ctx2 = tbl2.swizzle_dyn(ctx_lookup_idx);
+            let ctx3 = tbl3.swizzle_dyn(ctx_lookup_idx);
+            let is13 = (ctx & u8x16::splat(0x10)).simd_eq(u8x16::splat(0x10));
+            let is23 = (ctx & u8x16::splat(0x20)).simd_eq(u8x16::splat(0x20));
+            let ctx01 = is13.select(ctx1, ctx0);
+            let ctx23 = is13.select(ctx3, ctx2);
+            let ctx = is23.select(ctx23, ctx01);
+            let ctx_shifted = ctx.cast::<u16>() << u16x16::splat(8);
+            let off = u16x16::splat(LIT_BASE + SYMBOL_MASK);
+            let res = off + vals.cast::<u16>() + ctx_shifted;
+            res.copy_to_slice(&mut self.symbol_or_nbits[out_idx..]);
         }
         self.num_syms += count;
         self.iac_literals += count as u32;
     }
 
     #[inline]
-    #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2,bmi1,bmi2,popcnt,fma")]
-    unsafe fn add_iac(
+    fn add_iac(
         &mut self,
         i: usize,
         ii: usize,
@@ -310,41 +273,40 @@ impl MetablockData {
         distance_nbits_pat_buf: &[u32; 8],
         distance_nbits_count_buf: &[u32; 8],
         distance_sym_buf: &[u32; 8],
-        iac_hist_ptr: *mut u32,
-        dist_hist_ptr: *mut u32,
+        iac_hist: &mut [u32; MAX_IAC],
+        dist_hist: &mut [[u32; MAX_DIST]; 2],
         literals_cmap: &[u8; 64],
     ) {
-        let iac_sym_off = *insert_and_copy_sym_buf.get_unchecked(ii) as u16;
+        let iac_sym_off = insert_and_copy_sym_buf[ii] as u16;
 
-        *self.symbol_or_nbits.get_unchecked_mut(self.num_syms) = iac_sym_off;
+        self.symbol_or_nbits[self.num_syms] = iac_sym_off;
         self.num_syms += 1;
-        self.add_raw_bits(
-            *insert_and_copy_nbits_pat_buf.get_unchecked(ii),
-            *insert_and_copy_nbits_count_buf.get_unchecked(ii) as usize,
-            *insert_and_copy_bits_buf.get_unchecked(ii),
+        self.add_raw_bits64(
+            insert_and_copy_nbits_pat_buf[ii],
+            insert_and_copy_nbits_count_buf[ii] as usize,
+            insert_and_copy_bits_buf[ii],
         );
 
-        self.add_literals(
-            *self.insert_len.get_unchecked(i * 8 + ii) as usize,
-            literals_cmap,
-        );
+        self.add_literals(self.insert_len[i * 8 + ii] as usize, literals_cmap);
 
-        let dist_sym_off = *distance_sym_buf.get_unchecked(ii);
-        *self.symbol_or_nbits.get_unchecked_mut(self.num_syms) = dist_sym_off as u16;
+        let dist_sym_off = distance_sym_buf[ii];
+        self.symbol_or_nbits[self.num_syms] = dist_sym_off as u16;
         self.num_syms += 1;
-        self.add_raw_bits(
-            *distance_nbits_pat_buf.get_unchecked(ii),
-            *distance_nbits_count_buf.get_unchecked(ii) as usize,
-            *distance_bits_buf.get_unchecked(ii),
+        self.add_raw_bits32(
+            distance_nbits_pat_buf[ii],
+            distance_nbits_count_buf[ii] as usize,
+            distance_bits_buf[ii],
         );
 
-        *iac_hist_ptr.wrapping_offset(iac_sym_off as isize) += 1;
-        *dist_hist_ptr.wrapping_offset(dist_sym_off as isize) += 1;
+        iac_hist[(iac_sym_off - SYMBOL_MASK) as usize] += 1;
+        let dist_sym_ctx = dist_sym_off - (SYMBOL_MASK + DIST_BASE) as u32;
+        let dist_ctx = dist_sym_ctx as usize / MAX_DIST;
+        let dist_sym = dist_sym_ctx as usize % MAX_DIST;
+        dist_hist[dist_ctx][dist_sym] += 1;
     }
 
     #[inline]
-    #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2,bmi1,bmi2,popcnt,fma")]
-    unsafe fn compute_symbols_and_icd_histograms(
+    fn compute_symbols_and_icd_histograms(
         &mut self,
         iac_hist: &mut [u32; MAX_IAC],
         dist_hist: &mut [[u32; MAX_DIST]; 2],
@@ -360,21 +322,13 @@ impl MetablockData {
         let mut distance_nbits_count_buf = [0; 8];
         let mut distance_sym_buf = [0; 8];
 
-        let dist_hist_ptr = dist_hist[0]
-            .as_mut_ptr()
-            .wrapping_offset(-((SYMBOL_MASK + DIST_BASE) as isize));
-
-        let iac_hist_ptr = iac_hist
-            .as_mut_ptr()
-            .wrapping_offset(-(SYMBOL_MASK as isize));
-
         self.num_syms = 0;
         self.iac_literals = 0;
         let total_icd = self.total_icd as usize;
         for i in 0..(total_icd + 7) / 8 {
             insert_copy_len_to_sym_and_bits_simd(
-                self.insert_len.as_ptr().add(i * 8),
-                self.copy_len.as_ptr().add(i * 8),
+                &self.insert_len[i * 8..],
+                &self.copy_len[i * 8..],
                 &mut insert_and_copy_sym_buf,
                 &mut insert_and_copy_bits_buf,
                 &mut insert_and_copy_nbits_pat_buf,
@@ -404,8 +358,8 @@ impl MetablockData {
                         &distance_nbits_pat_buf,
                         &distance_nbits_count_buf,
                         &distance_sym_buf,
-                        iac_hist_ptr,
-                        dist_hist_ptr,
+                        iac_hist,
+                        dist_hist,
                         literals_cmap,
                     );
                 }
@@ -422,8 +376,8 @@ impl MetablockData {
                         &distance_nbits_pat_buf,
                         &distance_nbits_count_buf,
                         &distance_sym_buf,
-                        iac_hist_ptr,
-                        dist_hist_ptr,
+                        iac_hist,
+                        dist_hist,
                         literals_cmap,
                     );
                 }
@@ -448,85 +402,70 @@ impl MetablockData {
     }
 
     #[inline]
-    #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2,bmi1,bmi2,popcnt,fma")]
-    unsafe fn write_bits(&mut self, bw: &mut BitWriter) {
-        use core::arch::x86_64::*;
-        let get_sym_mask = _mm256_set1_epi16(!SYMBOL_MASK as i16);
-        const _: () = assert!(SYMBOL_MASK == 0x8000);
+    fn write_bits(&mut self, bw: &mut BitWriter) {
+        let get_sym_mask = u16x16::splat(!SYMBOL_MASK);
         for i in 0..self.num_syms / 16 {
-            let sym_or_nbits =
-                _mm256_loadu_si256(self.symbol_or_nbits.as_ptr().cast::<__m256i>().add(i));
-            let bits = _mm256_loadu_si256(self.bits.as_ptr().cast::<__m256i>().add(i));
-            const _: () = assert!(SYMBOL_MASK == 0x8000);
-            let is_symbol = _mm256_srai_epi16::<15>(sym_or_nbits);
-            let sym_or_nbits = _mm256_and_si256(get_sym_mask, sym_or_nbits);
-            let mask_even_lanes = _mm256_set1_epi32(0xFFFF);
-            let even_sym_or_nbits = _mm256_and_si256(sym_or_nbits, mask_even_lanes);
-            let odd_sym_or_nbits = _mm256_srli_epi32::<16>(sym_or_nbits);
-            // SAFETY: nbits is always <= of the size of histogram_buf.
-            let huff_even_nbits_bits =
-                _mm256_i32gather_epi32::<4>(self.histogram_buf.as_ptr().cast(), even_sym_or_nbits);
-            let huff_odd_nbits_bits =
-                _mm256_i32gather_epi32::<4>(self.histogram_buf.as_ptr().cast(), odd_sym_or_nbits);
-            let huff_nbits = _mm256_or_si256(
-                _mm256_slli_epi32::<16>(huff_odd_nbits_bits),
-                _mm256_and_si256(mask_even_lanes, huff_even_nbits_bits),
-            );
-            let huff_bits = _mm256_or_si256(
-                _mm256_srli_epi32::<16>(huff_even_nbits_bits),
-                _mm256_andnot_si256(mask_even_lanes, huff_odd_nbits_bits),
-            );
-            let bits = _mm256_blendv_epi8(bits, huff_bits, is_symbol);
-            let nbits = _mm256_blendv_epi8(sym_or_nbits, huff_nbits, is_symbol);
+            let sym_or_nbits = u16x16::from_slice(&self.symbol_or_nbits[i*16..]);
+            let bits = u16x16::from_slice(&self.bits[i*16..]);
+            let is_symbol = (sym_or_nbits & u16x16::splat(SYMBOL_MASK)).simd_eq(u16x16::splat(SYMBOL_MASK));
+            let sym_or_nbits = sym_or_nbits & get_sym_mask;
+            let indices = sym_or_nbits.cast::<usize>();
+            let huff_nbits_bits = u32x16::gather_or_default(&self.histogram_buf, indices);
+            let huff_nbits = huff_nbits_bits.cast::<u16>();
+            let huff_bits = (huff_nbits_bits >> u32x16::splat(16)).cast::<u16>();
 
-            let nbits_lo = _mm256_and_si256(mask_even_lanes, nbits);
-            let nbits32 = _mm256_add_epi32(_mm256_srli_epi32::<16>(nbits), nbits_lo);
-            let bits32_hi = _mm256_srli_epi32::<16>(bits);
-            let bits32_lo = _mm256_and_si256(mask_even_lanes, bits);
-            let bits32 = _mm256_or_si256(bits32_lo, _mm256_sllv_epi32(bits32_hi, nbits_lo));
+            let bits = is_symbol.select(huff_bits, bits);
+            let nbits = is_symbol.select(huff_nbits, sym_or_nbits);
 
-            let mask_even_lanes_32 = _mm256_set1_epi64x(0xFFFFFFFF);
-            let nbits32_lo = _mm256_and_si256(mask_even_lanes_32, nbits32);
-            let nbits64 = _mm256_add_epi64(_mm256_srli_epi64::<32>(nbits32), nbits32_lo);
-            let bits64_hi = _mm256_srli_epi64::<32>(bits32);
-            let bits64_lo = _mm256_and_si256(mask_even_lanes_32, bits32);
-            let bits64 = _mm256_or_si256(bits64_lo, _mm256_sllv_epi64(bits64_hi, nbits32_lo));
+            let mask_even_lanes = u16x16::from_le_bytes(u32x8::splat(0xFFFF).to_le_bytes());
+            let nbits_lo = mask_even_lanes & nbits;
+            let nbits_hi = u16x16::from_le_bytes((u32x8::from_le_bytes(nbits.to_le_bytes()) >> u32x8::splat(16)).to_le_bytes());
+            let nbits32 = u32x8::from_le_bytes((nbits_hi + nbits_lo).to_le_bytes());
+            let bits_lo = mask_even_lanes & bits;
+            let bits_hi = u16x16::from_le_bytes((u32x8::from_le_bytes(bits.to_le_bytes()) >> u32x8::splat(16)).to_le_bytes());
+            let bits32 = u32x8::from_le_bytes(bits_lo.to_le_bytes()) | u32x8::from_le_bytes(bits_hi.to_le_bytes()) << u32x8::from_le_bytes(nbits_lo.to_le_bytes());
+
+            let mask_even_lanes_32 = u32x8::from_le_bytes(u64x4::splat(0xFFFFFFFF).to_le_bytes());
+            let nbits_lo = mask_even_lanes_32 & nbits32;
+            let nbits_hi = u32x8::from_le_bytes((u64x4::from_le_bytes(nbits32.to_le_bytes()) >> u64x4::splat(32)).to_le_bytes());
+            let nbits64 = u64x4::from_le_bytes((nbits_hi + nbits_lo).to_le_bytes());
+            let bits_lo = mask_even_lanes_32 & bits32;
+            let bits_hi = u32x8::from_le_bytes((u64x4::from_le_bytes(bits32.to_le_bytes()) >> u64x4::splat(32)).to_le_bytes());
+            let bits64 = u64x4::from_le_bytes(bits_lo.to_le_bytes()) | u64x4::from_le_bytes(bits_hi.to_le_bytes()) << u64x4::from_le_bytes(nbits_lo.to_le_bytes());
 
             let mut bitsa = [0u64; 4];
             let mut nbitsa = [0u64; 4];
-            _mm256_storeu_si256(bitsa.as_mut_ptr().cast(), bits64);
-            _mm256_storeu_si256(nbitsa.as_mut_ptr().cast(), nbits64);
+            nbits64.copy_to_slice(&mut nbitsa);
+            bits64.copy_to_slice(&mut bitsa);
             for ii in 0..4 {
-                bw.write_unchecked_upto64(nbitsa[ii] as usize, bitsa[ii]);
+                bw.write_upto64(nbitsa[ii] as usize, bitsa[ii]);
             }
         }
         // Restore bitwriter to correct state for subsequent calls to write().
-        bw.write_unchecked(0, 0);
+        bw.write(0, 0);
 
         for i in self.num_syms / 16 * 16..self.num_syms {
-            let sym_or_nbits = *self.symbol_or_nbits.get_unchecked(i);
+            let sym_or_nbits = self.symbol_or_nbits[i];
             let symbol_idx = if (sym_or_nbits & SYMBOL_MASK) == SYMBOL_MASK {
                 sym_or_nbits & !SYMBOL_MASK
             } else {
                 0
             };
-            let HuffmanCodeEntry {
-                len: sym_nbits,
-                bits: sym_bits,
-            } = *self.histogram_buf.get_unchecked(symbol_idx as usize);
-            let bits = *self.bits.get_unchecked(i);
+            let code = self.histogram_buf[symbol_idx as usize];
+            let sym_nbits = (code & 0xFFFF) as u16;
+            let sym_bits = (code >> 16) as u16;
+            let bits = self.bits[i];
             let (nbits, bits) = if (sym_or_nbits & SYMBOL_MASK) == SYMBOL_MASK {
                 (sym_nbits, sym_bits)
             } else {
                 (sym_or_nbits, bits)
             };
-            bw.write_unchecked(nbits as usize, bits as u64);
+            bw.write(nbits as usize, bits as u64);
         }
     }
 
     #[inline]
-    #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2,bmi1,bmi2,popcnt,fma")]
-    unsafe fn write(&mut self, bw: &mut BitWriter, count: usize) {
+    fn write(&mut self, bw: &mut BitWriter, count: usize) {
         let mut header = metablock::Header::default();
         header.len = count;
         header.ndirect = 0;
@@ -539,12 +478,17 @@ impl MetablockData {
             data: [0u32; MAX_LIT],
             total: 0,
         }; 64];
-        for lit in &self.literals[..self.total_literals as usize] {
-            *lit_hist.get_unchecked_mut(lit.context as usize).data.get_unchecked_mut(lit.value as usize) += 1;
+        for (ctx, val) in self
+            .literals_ctx
+            .iter()
+            .zip(self.literals_val.iter())
+            .take(self.total_literals as usize)
+        {
+            lit_hist[*ctx as usize].data[*val as usize] += 1;
         }
         for ctx in 0..64 {
             for v in 0..MAX_LIT {
-                lit_hist.get_unchecked_mut(ctx).total += *lit_hist.get_unchecked(ctx).data.get_unchecked(v);
+                lit_hist[ctx].total += lit_hist[ctx].data[v];
             }
         }
 
@@ -627,9 +571,7 @@ impl Encoder {
         let count = self
             .ht
             .parse_and_emit_metablock(full_data, start, count, &mut self.md);
-        unsafe {
-            self.md.write(bw, count);
-        }
+        self.md.write(bw, count);
         count
     }
 
@@ -644,21 +586,6 @@ impl Encoder {
     pub fn compress(&mut self, data: &[u8]) -> Option<Vec<u8>> {
         if data.len() >= MAX_INPUT_LEN {
             // TODO: remove this limitation.
-            return None;
-        }
-        if !(is_x86_feature_detected!("avx2")
-            && is_x86_feature_detected!("avx")
-            && is_x86_feature_detected!("sse")
-            && is_x86_feature_detected!("sse2")
-            && is_x86_feature_detected!("sse3")
-            && is_x86_feature_detected!("ssse3")
-            && is_x86_feature_detected!("sse4.1")
-            && is_x86_feature_detected!("sse4.2")
-            && is_x86_feature_detected!("bmi1")
-            && is_x86_feature_detected!("bmi2")
-            && is_x86_feature_detected!("popcnt")
-            && is_x86_feature_detected!("fma"))
-        {
             return None;
         }
         // A byte can either be represented by a literal (15 bits max) or by a

@@ -7,6 +7,7 @@
     flake-utils.lib.eachDefaultSystem
       (system:
         let
+          overrides = (builtins.fromTOML (builtins.readFile ./rust-toolchain.toml));
           pkgs = import nixpkgs {
             inherit system;
           };
@@ -16,10 +17,15 @@
           devShells.default = mkShell {
             buildInputs = [
               brotli
-              cargo
+              rustup
               rustfmt
               (python3.withPackages (ps: with ps; [ brotli ]))
             ];
+            RUSTC_VERSION = overrides.toolchain.channel;
+            shellHook = ''
+              export PATH=$PATH:''${CARGO_HOME:-~/.cargo}/bin
+              export PATH=$PATH:''${RUSTUP_HOME:-~/.rustup}/toolchains/$RUSTC_VERSION-x86_64-unknown-linux-gnu/bin/
+            '';
           };
         }
       );

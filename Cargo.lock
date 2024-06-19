@@ -488,6 +488,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "prefetch"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7897ed68c68e183e9acecb6b722862263bb172655721583ebdc53094d934e5af"
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.74"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -540,6 +546,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "hugepage-slice",
+ "prefetch",
 ]
 
 [[package]]

@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use crate::constants::*;
-use std::arch::x86_64::*;
+use std::simd::prelude::*;
+use std::simd::ToBytes;
 
 const INS_BASE: [u32; 24] = [
     0, 1, 2, 3, 4, 5, 6, 8, 10, 14, 18, 26, 34, 50, 66, 98, 130, 194, 322, 578, 1090, 2114, 6210,
@@ -88,159 +89,128 @@ pub fn insert_copy_len_to_sym_and_bits(insert: u32, copy: u32) -> (u16, u8, u64)
 }
 
 #[inline]
-#[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2,bmi1,bmi2,popcnt,fma")]
-unsafe fn copy_len_to_sym_and_bits_simd(len: __m256i) -> (__m256i, __m256i, __m256i) {
-    let less_134 = _mm256_cmpgt_epi32(_mm256_set1_epi32(134), len);
-    let nbitsoff = _mm256_sub_epi32(_mm256_set1_epi32(127), less_134);
-    let offmask = _mm256_slli_epi32::<3>(less_134);
-    let offset = _mm256_andnot_si256(offmask, _mm256_set1_epi32(70));
-    let addoff = _mm256_andnot_si256(offmask, _mm256_set1_epi32(12));
-    let nbitsshift = _mm256_abs_epi32(less_134);
+fn copy_len_to_sym_and_bits_simd(len: u32x8) -> (u32x8, u32x8, u32x8) {
+    let less_134 = u32x8::splat(134).simd_gt(len).to_int().cast::<u32>();
+    let nbitsoff = u32x8::splat(127) - less_134;
+    let offmask = less_134 << u32x8::splat(3);
+    let offset = !offmask & u32x8::splat(70);
+    let addoff = !offmask & u32x8::splat(12);
+    let nbitsshift = less_134.cast::<i32>().abs().cast::<u32>();
 
-    let olen = _mm256_sub_epi32(len, offset);
-    let nbits = _mm256_andnot_si256(
-        _mm256_cmpgt_epi32(_mm256_set1_epi32(10), len),
-        _mm256_subs_epi16(
-            _mm256_srli_epi32::<23>(_mm256_castps_si256(_mm256_cvtepi32_ps(olen))),
-            nbitsoff,
-        ),
-    );
-    let one = _mm256_set1_epi32(1);
-    let bits = _mm256_and_si256(olen, _mm256_sub_epi32(_mm256_sllv_epi32(one, nbits), one));
-    let sym = _mm256_add_epi32(_mm256_sllv_epi32(nbits, nbitsshift), addoff);
-    let sym = _mm256_add_epi32(
-        sym,
-        _mm256_and_si256(less_134, _mm256_srlv_epi32(olen, nbits)),
-    );
+    let olen = len - offset;
+    let fexp = (olen.cast::<f32>().to_bits() >> u32x8::splat(23)).cast::<i32>();
+    let nbits =
+        !u32x8::splat(10).simd_gt(len).to_int() & fexp.saturating_sub(nbitsoff.cast::<i32>());
+    let nbits = nbits.cast::<u32>();
 
-    let thresh = _mm256_set1_epi32(2118);
-    let less_thresh = _mm256_cmpgt_epi32(thresh, len);
-    let sym = _mm256_blendv_epi8(_mm256_set1_epi32(23), sym, less_thresh);
-    let nbits = _mm256_blendv_epi8(_mm256_set1_epi32(24), nbits, less_thresh);
-    let bits = _mm256_blendv_epi8(_mm256_sub_epi32(len, thresh), bits, less_thresh);
+    let one = u32x8::splat(1);
+    let bits = olen & ((one << nbits) - one);
+    let sym = (nbits << nbitsshift) + addoff;
+    let sym = sym + (less_134 & (olen >> nbits));
+
+    let thresh = u32x8::splat(2118);
+    let less_thresh = thresh.simd_gt(len);
+    let sym = less_thresh.select(sym, u32x8::splat(23));
+    let nbits = less_thresh.select(nbits, u32x8::splat(24));
+    let bits = less_thresh.select(bits, len - thresh);
     (sym, nbits, bits)
 }
 
 #[inline]
-#[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2,bmi1,bmi2,popcnt,fma")]
-unsafe fn insert_len_to_sym_and_bits_simd(len: __m256i) -> (__m256i, __m256i, __m256i) {
-    let v130 = _mm256_set1_epi32(130);
-    let v2114 = _mm256_set1_epi32(2114);
-    let v6210 = _mm256_set1_epi32(6210);
-    let v22694 = _mm256_set1_epi32(22594);
+fn insert_len_to_sym_and_bits_simd(len: u32x8) -> (u32x8, u32x8, u32x8) {
+    let v130 = u32x8::splat(130);
+    let v2114 = u32x8::splat(2114);
+    let v6210 = u32x8::splat(6210);
+    let v22694 = u32x8::splat(22594);
 
-    let gt5 = _mm256_cmpgt_epi32(len, _mm256_set1_epi32(5));
-    let lt130 = _mm256_cmpgt_epi32(v130, len);
-    let lt2114 = _mm256_cmpgt_epi32(v2114, len);
-    let lt6210 = _mm256_cmpgt_epi32(v6210, len);
-    let lt22694 = _mm256_cmpgt_epi32(v22694, len);
+    let gt5 = len.simd_gt(u32x8::splat(5)).to_int().cast::<u32>();
+    let lt130 = v130.simd_gt(len).to_int().cast::<u32>();
+    let lt2114 = v2114.simd_gt(len).to_int().cast::<u32>();
+    let lt6210 = v6210.simd_gt(len).to_int().cast::<u32>();
+    let lt22694 = v22694.simd_gt(len).to_int().cast::<u32>();
 
-    let neg_num_lt = _mm256_add_epi32(
-        _mm256_add_epi32(lt130, lt2114),
-        _mm256_add_epi32(lt6210, lt22694),
-    );
+    let neg_num_lt = (lt130 + lt2114 + lt6210 + lt22694).cast::<i32>();
 
-    let lookup_indices = _mm256_add_epi32(
-        _mm256_mullo_epi32(_mm256_set1_epi32(-0x202), neg_num_lt),
-        _mm256_set1_epi32(0x302),
-    );
+    let lookup_indices = ((i32x8::splat(-0x202) * neg_num_lt) + i32x8::splat(0x302)).to_le_bytes();
 
-    let offset_tbl = _mm256_broadcastsi128_si256(_mm_setr_epi16(0, 22594, 6210, 2114, 66, 2, 0, 0));
-    let nbitsoff_tbl = _mm256_broadcastsi128_si256(_mm_setr_epi16(0, 25, 15, 13, 1, 0, 0, 0));
-    let addoff_tbl = _mm256_broadcastsi128_si256(_mm_setr_epi16(0, 0, 9, 10, 11, 3, 0, 0));
+    let offset_tbl = u16x16::from_array([
+        0, 22594, 6210, 2114, 66, 2, 0, 0, 0, 22594, 6210, 2114, 66, 2, 0, 0,
+    ]);
+    let nbitsoff_tbl = u16x16::from_array([0, 25, 15, 13, 1, 0, 0, 0, 0, 25, 15, 13, 1, 0, 0, 0]);
+    let addoff_tbl = u16x16::from_array([0, 0, 9, 10, 11, 3, 0, 0, 0, 0, 9, 10, 11, 3, 0, 0]);
 
-    let offset = _mm256_shuffle_epi8(offset_tbl, lookup_indices);
-    let nbitsoff = _mm256_shuffle_epi8(nbitsoff_tbl, lookup_indices);
-    let addoff = _mm256_shuffle_epi8(addoff_tbl, lookup_indices);
+    let offset = u32x8::from_le_bytes(offset_tbl.to_le_bytes().swizzle_dyn(lookup_indices));
+    let nbitsoff = u32x8::from_le_bytes(nbitsoff_tbl.to_le_bytes().swizzle_dyn(lookup_indices));
+    let addoff = u32x8::from_le_bytes(addoff_tbl.to_le_bytes().swizzle_dyn(lookup_indices));
 
-    let nbitsadd = _mm256_sub_epi32(addoff, _mm256_set1_epi32(1));
-    let nbitsoff = _mm256_add_epi32(nbitsoff, gt5);
-    let nbitsshift = _mm256_abs_epi32(lt130);
+    let nbitsadd = addoff - u32x8::splat(1);
+    let nbitsoff = nbitsoff + gt5;
+    let nbitsshift = lt130.cast::<i32>().abs().cast::<u32>();
 
-    let olen = _mm256_sub_epi32(len, offset);
+    let olen = len - offset;
+    let fexp = (olen.cast::<f32>().to_bits() >> u32x8::splat(23)).cast::<i32>();
+    let nbits = nbitsoff + (gt5 & lt2114 & fexp.saturating_sub(i32x8::splat(127)).cast::<u32>());
+    let nbits = nbits.cast::<u32>();
 
-    let nbits = _mm256_add_epi32(
-        _mm256_and_si256(
-            _mm256_and_si256(gt5, lt2114),
-            _mm256_subs_epi16(
-                _mm256_srli_epi32::<23>(_mm256_castps_si256(_mm256_cvtepi32_ps(olen))),
-                _mm256_set1_epi32(127),
-            ),
-        ),
-        nbitsoff,
-    );
-
-    let one = _mm256_set1_epi32(1);
-    let bits = _mm256_and_si256(olen, _mm256_sub_epi32(_mm256_sllv_epi32(one, nbits), one));
-    let sym = _mm256_add_epi32(_mm256_sllv_epi32(nbits, nbitsshift), nbitsadd);
-    let sym = _mm256_add_epi32(sym, _mm256_and_si256(lt130, _mm256_srlv_epi32(olen, nbits)));
+    let one = u32x8::splat(1);
+    let bits = olen & ((one << nbits) - one);
+    let sym = (nbits << nbitsshift) + nbitsadd;
+    let sym = sym + (lt130 & (olen >> nbits));
     (sym, nbits, bits)
 }
 
 #[inline]
-#[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2,bmi1,bmi2,popcnt,fma")]
-pub unsafe fn insert_copy_len_to_sym_and_bits_simd(
-    insert: *const u32,
-    copy: *const u32,
+pub fn insert_copy_len_to_sym_and_bits_simd(
+    insert: &[u32],
+    copy: &[u32],
     sym_buf: &mut [u32; 8],
     bits_buf: &mut [u64; 8],
     nbits_pat_buf: &mut [u64; 8],
     nbits_count_buf: &mut [u32; 8],
     distance_ctx_buf: &mut [u32; 8],
 ) {
-    let insert_len = _mm256_loadu_si256(insert.cast());
-    let (insert_code, insert_nbits, insert_bits) = insert_len_to_sym_and_bits_simd(insert_len);
-    let copy_len = _mm256_loadu_si256(copy.cast());
-    _mm256_storeu_si256(
-        distance_ctx_buf.as_mut_ptr().cast(),
-        _mm256_abs_epi32(_mm256_cmpgt_epi32(copy_len, _mm256_set1_epi32(4))),
-    );
+    let (insert_code, insert_nbits, insert_bits) =
+        insert_len_to_sym_and_bits_simd(u32x8::from_slice(insert));
+    let copy_len = u32x8::from_slice(copy);
+    copy_len
+        .simd_gt(u32x8::splat(4))
+        .to_int()
+        .abs()
+        .cast::<u32>()
+        .copy_to_slice(distance_ctx_buf);
     let (copy_code, copy_nbits, copy_bits) = copy_len_to_sym_and_bits_simd(copy_len);
 
-    let nbits = _mm256_add_epi32(insert_nbits, copy_nbits);
-    let nbits_count = _mm256_srli_epi32::<4>(_mm256_add_epi32(nbits, _mm256_set1_epi32(15)));
-    _mm256_storeu_si256(nbits_count_buf.as_mut_ptr().cast(), nbits_count);
-    let insert_nbits_64_0 = _mm256_cvtepu32_epi64(_mm256_extractf128_si256::<0>(insert_nbits));
-    let insert_nbits_64_1 = _mm256_cvtepu32_epi64(_mm256_extractf128_si256::<1>(insert_nbits));
-    let insert_bits_64_0 = _mm256_cvtepu32_epi64(_mm256_extractf128_si256::<0>(insert_bits));
-    let insert_bits_64_1 = _mm256_cvtepu32_epi64(_mm256_extractf128_si256::<1>(insert_bits));
-    let copy_bits_64_0 = _mm256_cvtepu32_epi64(_mm256_extractf128_si256::<0>(copy_bits));
-    let copy_bits_64_1 = _mm256_cvtepu32_epi64(_mm256_extractf128_si256::<1>(copy_bits));
+    let nbits = insert_nbits + copy_nbits;
+    let nbits_count = (nbits + u32x8::splat(15)) >> u32x8::splat(4);
+    nbits_count.copy_to_slice(nbits_count_buf);
+    let insert_nbits_64 = insert_nbits.cast::<u64>();
+    let insert_bits_64 = insert_bits.cast::<u64>();
+    let copy_bits_64 = copy_bits.cast::<u64>();
 
-    let bits_0 = _mm256_or_si256(
-        _mm256_sllv_epi64(copy_bits_64_0, insert_nbits_64_0),
-        insert_bits_64_0,
+    let bits = (copy_bits_64 << insert_nbits_64) | insert_bits_64;
+    bits.copy_to_slice(bits_buf);
+
+    let nbits_pat = nbits << u32x8::splat(16) | nbits;
+    let nbits_pat = nbits_pat << u32x8::splat(8) | nbits_pat;
+    let nbits_pat = u32x8::from_le_bytes(
+        nbits_pat
+            .to_le_bytes()
+            .saturating_sub(u32x8::splat(0x30201000).to_le_bytes())
+            .simd_min(u8x32::splat(16)),
     );
-
-    let bits_1 = _mm256_or_si256(
-        _mm256_sllv_epi64(copy_bits_64_1, insert_nbits_64_1),
-        insert_bits_64_1,
+    let nbits_pat = nbits_pat.cast::<u64>().to_le_bytes();
+    let nbits_pat = simd_swizzle!(
+        nbits_pat,
+        [
+            0, 5, 1, 5, 2, 5, 3, 5, 8, 5, 9, 5, 10, 5, 11, 5, 16, 5, 17, 5, 18, 5, 19, 5, 24, 5,
+            25, 5, 26, 5, 27, 5, 32, 5, 33, 5, 34, 5, 35, 5, 40, 5, 41, 5, 42, 5, 43, 5, 48, 5, 49,
+            5, 50, 5, 51, 5, 56, 5, 57, 5, 58, 5, 59, 5
+        ]
     );
-    _mm256_storeu_si256(bits_buf.as_mut_ptr().add(0).cast(), bits_0);
-    _mm256_storeu_si256(bits_buf.as_mut_ptr().add(4).cast(), bits_1);
+    u64x8::from_le_bytes(nbits_pat).copy_to_slice(nbits_pat_buf);
 
-    let nbits_pat = _mm256_or_si256(_mm256_slli_epi32::<16>(nbits), nbits);
-    let nbits_pat = _mm256_or_si256(_mm256_slli_epi32::<8>(nbits_pat), nbits_pat);
-    let nbits_pat = _mm256_min_epi8(
-        _mm256_subs_epu8(nbits_pat, _mm256_set1_epi32(0x30201000)),
-        _mm256_set1_epi8(16),
-    );
-    let nbits_pat_0 = _mm256_cvtepu32_epi64(_mm256_extractf128_si256::<0>(nbits_pat));
-    let nbits_pat_1 = _mm256_cvtepu32_epi64(_mm256_extractf128_si256::<1>(nbits_pat));
-    let expand_mask = _mm256_broadcastsi128_si256(_mm_setr_epi8(
-        0, -1, 1, -1, 2, -1, 3, -1, 8, -1, 9, -1, 10, -1, 11, -1,
-    ));
-    let nbits_pat_0 = _mm256_shuffle_epi8(nbits_pat_0, expand_mask);
-    let nbits_pat_1 = _mm256_shuffle_epi8(nbits_pat_1, expand_mask);
-
-    _mm256_storeu_si256(nbits_pat_buf.as_mut_ptr().add(0).cast(), nbits_pat_0);
-    _mm256_storeu_si256(nbits_pat_buf.as_mut_ptr().add(4).cast(), nbits_pat_1);
-
-    let mask = _mm256_set1_epi32(0x7);
-    let bits64 = _mm256_or_si256(
-        _mm256_and_si256(copy_code, mask),
-        _mm256_slli_epi32::<3>(_mm256_and_si256(insert_code, mask)),
-    );
+    let mask = u32x8::splat(0x7);
+    let bits64 = (copy_code & mask) | ((insert_code & mask) << u32x8::splat(3));
 
     /*
     (i, c)
@@ -255,20 +225,19 @@ pub unsafe fn insert_copy_len_to_sym_and_bits_simd(
     (2, 2) -> 10
     */
 
-    let table = _mm256_broadcastsi128_si256(_mm_setr_epi8(
-        0, 2, 3, 6, 0, 4, 5, 8, 0, 7, 9, 10, 0, 0, 0, 0,
-    ));
+    let table = u8x32::from_array([
+        0, 2, 3, 6, 0, 4, 5, 8, 0, 7, 9, 10, 0, 0, 0, 0, 0, 2, 3, 6, 0, 4, 5, 8, 0, 7, 9, 10, 0, 0,
+        0, 0,
+    ]);
 
-    let idx = _mm256_or_si256(
-        _mm256_add_epi32(_mm256_set1_epi32(1), _mm256_srli_epi32::<3>(copy_code)),
-        _mm256_slli_epi32::<2>(_mm256_srli_epi32::<3>(insert_code)),
-    );
+    let idx = (u32x8::splat(1) + (copy_code >> u32x8::splat(3)))
+        | ((insert_code >> u32x8::splat(3)) << u32x8::splat(2));
 
-    let offset = _mm256_slli_epi32::<6>(_mm256_shuffle_epi8(table, idx));
-    let offset = _mm256_or_si256(_mm256_set1_epi32(SYMBOL_MASK as i32), offset);
+    let offset = u32x8::splat(SYMBOL_MASK as u32)
+        | (u32x8::from_le_bytes(table.swizzle_dyn(idx.to_le_bytes())) << u32x8::splat(6));
 
-    let sym = _mm256_or_si256(bits64, offset);
-    _mm256_storeu_si256(sym_buf.as_mut_ptr().cast(), sym);
+    let sym = bits64 | offset;
+    sym.copy_to_slice(sym_buf);
 }
 
 /// Returns (symbol, nbits, bits). Assumes NPREFIX = 0 and NDIRECT = 0. Does not support the
@@ -319,8 +288,7 @@ fn distance_to_sym_and_bits_with_cache(
 }
 
 #[inline]
-#[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2,bmi1,bmi2,popcnt,fma")]
-pub unsafe fn distance_to_sym_and_bits_simd(
+pub fn distance_to_sym_and_bits_simd(
     distances: &[u32],
     pos: usize,
     distance_ctx_buf: &[u32; 8],
@@ -329,79 +297,60 @@ pub unsafe fn distance_to_sym_and_bits_simd(
     nbits_pat_buf: &mut [u32; 8],
     nbits_count_buf: &mut [u32; 8],
 ) {
-    let distance = _mm256_loadu_si256(distances.as_ptr().add(pos + 2).cast());
-    let last_distance = _mm256_loadu_si256(distances.as_ptr().add(pos + 1).cast());
-    let second_last_distance = _mm256_loadu_si256(distances.as_ptr().add(pos).cast());
-    let dist = _mm256_add_epi32(distance, _mm256_set1_epi32(3));
-    let float_dist = _mm256_castps_si256(_mm256_cvtepi32_ps(dist));
-    let nbits = _mm256_sub_epi32(_mm256_srli_epi32::<23>(float_dist), _mm256_set1_epi32(128));
-    let prefix = _mm256_and_si256(_mm256_set1_epi32(1), _mm256_srlv_epi32(dist, nbits));
-    let offset = _mm256_sllv_epi32(_mm256_add_epi32(_mm256_set1_epi32(2), prefix), nbits);
-    let code = _mm256_add_epi32(
-        _mm256_add_epi32(_mm256_set1_epi32(14), prefix),
-        _mm256_slli_epi32::<1>(nbits),
-    );
-    let bits = _mm256_sub_epi32(dist, offset);
+    let distance = u32x8::from_slice(&distances[pos + 2..]);
+    let last_distance = u32x8::from_slice(&distances[pos + 1..]);
+    let second_last_distance = u32x8::from_slice(&distances[pos..]);
+    let dist = distance + u32x8::splat(3);
+    let fexp = (dist.cast::<f32>().to_bits() >> u32x8::splat(23)).cast::<u32>();
+    let nbits = fexp - u32x8::splat(128);
+    let prefix = u32x8::splat(1) & (dist >> nbits);
+    let offset = (u32x8::splat(2) + prefix) << nbits;
+    let code = u32x8::splat(14) + prefix + (nbits << u32x8::splat(1));
+    let bits = dist - offset;
     // lookup table from distance + 3 - [second_]last_distance to corresponding symbol. The upper 4
     // bits contain the symbol for last_distance, the lower 4 for second_last_distance.
-    let lut = _mm256_broadcastsi128_si256(_mm_setr_epi8(
-        0x00, 0x6c, 0x4a, 0x01, 0x5b, 0x7d, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    ));
-    let last_diff = _mm256_sub_epi32(dist, last_distance);
-    let second_last_diff = _mm256_sub_epi32(dist, second_last_distance);
-    let six = _mm256_set1_epi32(6);
-    let last_matches = _mm256_and_si256(
-        _mm256_cmpgt_epi32(last_diff, _mm256_setzero_si256()),
-        _mm256_cmpgt_epi32(six, last_diff),
-    );
-    let second_last_matches = _mm256_and_si256(
-        _mm256_cmpgt_epi32(second_last_diff, _mm256_setzero_si256()),
-        _mm256_cmpgt_epi32(six, second_last_diff),
-    );
+    let lut = u8x32::from_array([
+        0x00, 0x6c, 0x4a, 0x01, 0x5b, 0x7d, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x6c, 0x4a, 0x01,
+        0x5b, 0x7d, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ]);
+    let last_diff = (dist - last_distance).cast::<i32>();
+    let second_last_diff = (dist - second_last_distance).cast::<i32>();
+    let six = i32x8::splat(6);
+    let last_matches = last_diff.simd_gt(i32x8::splat(0)) & six.simd_gt(last_diff);
+    let second_last_matches =
+        second_last_diff.simd_gt(i32x8::splat(0)) & six.simd_gt(second_last_diff);
 
-    let code = _mm256_castps_si256(_mm256_blendv_ps(
-        _mm256_castsi256_ps(code),
-        _mm256_castsi256_ps(_mm256_and_si256(
-            _mm256_set1_epi32(0xf),
-            _mm256_shuffle_epi8(lut, second_last_diff),
-        )),
-        _mm256_castsi256_ps(second_last_matches),
-    ));
-
-    let code = _mm256_castps_si256(_mm256_blendv_ps(
-        _mm256_castsi256_ps(code),
-        _mm256_castsi256_ps(_mm256_srai_epi32::<4>(_mm256_shuffle_epi8(lut, last_diff))),
-        _mm256_castsi256_ps(last_matches),
-    ));
+    let second_last_diff_sym =
+        u32x8::from_le_bytes(lut.swizzle_dyn(second_last_diff.to_le_bytes())) & u32x8::splat(0xf);
+    let code = second_last_matches.select(second_last_diff_sym, code);
+    let last_diff_sym =
+        u32x8::from_le_bytes(lut.swizzle_dyn(last_diff.to_le_bytes())) >> u32x8::splat(4);
+    let code = last_matches.select(last_diff_sym, code);
 
     let shifted_ctx =
-        _mm256_slli_epi32::<LOG_MAX_DIST>(_mm256_loadu_si256(distance_ctx_buf.as_ptr().cast()));
+        u32x8::from_array(distance_ctx_buf.clone()) << u32x8::splat(LOG_MAX_DIST as u32);
 
-    let code = _mm256_add_epi32(
-        _mm256_add_epi32(_mm256_set1_epi32((SYMBOL_MASK + DIST_BASE) as i32), code),
-        shifted_ctx,
-    );
+    let code = shifted_ctx + code + u32x8::splat((SYMBOL_MASK + DIST_BASE) as u32);
 
-    let last_mask = _mm256_or_si256(last_matches, second_last_matches);
-    let bits = _mm256_andnot_si256(last_mask, bits);
-    let nbits = _mm256_andnot_si256(last_mask, nbits);
-    let nbits_count = _mm256_srli_epi32::<4>(_mm256_add_epi32(nbits, _mm256_set1_epi32(15)));
-    let nbits_pat = _mm256_or_si256(nbits, _mm256_slli_epi32::<16>(nbits));
-    let nbits_pat = _mm256_min_epi16(
-        _mm256_subs_epu16(nbits_pat, _mm256_set1_epi32(16 << 16)),
-        _mm256_set1_epi16(16),
-    );
-    _mm256_storeu_si256(sym_buf.as_mut_ptr().cast(), code);
-    _mm256_storeu_si256(bits_buf.as_mut_ptr().cast(), bits);
-    _mm256_storeu_si256(nbits_pat_buf.as_mut_ptr().cast(), nbits_pat);
-    _mm256_storeu_si256(nbits_count_buf.as_mut_ptr().cast(), nbits_count);
+    let last_mask = (last_matches | second_last_matches).to_int().cast::<u32>();
+    let bits = !last_mask & bits;
+    let nbits = !last_mask & nbits;
+    let nbits_count = (nbits + u32x8::splat(15)) >> u32x8::splat(4);
+    let nbits_pat = u16x16::from_le_bytes((nbits | (nbits << u32x8::splat(16))).to_le_bytes());
+    let nbits_pat = nbits_pat
+        .saturating_sub(u16x16::from_le_bytes(u32x8::splat(16 << 16).to_le_bytes()))
+        .cast::<i16>()
+        .simd_min(i16x16::splat(16));
+    nbits_count.copy_to_slice(nbits_count_buf);
+    u32x8::from_le_bytes(nbits_pat.to_le_bytes()).copy_to_slice(nbits_pat_buf);
+    bits.copy_to_slice(bits_buf);
+    code.copy_to_slice(sym_buf);
 }
 
 #[cfg(test)]
 mod test {
-    use std::arch::x86_64::{_mm256_loadu_si256, _mm256_storeu_si256};
-
     use crate::constants::*;
+    use std::simd::prelude::*;
 
     use super::{
         copy_len_to_sym_and_bits, copy_len_to_sym_and_bits_simd, distance_to_sym_and_bits_simd,
@@ -429,117 +378,112 @@ mod test {
 
     #[test]
     fn test_distance_simd() {
-        unsafe {
-            let mut distances = [0u32; 1024];
-            let distance_ctx_buf = [0, 1, 0, 1, 0, 1, 0, 1];
-            let mut distance_bits_buf = [0; 8];
-            let mut distance_nbits_pat_buf = [0; 8];
-            let mut distance_nbits_count_buf = [0; 8];
-            let mut distance_sym_buf = [0; 8];
-            for d in 1..WSIZE {
-                if d % 5 == 0 {
-                    for i in 0..10 {
-                        distances[i] = d as u32;
-                    }
-                } else if d % 5 == 1 {
-                    for i in 0..10 {
-                        distances[i] = (d + (i % 2)) as u32;
-                    }
-                } else if d % 5 == 2 {
-                    for i in 0..10 {
-                        distances[i] = (d + (i / 2 % 2)) as u32;
-                    }
-                } else if d % 5 == 3 {
-                    for i in 0..10 {
-                        distances[i] = (d + i * 4) as u32;
-                    }
-                } else if d % 5 == 4 {
-                    for i in 0..10 {
-                        distances[i] = if i % 2 == 0 { d } else { d + 2 } as u32;
-                    }
+        let mut distances = [0u32; 1024];
+        let distance_ctx_buf = [0, 1, 0, 1, 0, 1, 0, 1];
+        let mut distance_bits_buf = [0; 8];
+        let mut distance_nbits_pat_buf = [0; 8];
+        let mut distance_nbits_count_buf = [0; 8];
+        let mut distance_sym_buf = [0; 8];
+        for d in 1..WSIZE {
+            if d % 5 == 0 {
+                for i in 0..10 {
+                    distances[i] = d as u32;
                 }
-                distance_to_sym_and_bits_simd(
-                    &distances,
-                    0,
-                    &distance_ctx_buf,
-                    &mut distance_sym_buf,
-                    &mut distance_bits_buf,
-                    &mut distance_nbits_pat_buf,
-                    &mut distance_nbits_count_buf,
+            } else if d % 5 == 1 {
+                for i in 0..10 {
+                    distances[i] = (d + (i % 2)) as u32;
+                }
+            } else if d % 5 == 2 {
+                for i in 0..10 {
+                    distances[i] = (d + (i / 2 % 2)) as u32;
+                }
+            } else if d % 5 == 3 {
+                for i in 0..10 {
+                    distances[i] = (d + i * 4) as u32;
+                }
+            } else if d % 5 == 4 {
+                for i in 0..10 {
+                    distances[i] = if i % 2 == 0 { d } else { d + 2 } as u32;
+                }
+            }
+            distance_to_sym_and_bits_simd(
+                &distances,
+                0,
+                &distance_ctx_buf,
+                &mut distance_sym_buf,
+                &mut distance_bits_buf,
+                &mut distance_nbits_pat_buf,
+                &mut distance_nbits_count_buf,
+            );
+            for i in 0..8 {
+                let distance = distances[i + 2];
+                // if last_distance == second_last_distance, second_last_distance is incorrect.
+                // However, in that case, we always select last_distance anyway.
+                let last_distance = distances[i + 1];
+                let second_last_distance = distances[i];
+                let (sym, nbits, bits) = distance_to_sym_and_bits_with_cache(
+                    distance,
+                    last_distance,
+                    second_last_distance,
                 );
-                for i in 0..8 {
-                    let distance = distances[i + 2];
-                    // if last_distance == second_last_distance, second_last_distance is incorrect.
-                    // However, in that case, we always select last_distance anyway.
-                    let last_distance = distances[i + 1];
-                    let second_last_distance = distances[i];
-                    let (sym, nbits, bits) = distance_to_sym_and_bits_with_cache(
-                        distance,
-                        last_distance,
-                        second_last_distance,
-                    );
-                    let adj_sym = sym as u16
-                        + (SYMBOL_MASK + DIST_BASE)
-                        + distance_ctx_buf[i] as u16 * MAX_DIST as u16;
-                    assert_eq!(adj_sym as u32, distance_sym_buf[i]);
-                    assert_eq!(bits as u32, distance_bits_buf[i]);
-                    assert_eq!(
-                        nbits as u64,
-                        get_nbits(
-                            distance_nbits_pat_buf[i] as u64,
-                            distance_nbits_count_buf[i]
-                        )
-                    );
-                }
+                let adj_sym = sym as u16
+                    + (SYMBOL_MASK + DIST_BASE)
+                    + distance_ctx_buf[i] as u16 * MAX_DIST as u16;
+                assert_eq!(adj_sym as u32, distance_sym_buf[i]);
+                assert_eq!(bits as u32, distance_bits_buf[i]);
+                assert_eq!(
+                    nbits as u64,
+                    get_nbits(
+                        distance_nbits_pat_buf[i] as u64,
+                        distance_nbits_count_buf[i]
+                    )
+                );
             }
         }
     }
 
     #[test]
     fn test_insert_and_copy_simd() {
-        unsafe {
-            let mut insert = [0; 8];
-            let mut copy = [0; 8];
-            let mut sym_buf = [0; 8];
-            let mut bits_buf = [0; 8];
-            let mut nbits_pat_buf = [0; 8];
-            let mut nbits_count_buf = [0; 8];
-            let mut distance_ctx_buf = [0; 8];
-            for i in (0..METABLOCK_SIZE).step_by(8) {
-                if i > 22594 && i % 1024 != 0 {
+        let mut insert = [0; 8];
+        let mut copy = [0; 8];
+        let mut sym_buf = [0; 8];
+        let mut bits_buf = [0; 8];
+        let mut nbits_pat_buf = [0; 8];
+        let mut nbits_count_buf = [0; 8];
+        let mut distance_ctx_buf = [0; 8];
+        for i in (0..METABLOCK_SIZE).step_by(8) {
+            if i > 22594 && i % 1024 != 0 {
+                continue;
+            }
+            for j in (4..MAX_COPY_LEN).step_by(8) {
+                if j > 2118 && j % 1024 != 0 {
                     continue;
                 }
-                for j in (4..MAX_COPY_LEN).step_by(8) {
-                    if j > 2118 && j % 1024 != 0 {
-                        continue;
-                    }
-                    for x in 0..8 {
-                        insert[x] = (i + x) as u32;
-                        copy[x] = (j + x) as u32;
-                    }
-                    insert_copy_len_to_sym_and_bits_simd(
-                        insert.as_ptr(),
-                        copy.as_ptr(),
-                        &mut sym_buf,
-                        &mut bits_buf,
-                        &mut nbits_pat_buf,
-                        &mut nbits_count_buf,
-                        &mut distance_ctx_buf,
+                for x in 0..8 {
+                    insert[x] = (i + x) as u32;
+                    copy[x] = (j + x) as u32;
+                }
+                insert_copy_len_to_sym_and_bits_simd(
+                    &insert,
+                    &copy,
+                    &mut sym_buf,
+                    &mut bits_buf,
+                    &mut nbits_pat_buf,
+                    &mut nbits_count_buf,
+                    &mut distance_ctx_buf,
+                );
+                for x in 0..8 {
+                    let (sym, nbits, bits) = insert_copy_len_to_sym_and_bits(insert[x], copy[x]);
+                    assert_eq!((sym | SYMBOL_MASK) as u32, sym_buf[x as usize]);
+                    assert_eq!(
+                        nbits as u64,
+                        get_nbits(nbits_pat_buf[x as usize], nbits_count_buf[x as usize])
                     );
-                    for x in 0..8 {
-                        let (sym, nbits, bits) =
-                            insert_copy_len_to_sym_and_bits(insert[x], copy[x]);
-                        assert_eq!((sym | SYMBOL_MASK) as u32, sym_buf[x as usize]);
-                        assert_eq!(
-                            nbits as u64,
-                            get_nbits(nbits_pat_buf[x as usize], nbits_count_buf[x as usize])
-                        );
-                        assert_eq!(bits, bits_buf[x as usize]);
-                        assert_eq!(
-                            if copy[x] <= 4 { 0 } else { 1 },
-                            distance_ctx_buf[x as usize]
-                        )
-                    }
+                    assert_eq!(bits, bits_buf[x as usize]);
+                    assert_eq!(
+                        if copy[x] <= 4 { 0 } else { 1 },
+                        distance_ctx_buf[x as usize]
+                    )
                 }
             }
         }
@@ -547,52 +491,46 @@ mod test {
 
     #[test]
     fn test_insert_simd() {
-        unsafe {
-            let mut insert = [0; 8];
-            let mut sym_buf = [0; 8];
-            let mut bits_buf = [0; 8];
-            let mut nbits_buf = [0; 8];
-            for i in (0..METABLOCK_SIZE).step_by(8) {
-                for x in 0..8 {
-                    insert[x] = (i + x) as u32;
-                }
-                let (sym, nbits, bits) =
-                    insert_len_to_sym_and_bits_simd(_mm256_loadu_si256(insert.as_ptr().cast()));
-                _mm256_storeu_si256(sym_buf.as_mut_ptr().cast(), sym);
-                _mm256_storeu_si256(bits_buf.as_mut_ptr().cast(), bits);
-                _mm256_storeu_si256(nbits_buf.as_mut_ptr().cast(), nbits);
-                for x in 0..8 {
-                    let (sym, nbits, bits) = insert_len_to_sym_and_bits(i as u32 + x);
-                    assert_eq!(sym as u32, sym_buf[x as usize]);
-                    assert_eq!(nbits, nbits_buf[x as usize]);
-                    assert_eq!(bits, bits_buf[x as usize]);
-                }
+        let mut insert = [0; 8];
+        let mut sym_buf = [0; 8];
+        let mut bits_buf = [0; 8];
+        let mut nbits_buf = [0; 8];
+        for i in (0..METABLOCK_SIZE).step_by(8) {
+            for x in 0..8 {
+                insert[x] = (i + x) as u32;
+            }
+            let (sym, nbits, bits) = insert_len_to_sym_and_bits_simd(u32x8::from_slice(&insert));
+            sym.copy_to_slice(&mut sym_buf);
+            bits.copy_to_slice(&mut bits_buf);
+            nbits.copy_to_slice(&mut nbits_buf);
+            for x in 0..8 {
+                let (sym, nbits, bits) = insert_len_to_sym_and_bits(i as u32 + x);
+                assert_eq!(sym as u32, sym_buf[x as usize]);
+                assert_eq!(nbits, nbits_buf[x as usize]);
+                assert_eq!(bits, bits_buf[x as usize]);
             }
         }
     }
 
     #[test]
     fn test_copy_simd() {
-        unsafe {
-            let mut copy = [0; 8];
-            let mut sym_buf = [0; 8];
-            let mut bits_buf = [0; 8];
-            let mut nbits_buf = [0; 8];
-            for i in (2..METABLOCK_SIZE).step_by(8) {
-                for x in 0..8 {
-                    copy[x] = (i + x) as u32;
-                }
-                let (sym, nbits, bits) =
-                    copy_len_to_sym_and_bits_simd(_mm256_loadu_si256(copy.as_ptr().cast()));
-                _mm256_storeu_si256(sym_buf.as_mut_ptr().cast(), sym);
-                _mm256_storeu_si256(bits_buf.as_mut_ptr().cast(), bits);
-                _mm256_storeu_si256(nbits_buf.as_mut_ptr().cast(), nbits);
-                for x in 0..8 {
-                    let (sym, nbits, bits) = copy_len_to_sym_and_bits(i as u32 + x);
-                    assert_eq!(sym as u32, sym_buf[x as usize]);
-                    assert_eq!(nbits, nbits_buf[x as usize]);
-                    assert_eq!(bits, bits_buf[x as usize]);
-                }
+        let mut copy = [0; 8];
+        let mut sym_buf = [0; 8];
+        let mut bits_buf = [0; 8];
+        let mut nbits_buf = [0; 8];
+        for i in (2..METABLOCK_SIZE).step_by(8) {
+            for x in 0..8 {
+                copy[x] = (i + x) as u32;
+            }
+            let (sym, nbits, bits) = copy_len_to_sym_and_bits_simd(u32x8::from_slice(&copy));
+            sym.copy_to_slice(&mut sym_buf);
+            bits.copy_to_slice(&mut bits_buf);
+            nbits.copy_to_slice(&mut nbits_buf);
+            for x in 0..8 {
+                let (sym, nbits, bits) = copy_len_to_sym_and_bits(i as u32 + x);
+                assert_eq!(sym as u32, sym_buf[x as usize]);
+                assert_eq!(nbits, nbits_buf[x as usize]);
+                assert_eq!(bits, bits_buf[x as usize]);
             }
         }
     }

@@ -18,12 +18,7 @@ use crate::bitwriter::BitWriter;
 
 const MAX_BITS: usize = 15;
 
-#[repr(C)]
-#[derive(Debug, Default, Clone, Copy)]
-pub struct HuffmanCodeEntry {
-    pub(crate) len: u16,
-    pub(crate) bits: u16,
-}
+pub type HuffmanCodeEntry = u32;
 
 #[derive(Debug, Default)]
 pub struct HuffmanCode<'a> {
@@ -50,8 +45,8 @@ fn compute_bits_from_lengths(buf: &mut [HuffmanCodeEntry]) {
     // In Brotli, all bit depths are [1..15]
     const MAX_BITS: usize = 16;
     let mut len_counts = [0; MAX_BITS];
-    for HuffmanCodeEntry { len: d, .. } in buf.iter() {
-        len_counts[*d as usize] += 1;
+    for code in buf.iter() {
+        len_counts[(*code & 0xFFFF) as usize] += 1;
     }
     len_counts[0] = 0;
     let mut next_code = [0; MAX_BITS];
@@ -61,9 +56,10 @@ fn compute_bits_from_lengths(buf: &mut [HuffmanCodeEntry]) {
         next_code[i] = code & 0xffff;
     }
     for i in 0..buf.len() {
-        if buf[i].len != 0 {
-            buf[i].bits = reverse_bits(buf[i].len as usize, next_code[buf[i].len as usize]);
-            next_code[buf[i].len as usize] += 1;
+        let l = buf[i] & 0xFFFF;
+        if l != 0 {
+            buf[i] |= (reverse_bits(l as usize, next_code[l as usize]) as u32) << 16;
+            next_code[l as usize] += 1;
         }
     }
 }
@@ -77,7 +73,7 @@ impl<'a> HuffmanCode<'a> {
         assert!(max_len < 16);
         assert!(counts.len() <= (1 << max_len));
         assert!(counts.iter().all(|x| *x < (1u32 << 30)));
-        let total = counts.iter().sum();
+        let total = counts.iter().sum::<u32>();
         assert_ne!(total, 0);
 
         let n = counts.len();
@@ -143,7 +139,7 @@ impl<'a> HuffmanCode<'a> {
             for i in (0..parent.len() as u32).rev() {
                 let depth = if let Some(p) = parent[i as usize] {
                     debug_assert!(p > i);
-                    buf[p as usize].len + 1
+                    (buf[p as usize] & 0xFFFF) + 1
                 } else {
                     0
                 };
@@ -151,7 +147,7 @@ impl<'a> HuffmanCode<'a> {
                     min_count *= 2;
                     continue 'retry;
                 }
-                buf[i as usize].len = depth;
+                buf[i as usize] = depth;
             }
             break;
         }
@@ -174,7 +170,7 @@ impl<'a> HuffmanCode<'a> {
         }
         bw.write(2, 0b01);
         bw.write(2, nonzero_syms.len() as u64 - 1);
-        nonzero_syms.sort_by_key(|x| (self.code[*x as usize].len, *x));
+        nonzero_syms.sort_by_key(|x| (self.code[*x as usize] & 0xFFFF, *x));
 
         for sym in nonzero_syms.iter() {
             bw.write(self.bit_width(), *sym as u64);
@@ -182,7 +178,7 @@ impl<'a> HuffmanCode<'a> {
         if nonzero_syms.len() == 4 {
             bw.write(
                 1,
-                if self.code[nonzero_syms[0] as usize].len == 1 {
+                if self.code[nonzero_syms[0] as usize] & 0xFFFF == 1 {
                     1
                 } else {
                     0
@@ -200,7 +196,7 @@ impl<'a> HuffmanCode<'a> {
         let mut nonzero_syms: Vec<_> = self
             .code
             .iter()
-            .map(|HuffmanCodeEntry { len, .. }| *len)
+            .map(|code| *code & 0xFFFF)
             .enumerate()
             .filter(|(_, l)| *l != 0)
             .take(5)
@@ -218,15 +214,11 @@ impl<'a> HuffmanCode<'a> {
 
         let mut rle_lengths = vec![];
 
-        let mut iter = self
-            .code
-            .iter()
-            .map(|HuffmanCodeEntry { len, .. }| len)
-            .peekable();
+        let mut iter = self.code.iter().map(|code| *code & 0xFFFF).peekable();
 
         let mut last_nonzero = 8;
 
-        while let Some(&&v) = iter.peek() {
+        while let Some(&v) = iter.peek() {
             let mut count = 0;
             while iter.peek() == Some(&&v) {
                 count += 1;
@@ -291,20 +283,18 @@ impl<'a> HuffmanCode<'a> {
             }
         } else {
             let mut num_code_length = 18;
-            while code_length_code.code[code_length_order[num_code_length - 1]].len == 0 {
+            while code_length_code.code[code_length_order[num_code_length - 1]] & 0xFFFF == 0 {
                 num_code_length -= 1;
             }
             for i in 0..num_code_length {
-                let sym = code_length_code.code[code_length_order[i]].len as usize;
+                let sym = (code_length_code.code[code_length_order[i]] & 0xFFFF) as usize;
                 bw.write(code_length_length_nbits[sym], code_length_length_bits[sym]);
             }
         }
 
         for (sym, extra) in rle_lengths {
-            bw.write(
-                code_length_code.code[sym as usize].len as usize,
-                code_length_code.code[sym as usize].bits as u64,
-            );
+            let (len, bits) = code_length_code.symbol_info(sym as usize);
+            bw.write(len, bits);
             if sym == 17 {
                 bw.write(3, extra);
             } else if sym == 16 {
@@ -315,7 +305,10 @@ impl<'a> HuffmanCode<'a> {
         }
     }
     pub fn symbol_info(&self, sym: usize) -> (usize, u64) {
-        (self.code[sym].len as usize, self.code[sym].bits as u64)
+        (
+            (self.code[sym] & 0xFFFF) as usize,
+            (self.code[sym] >> 16) as u64,
+        )
     }
 }
 
@@ -349,10 +342,8 @@ impl ContextMap {
         cmap_code.write(bw);
         for i in self.tree_idx.iter() {
             let sym = *i as usize;
-            bw.write(
-                cmap_code.code[sym].len as usize,
-                cmap_code.code[sym].bits as u64,
-            );
+            let (len, bits) = cmap_code.symbol_info(sym);
+            bw.write(len, bits);
         }
         bw.write(1, 0b0); // no MTF.
     }

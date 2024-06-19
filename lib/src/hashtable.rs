@@ -15,7 +15,8 @@
 use crate::compress::MetablockData;
 use crate::constants::*;
 use hugepage_slice::BoxedHugePageSlice;
-use std::{arch::x86_64::*, mem::size_of, ptr::copy_nonoverlapping};
+use std::simd::prelude::*;
+use std::simd::ToBytes;
 
 const LOG_TABLE_SIZE: u32 = 17;
 const TABLE_SIZE: u32 = 1 << LOG_TABLE_SIZE;
@@ -25,8 +26,7 @@ fn hash(data: u32) -> u32 {
 }
 
 #[inline]
-#[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2,bmi1,bmi2,popcnt,fma")]
-unsafe fn fill_entry_inner(
+fn fill_entry_inner(
     pos: usize,
     chunk1: u32,
     chunk2: u32,
@@ -43,33 +43,17 @@ unsafe fn fill_entry_inner(
     }
     let idx = *ridx as usize - 1;
     *ridx = *ridx % ENTRY_SIZE as u8 + 1;
-    *table.pos.get_unchecked_mut(idx) = pos as u32;
-    *table.chunk1.get_unchecked_mut(idx) = chunk1;
-    *table.chunk2.get_unchecked_mut(idx) = chunk2;
-    *table.chunk3.get_unchecked_mut(idx) = chunk3;
+    table.pos[idx] = pos as u32;
+    table.chunk1[idx] = chunk1;
+    table.chunk2[idx] = chunk2;
+    table.chunk3[idx] = chunk3;
 }
 
 #[inline]
-#[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2,bmi1,bmi2,popcnt,fma")]
-unsafe fn fill_entry(data: &[u8], pos: usize, table: &mut HashTableEntry, ridx: &mut u8) {
-    let mut chunk1 = 0;
-    let mut chunk2 = 0;
-    let mut chunk3 = 0;
-    copy_nonoverlapping(
-        data.as_ptr().add(pos),
-        (&mut chunk1) as *mut u32 as *mut u8,
-        4,
-    );
-    copy_nonoverlapping(
-        data.as_ptr().add(pos + 4),
-        (&mut chunk2) as *mut u32 as *mut u8,
-        4,
-    );
-    copy_nonoverlapping(
-        data.as_ptr().add(pos + 8),
-        (&mut chunk3) as *mut u32 as *mut u8,
-        4,
-    );
+fn fill_entry(data: &[u8], pos: usize, table: &mut HashTableEntry, ridx: &mut u8) {
+    let chunk1 = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+    let chunk2 = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap());
+    let chunk3 = u32::from_le_bytes(data[pos + 8..pos + 12].try_into().unwrap());
     fill_entry_inner(pos, chunk1, chunk2, chunk3, table, ridx);
 }
 
@@ -85,16 +69,15 @@ struct HashTableEntry {
 }
 
 #[inline]
-#[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2,bmi1,bmi2,popcnt,fma")]
-unsafe fn longest_match(data: &[u8], pos1: u32, pos2: usize) -> usize {
+fn longest_match(data: &[u8], pos1: u32, pos2: usize) -> usize {
     let pos1 = pos1 as usize;
     debug_assert!(pos2 > pos1);
     let max = (data.len() - pos2 - INTERIOR_MARGIN).min(MAX_COPY_LEN);
     let mut i = 0;
     while i + 32 <= max {
-        let data1 = _mm256_loadu_si256(data[pos1 + i..].as_ptr() as *const __m256i);
-        let data2 = _mm256_loadu_si256(data[pos2 + i..].as_ptr() as *const __m256i);
-        let mask = !(_mm256_movemask_epi8(_mm256_cmpeq_epi8(data1, data2)) as u32);
+        let data1 = u8x32::from_slice(&data[pos1 + i..]);
+        let data2 = u8x32::from_slice(&data[pos2 + i..]);
+        let mask = !(data1.simd_eq(data2).to_bitmask() as u32);
         if mask != 0 {
             return i + mask.trailing_zeros() as usize;
         }
@@ -110,17 +93,15 @@ unsafe fn longest_match(data: &[u8], pos1: u32, pos2: usize) -> usize {
 }
 
 #[inline]
-#[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2,bmi1,bmi2,popcnt,fma")]
-unsafe fn _mm256_ilog2_epi32(x: __m256i) -> __m256i {
-    let float = _mm256_castps_si256(_mm256_cvtepi32_ps(x));
-    _mm256_sub_epi32(_mm256_srli_epi32::<23>(float), _mm256_set1_epi32(127))
+fn ilog2(x: u32x8) -> u32x8 {
+    let float_bits = x.cast::<f32>().to_bits();
+    (float_bits >> u32x8::splat(23)) - u32x8::splat(127)
 }
 
 /// Returns distance, copy len, gain.
 /// Copy len is 0 if nothing is found.
 #[inline]
-#[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2,bmi1,bmi2,popcnt,fma")]
-unsafe fn best_match(
+fn best_match(
     data: &[u8],
     pos: usize,
     table: &mut HashTableEntry,
@@ -130,33 +111,18 @@ unsafe fn best_match(
         fill_entry(data, pos, table, replacement_idx);
         return (0, 0, 0);
     }
-    let mut chunk1 = 0;
-    let mut chunk2 = 0;
-    let mut chunk3 = 0;
-    copy_nonoverlapping(
-        data.as_ptr().add(pos),
-        (&mut chunk1) as *mut u32 as *mut u8,
-        4,
-    );
-    copy_nonoverlapping(
-        data.as_ptr().add(pos + 4),
-        (&mut chunk2) as *mut u32 as *mut u8,
-        4,
-    );
-    copy_nonoverlapping(
-        data.as_ptr().add(pos + 8),
-        (&mut chunk3) as *mut u32 as *mut u8,
-        4,
-    );
+    let chunk1 = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+    let chunk2 = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap());
+    let chunk3 = u32::from_le_bytes(data[pos + 8..pos + 12].try_into().unwrap());
 
-    let mut best_distance = _mm256_setzero_si256();
-    let mut best_len = _mm256_setzero_si256();
-    let mut best_gain = _mm256_setzero_si256();
+    let mut best_distance = u32x8::splat(0);
+    let mut best_len = u32x8::splat(0);
+    let mut best_gain = i32x8::splat(0);
 
-    let vpos = _mm256_set1_epi32(pos as i32);
-    let vchunk1 = _mm256_set1_epi32(chunk1 as i32);
-    let vchunk2 = _mm256_set1_epi32(chunk2 as i32);
-    let vchunk3 = _mm256_set1_epi32(chunk3 as i32);
+    let vpos = u32x8::splat(pos as u32);
+    let vchunk1 = u32x8::splat(chunk1);
+    let vchunk2 = u32x8::splat(chunk2).to_le_bytes();
+    let vchunk3 = u32x8::splat(chunk3).to_le_bytes();
 
     const _: () = assert!(ENTRY_SIZE <= 64);
 
@@ -165,70 +131,60 @@ unsafe fn best_match(
     let mut local_pos = [0u32; ENTRY_SIZE];
 
     for i in (0..(ENTRY_SIZE / 8)).rev() {
-        let hpos = _mm256_load_si256((table.pos.as_ptr() as *const __m256i).offset(i as isize));
-        _mm256_storeu_si256(
-            (local_pos.as_mut_ptr() as *mut __m256i).offset(i as isize),
-            hpos,
+        let hpos = u32x8::from_slice(&table.pos[i * 8..]);
+        hpos.copy_to_slice(&mut local_pos[i * 8..(i + 1) * 8]);
+        let hchunk1 = u32x8::from_slice(&table.chunk1[i * 8..]);
+        let hchunk2 = u32x8::from_slice(&table.chunk2[i * 8..]).to_le_bytes();
+        let hchunk3 = u32x8::from_slice(&table.chunk3[i * 8..]).to_le_bytes();
+
+        let dist = vpos - hpos;
+        let valid_mask = !dist.simd_gt(u32x8::splat(WSIZE as u32)) & vchunk1.simd_eq(hchunk1);
+        let eq2 = vchunk2.simd_eq(hchunk2).to_int();
+        let eq3 = vchunk3.simd_eq(hchunk3).to_int();
+        let eq2 = u32x8::from_le_bytes(eq2.cast());
+        let eq3 = u32x8::from_le_bytes(eq3.cast());
+
+        let matches2 = eq2.simd_eq(u32x8::splat(u32::MAX));
+
+        let last_eq = matches2.select(eq3, eq2);
+        let last_ncnt = !last_eq & u32x8::splat(0x01020304);
+        let last_ncnt = u32x8::from_le_bytes(
+            last_ncnt
+                .to_le_bytes()
+                .simd_max((last_ncnt >> u32x8::splat(8)).to_le_bytes()),
         );
-        let hchunk1 =
-            _mm256_load_si256((table.chunk1.as_ptr() as *const __m256i).offset(i as isize));
-        let hchunk2 =
-            _mm256_load_si256((table.chunk2.as_ptr() as *const __m256i).offset(i as isize));
-        let hchunk3 =
-            _mm256_load_si256((table.chunk3.as_ptr() as *const __m256i).offset(i as isize));
-
-        let dist = _mm256_sub_epi32(vpos, hpos);
-        let valid_mask = _mm256_andnot_si256(
-            _mm256_cmpgt_epi32(dist, _mm256_set1_epi32(WSIZE as i32)),
-            _mm256_cmpeq_epi32(vchunk1, hchunk1),
+        let last_ncnt = u32x8::from_le_bytes(
+            last_ncnt
+                .to_le_bytes()
+                .simd_max((last_ncnt >> u32x8::splat(16)).to_le_bytes()),
         );
+        let last_cnt_p4 = u32x8::splat(8) - (last_ncnt & u32x8::splat(0xFF));
 
-        let eq2 = _mm256_cmpeq_epi8(vchunk2, hchunk2);
-        let eq3 = _mm256_cmpeq_epi8(vchunk3, hchunk3);
-
-        let matches2 = _mm256_cmpeq_epi32(eq2, _mm256_set1_epi8(-1));
-
-        let last_eq = _mm256_blendv_epi8(eq2, eq3, matches2);
-        let last_ncnt = _mm256_andnot_si256(last_eq, _mm256_set1_epi32(0x01020304));
-        let last_ncnt = _mm256_max_epi8(last_ncnt, _mm256_srli_epi32::<8>(last_ncnt));
-        let last_ncnt = _mm256_max_epi8(last_ncnt, _mm256_srli_epi32::<16>(last_ncnt));
-        let last_cnt_p4 = _mm256_sub_epi32(
-            _mm256_set1_epi32(8),
-            _mm256_and_si256(last_ncnt, _mm256_set1_epi32(0xff)),
-        );
-
-        let len = _mm256_add_epi32(
-            _mm256_and_si256(_mm256_set1_epi32(4), matches2),
-            last_cnt_p4,
-        );
-        let len = _mm256_and_si256(valid_mask, len);
-        let len_is_12_v = _mm256_cmpeq_epi32(len, _mm256_set1_epi32(12));
-        let len_is_12 = _mm256_movemask_ps(_mm256_castsi256_ps(len_is_12_v)) as u32;
+        let len = (matches2.to_int().cast() & u32x8::splat(4)) + last_cnt_p4;
+        let len = valid_mask.to_int().cast() & len;
+        let len_is_12_v = len.simd_eq(u32x8::splat(12));
+        let len_is_12 = len_is_12_v.to_bitmask() as u32;
         len12p_mask |= (len_is_12 as u64) << (i * 8);
 
-        let gain = _mm256_sub_epi32(
-            _mm256_slli_epi32::<2>(len),
-            _mm256_add_epi32(_mm256_ilog2_epi32(dist), _mm256_set1_epi32(6)),
-        );
+        let gain =
+            (len << u32x8::splat(2)).cast::<i32>() - (ilog2(dist) + u32x8::splat(6)).cast::<i32>();
 
-        let better_gain = _mm256_cmpgt_epi32(gain, best_gain);
-        best_gain = _mm256_max_epi32(gain, best_gain);
-        best_len = _mm256_blendv_epi8(best_len, len, better_gain);
-        best_distance = _mm256_blendv_epi8(best_distance, dist, better_gain);
+        let better_gain = gain.simd_gt(best_gain);
+        best_gain = gain.simd_max(best_gain);
+        best_len = better_gain.select(len, best_len);
+        best_distance = better_gain.select(dist, best_distance);
     }
 
-    let mut max = _mm256_max_epi32(best_gain, _mm256_shuffle_epi32::<0b10110001>(best_gain));
-    max = _mm256_max_epi32(max, _mm256_shuffle_epi32::<0b01001110>(max));
-    max = _mm256_max_epi32(max, _mm256_permute4x64_epi64::<0b01001110>(max));
-    let not_max = _mm256_cmpgt_epi32(max, best_gain);
-    let max_pos = _mm256_or_si256(not_max, _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
-    let mut max_pos = _mm256_max_epi32(max_pos, _mm256_shuffle_epi32::<0b10110001>(max_pos));
-    max_pos = _mm256_max_epi32(max_pos, _mm256_shuffle_epi32::<0b01001110>(max_pos));
-    max_pos = _mm256_max_epi32(max_pos, _mm256_permute4x64_epi64::<0b01001110>(max_pos));
-    let mut d =
-        _mm256_extract_epi32::<0>(_mm256_permutevar8x32_epi32(best_distance, max_pos)) as u32;
-    let mut l = _mm256_extract_epi32::<0>(_mm256_permutevar8x32_epi32(best_len, max_pos)) as u32;
-    let mut g = _mm256_extract_epi32::<0>(_mm256_permutevar8x32_epi32(best_gain, max_pos));
+    let max = i32x8::splat(best_gain.reduce_max());
+    let not_max = max.simd_gt(best_gain);
+    let max_pos = (not_max.to_int().cast() | i32x8::from_array([0, 1, 2, 3, 4, 5, 6, 7]))
+        .reduce_max() as usize;
+    let dv = best_distance.to_array();
+    let lv = best_len.to_array();
+    let gv = best_gain.to_array();
+    let mut d = dv[max_pos];
+    let mut l = lv[max_pos];
+    let mut g = gv[max_pos];
 
     fill_entry_inner(pos, chunk1, chunk2, chunk3, table, replacement_idx);
 
@@ -237,11 +193,8 @@ unsafe fn best_match(
         while mask > 0 {
             let p = mask.trailing_zeros() as usize;
             mask &= mask - 1;
-            _mm_prefetch::<_MM_HINT_T0>(
-                data.as_ptr()
-                    .add(*local_pos.get_unchecked(p) as usize)
-                    .cast(),
-            );
+            use prefetch::prefetch::{prefetch, Data, High, Read};
+            prefetch::<Read, High, Data, u8>(data[local_pos[p] as usize..].as_ptr());
         }
         while len12p_mask > 0 {
             let p = len12p_mask.trailing_zeros() as usize;
@@ -286,105 +239,49 @@ const CONTEXT_LUT1: [u8; 256] = [
 const PRECOMPUTE_SIZE: usize = 16;
 
 #[inline]
-#[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2,bmi1,bmi2,popcnt,fma")]
-unsafe fn compute_context(pos: usize, data: &[u8], context: &mut [u8; PRECOMPUTE_SIZE]) {
-    let ctx_in = _mm_loadu_si128(data.as_ptr().add(pos - 2).cast());
-    // low 64 bits: data[-2], high 64 bits: data[-1].
-    let ctx_in_128 = _mm_shuffle_epi8(
-        ctx_in,
-        _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 1, 2, 3, 4, 5, 6, 7, 8),
-    );
-    let ctx_in = _mm256_broadcastsi128_si256(ctx_in_128);
-    let tbl1 = _mm256_setr_epi32(
-        0x00000000,
-        0x00100110,
-        0x00000000,
-        0x00000000,
-        0x43533432,
-        0x39383376,
-        0xbbbbbbbbu32 as i32,
-        0x37a688bb,
-    );
-    let tbl2 = _mm256_setr_epi32(
-        0xddcdddc3u32 as i32,
-        0xcdddddcdu32 as i32,
-        0xddcdddddu32 as i32,
-        0x33736ddd,
-        0xffefffe3u32 as i32,
-        0xefffffefu32 as i32,
-        0xffefffffu32 as i32,
-        0x03736fff,
-    );
-    let ctx_in_div2 =
-        _mm256_and_si256(_mm256_srli_epi16::<1>(ctx_in), _mm256_set1_epi8(0b01111111));
-    let ctx_lookup = _mm256_blendv_epi8(
-        _mm256_shuffle_epi8(tbl1, ctx_in_div2),
-        _mm256_shuffle_epi8(tbl2, ctx_in_div2),
-        _mm256_slli_epi16::<1>(ctx_in),
-    );
-    let high_nibble = _mm256_cmpeq_epi8(
-        _mm256_and_si256(ctx_in, _mm256_set1_epi8(1)),
-        _mm256_set1_epi8(1),
-    );
-    let ctx_lookup = _mm256_and_si256(
-        _mm256_blendv_epi8(ctx_lookup, _mm256_srli_epi16::<4>(ctx_lookup), high_nibble),
-        _mm256_set1_epi8(0xF),
-    );
-    let ctx0_low_div4 = _mm_blendv_epi8(
-        _mm256_extracti128_si256::<0>(ctx_lookup),
-        _mm256_extracti128_si256::<1>(ctx_lookup),
-        _mm_slli_epi16::<2>(ctx_in_128),
-    );
-    let ctx0_to_ctx1_low = _mm_setr_epi8(0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 3, 3);
-    let ctx1_low = _mm_shuffle_epi8(ctx0_to_ctx1_low, ctx0_low_div4);
-    let ctx0_low = _mm_slli_epi16::<2>(ctx0_low_div4);
-
-    let ctx0_hi = _mm_or_si128(
-        _mm_and_si128(ctx_in_128, _mm_set1_epi8(1)),
-        _mm_and_si128(_mm_srli_epi16::<5>(ctx_in_128), _mm_set1_epi8(2)),
-    );
-    let ctx1_hi = _mm_and_si128(
-        _mm_cmpgt_epi8(ctx_in_128, _mm_set1_epi8(-33)),
-        _mm_set1_epi8(2),
-    );
-    let ctx0 = _mm_blendv_epi8(ctx0_low, ctx0_hi, ctx_in_128);
-    let ctx1 = _mm_blendv_epi8(ctx1_low, ctx1_hi, ctx_in_128);
-    let ctx = _mm_or_si128(ctx1, _mm_alignr_epi8::<8>(ctx0, ctx0));
-    _mm_storeu_si128(context.as_mut_ptr().cast(), ctx);
+fn compute_context(pos: usize, data: &[u8], context: &mut [u8; PRECOMPUTE_SIZE]) {
+    // stdsimd does not have a way to do per-128-lane shuffles with AVX2. Use non-SIMD
+    // implementation, since performance was very close even with those.
+    for x in 0..PRECOMPUTE_SIZE / 2 {
+        let a = data[pos + x - 1];
+        let b = data[pos + x - 2];
+        context[x] = CONTEXT_LUT0[a as usize] | CONTEXT_LUT1[b as usize];
+    }
 }
 
 #[inline]
-#[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2,bmi1,bmi2,popcnt,fma")]
-unsafe fn compute_hash_and_context_at(
+fn compute_hash_and_context_at(
     pos: usize,
     data: &[u8],
     context: &mut [u8; PRECOMPUTE_SIZE],
     hashes: &mut [u32; PRECOMPUTE_SIZE],
 ) {
     const _: () = assert!(PRECOMPUTE_SIZE == 16);
-    let hash_mul = _mm256_set1_epi32(0x1E35A7BD);
-    let d08 = _mm256_loadu_si256(data.as_ptr().add(pos).cast());
-    let d0 = _mm256_permute4x64_epi64::<0b01000100>(d08);
-    let d8 = _mm256_permute4x64_epi64::<0b10011001>(d08);
+    let hash_mul = u32x8::splat(0x1E35A7BD);
+    let d08 = u8x32::from_slice(&data[pos..]);
 
-    let shufmask = _mm256_setr_epi8(
-        0, 1, 2, 3, 1, 2, 3, 4, 2, 3, 4, 5, 3, 4, 5, 6, 4, 5, 6, 7, 5, 6, 7, 8, 6, 7, 8, 9, 7, 8,
-        9, 10,
+    let data0 = simd_swizzle!(
+        d08,
+        [
+            0, 1, 2, 3, 1, 2, 3, 4, 2, 3, 4, 5, 3, 4, 5, 6, 4, 5, 6, 7, 5, 6, 7, 8, 6, 7, 8, 9, 7,
+            8, 9, 10
+        ]
+    );
+    let data1 = simd_swizzle!(
+        d08,
+        [
+            8, 9, 10, 11, 9, 10, 11, 12, 10, 11, 12, 13, 11, 12, 13, 14, 12, 13, 14, 15, 13, 14,
+            15, 16, 14, 15, 16, 17, 15, 16, 17, 18
+        ]
     );
 
-    let data0 = _mm256_shuffle_epi8(d0, shufmask);
-    let data1 = _mm256_shuffle_epi8(d8, shufmask);
+    const SHIFT: u32 = 32 - LOG_TABLE_SIZE as u32;
 
-    let data0 = _mm256_mullo_epi32(data0, hash_mul);
-    let data1 = _mm256_mullo_epi32(data1, hash_mul);
+    let data0 = (u32x8::from_le_bytes(data0) * hash_mul) >> u32x8::splat(SHIFT);
+    let data1 = (u32x8::from_le_bytes(data1) * hash_mul) >> u32x8::splat(SHIFT);
 
-    const SHIFT: i32 = 32 - LOG_TABLE_SIZE as i32;
-
-    let data0 = _mm256_srli_epi32::<SHIFT>(data0);
-    let data1 = _mm256_srli_epi32::<SHIFT>(data1);
-
-    _mm256_storeu_si256(hashes.as_mut_ptr().cast(), data0);
-    _mm256_storeu_si256(hashes.as_mut_ptr().add(8).cast(), data1);
+    data0.copy_to_slice(&mut hashes[..8]);
+    data1.copy_to_slice(&mut hashes[8..]);
 
     for i in 0..PRECOMPUTE_SIZE {
         debug_assert_eq!(
@@ -423,19 +320,15 @@ impl HashTable {
     }
 
     #[inline]
-    #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2,bmi1,bmi2,popcnt,fma")]
-    unsafe fn prefetch_pos(&self, pos: u32) {
-        let ptr = self.table.as_ptr().offset(pos as isize) as *const _ as *const i8;
-        for i in (0..size_of::<HashTableEntry>()).step_by(64) {
-            _mm_prefetch::<_MM_HINT_T0>(ptr.add(i));
-        }
-        _mm_prefetch::<_MM_HINT_T0>(self.replacement_idx.as_ptr().add(pos as usize) as *const i8);
+    fn prefetch_pos(&self, pos: u32) {
+        use prefetch::prefetch::{prefetch, Data, High, Read, Write};
+        prefetch::<Read, High, Data, HashTableEntry>(self.table[pos as usize..].as_ptr());
+        prefetch::<Write, High, Data, u8>(self.replacement_idx[pos as usize..].as_ptr());
     }
 
     /// Returns the number of bytes that were written to the output. Updates the hash table with
     /// strings starting at all of those bytes, if within the margin.
-    #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2,bmi1,bmi2,popcnt,fma")]
-    unsafe fn parse_and_emit_interior(
+    fn parse_and_emit_interior(
         &mut self,
         data: &[u8],
         start: usize,
@@ -465,16 +358,14 @@ impl HashTable {
             }
             let po = next_byte_offset % (PRECOMPUTE_SIZE / 2);
             const _: () = assert!(PREFETCH_OFFSET <= PRECOMPUTE_SIZE / 2);
-            self.prefetch_pos(*hashes.get_unchecked(po + PREFETCH_OFFSET));
+            self.prefetch_pos(hashes[po + PREFETCH_OFFSET]);
             if skip == 0 {
                 let (dist, len, gain) = {
                     best_match(
                         data,
                         start + next_byte_offset,
-                        self.table
-                            .get_unchecked_mut(*hashes.get_unchecked(po) as usize),
-                        self.replacement_idx
-                            .get_unchecked_mut(*hashes.get_unchecked(po) as usize),
+                        &mut self.table[hashes[po] as usize],
+                        &mut self.replacement_idx[hashes[po] as usize],
                     )
                 };
                 if len as usize >= 12 {
@@ -485,10 +376,8 @@ impl HashTable {
                     let (dist2, len2, gain2) = best_match(
                         data,
                         start + next_byte_offset,
-                        self.table
-                            .get_unchecked_mut(*hashes.get_unchecked(po + 1) as usize),
-                        self.replacement_idx
-                            .get_unchecked_mut(*hashes.get_unchecked(po + 1) as usize),
+                        &mut self.table[hashes[po + 1] as usize],
+                        &mut self.replacement_idx[hashes[po + 1] as usize],
                     );
                     if gain2 >= gain + 5 {
                         metablock_data.add_literal(context[po], data[start + next_byte_offset - 1]);
@@ -505,10 +394,8 @@ impl HashTable {
                 fill_entry(
                     data,
                     start + next_byte_offset,
-                    self.table
-                        .get_unchecked_mut(*hashes.get_unchecked(po) as usize),
-                    self.replacement_idx
-                        .get_unchecked_mut(*hashes.get_unchecked(po) as usize),
+                    &mut self.table[hashes[po] as usize],
+                    &mut self.replacement_idx[hashes[po] as usize],
                 );
                 skip -= 1;
             }
@@ -524,74 +411,40 @@ impl HashTable {
         count: usize,
         metablock_data: &mut MetablockData,
     ) -> usize {
-        unsafe {
-            let mut bpos = start;
-            if bpos == 0 {
-                metablock_data.add_literal(0, data[0]);
-                metablock_data.add_literal(CONTEXT_LUT0[data[0] as usize], data[1]);
-                bpos += 2;
-            }
-            bpos += self.parse_and_emit_interior(
-                data,
-                bpos,
-                (bpos + count).min(data.len() - INTERIOR_MARGIN) - bpos,
-                metablock_data,
-            );
-            while bpos < start + count {
-                let a = data[bpos - 1];
-                let b = data[bpos - 2];
-                let context = CONTEXT_LUT0[a as usize] | CONTEXT_LUT1[b as usize];
-                metablock_data.add_literal(context, data[bpos]);
-                bpos += 1;
-            }
-            bpos - start
+        let mut bpos = start;
+        if bpos == 0 {
+            metablock_data.add_literal(0, data[0]);
+            metablock_data.add_literal(CONTEXT_LUT0[data[0] as usize], data[1]);
+            bpos += 2;
         }
+        bpos += self.parse_and_emit_interior(
+            data,
+            bpos,
+            (bpos + count).min(data.len() - INTERIOR_MARGIN) - bpos,
+            metablock_data,
+        );
+        while bpos < start + count {
+            let a = data[bpos - 1];
+            let b = data[bpos - 2];
+            let context = CONTEXT_LUT0[a as usize] | CONTEXT_LUT1[b as usize];
+            metablock_data.add_literal(context, data[bpos]);
+            bpos += 1;
+        }
+        bpos - start
     }
 }
 
 #[cfg(test)]
 mod test {
-    use std::arch::x86_64::{_mm256_extract_epi32, _mm256_set1_epi32};
+    use std::simd::prelude::*;
 
-    use crate::constants::*;
-
-    use super::{_mm256_ilog2_epi32, compute_context, CONTEXT_LUT0, CONTEXT_LUT1, PRECOMPUTE_SIZE};
+    use crate::{constants::*, hashtable::ilog2};
 
     #[test]
     fn test_ilog2() {
-        unsafe {
-            for i in 1..WSIZE {
-                let simd =
-                    _mm256_extract_epi32::<0>(_mm256_ilog2_epi32(_mm256_set1_epi32(i as i32)))
-                        as u32;
-                assert_eq!(simd, i.ilog2());
-            }
-        }
-    }
-
-    #[test]
-    fn test_compute_context() {
-        unsafe {
-            let mut context = [0; PRECOMPUTE_SIZE];
-            let mut data = [0; 256];
-            for i in 0..=255 {
-                for j in 0..=255 {
-                    for x in 0..8 {
-                        data[2 * x] = i;
-                        data[2 * x + 1] = j;
-                    }
-                    compute_context(2, &data, &mut context);
-                    for x in 0..PRECOMPUTE_SIZE / 2 {
-                        let a = *data.get_unchecked(x + 1);
-                        let b = *data.get_unchecked(x);
-                        println!("{:?} {x}", context);
-                        assert_eq!(
-                            context[x],
-                            CONTEXT_LUT0[a as usize] | CONTEXT_LUT1[b as usize]
-                        );
-                    }
-                }
-            }
+        for i in 1..WSIZE as u32 {
+            let simd = ilog2(u32x8::splat(i)).to_array()[0];
+            assert_eq!(simd, i.ilog2());
         }
     }
 }
