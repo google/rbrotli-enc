@@ -182,9 +182,11 @@ impl<const N: usize, const M: usize> CheckLengthsUsize<N, M> {
 
 pub struct CheckLengthsArray<const N: usize, const M: usize, const LEN: usize>;
 
-// TODO: check overflows
 impl<const N: usize, const M: usize, const LEN: usize> CheckLengthsArray<N, M, LEN> {
-    pub const CHECK_GE: () = assert!(N + 1 >= M + LEN);
+    pub const CHECK_GE: () = assert!(match (N.checked_add(1), M.checked_add(LEN)) {
+        (Some(a), Some(b)) => a >= b,
+        _ => false,
+    });
 }
 
 /// A slice guaranteed to have a length of at least `LOWER_BOUND`.

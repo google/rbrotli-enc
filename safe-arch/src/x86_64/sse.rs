@@ -686,16 +686,3 @@ pub fn _MM_TRANSPOSE4_PS(
 }
 
 pub use std::arch::x86_64::_mm_stream_ps;
-
-#[inline]
-#[target_feature(enable = "sse")]
-#[safe_arch]
-pub fn _mm_safe_prefetch<const STRATEGY: i32, T>(r: &T) {
-    // SAFETY: target_feature_11 checks we can call SSE functions. The addresses we generate and
-    // feed to prefetch fit within the range of memory pointed to by `r`.
-    unsafe {
-        for i in (0..std::mem::size_of::<T>()).step_by(64) {
-            std::arch::x86_64::_mm_prefetch::<STRATEGY>((r as *const T as *const i8).add(i));
-        }
-    }
-}

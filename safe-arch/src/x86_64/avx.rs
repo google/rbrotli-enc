@@ -479,21 +479,8 @@ pub fn _mm256_extractf128_si256<const IMM1: i32>(a: __m256i) -> __m128i {
     unsafe { std::arch::x86_64::_mm256_extractf128_si256::<IMM1>(a) }
 }
 
-#[inline]
-#[target_feature(enable = "avx")]
-#[safe_arch]
-pub fn _mm256_zeroall() {
-    // SAFETY: safety ensured by target_feature_11
-    unsafe { std::arch::x86_64::_mm256_zeroall() }
-}
-
-#[inline]
-#[target_feature(enable = "avx")]
-#[safe_arch]
-pub fn _mm256_zeroupper() {
-    // SAFETY: safety ensured by target_feature_11
-    unsafe { std::arch::x86_64::_mm256_zeroupper() }
-}
+pub use std::arch::x86_64::_mm256_zeroall;
+pub use std::arch::x86_64::_mm256_zeroupper;
 
 #[inline]
 #[target_feature(enable = "avx")]

@@ -27,11 +27,16 @@ pub mod x86_64;
 
 struct CheckLengthsSimd<T, const N: usize, const M: usize, const SIMD_SIZE: usize>(PhantomData<T>);
 
-// TODO: check overflows
 impl<T, const N: usize, const M: usize, const SIMD_SIZE: usize>
     CheckLengthsSimd<T, N, M, SIMD_SIZE>
 {
-    pub(crate) const CHECK_GE: () = assert!(N + 1 >= M + SIMD_SIZE / std::mem::size_of::<T>());
+    pub(crate) const CHECK_GE: () = assert!(match (
+        N.checked_add(1),
+        M.checked_add(SIMD_SIZE / std::mem::size_of::<T>())
+    ) {
+        (Some(a), Some(b)) => a >= b,
+        _ => false,
+    });
 }
 
 struct CheckPow2<const VAL: usize> {}
