@@ -356,6 +356,7 @@ name = "hugepage-buffer"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "zerocopy",
 ]
 
 [[package]]

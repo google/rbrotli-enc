@@ -12,11 +12,44 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{safe_arch, x86_64::*, CheckLengthsSimd, CheckPow2, CheckPow2Size, CheckSameSize};
+use crate::{safe_arch, x86_64::*};
 use bounded_utils::{BoundedSlice, BoundedU32, BoundedU8, BoundedUsize};
+use std::marker::PhantomData;
 use zerocopy::{AsBytes, FromBytes};
 
 const AVX_VECTOR_SIZE: usize = 32;
+
+// Safety note: we assume in a few places that addition of a small number of
+// `usize`s will not overflow a `u128`.
+const _: () = assert!(std::mem::size_of::<usize>() < std::mem::size_of::<u128>());
+
+struct CheckLengthsSimd<T, const N: usize, const M: usize, const SIMD_SIZE: usize>(PhantomData<T>);
+
+impl<T, const N: usize, const M: usize, const SIMD_SIZE: usize>
+    CheckLengthsSimd<T, N, M, SIMD_SIZE>
+{
+    pub(crate) const CHECK_GE: () =
+        assert!((N as u128) >= (M as u128 + SIMD_SIZE as u128 / std::mem::size_of::<T>() as u128));
+}
+
+struct CheckPow2<const VAL: usize> {}
+impl<const VAL: usize> CheckPow2<VAL> {
+    const IS_POW2_MINUS_ONE: () = assert!((VAL as u128 + 1).is_power_of_two());
+    const IS_POW2: () = assert!(VAL.is_power_of_two());
+}
+
+struct CheckPow2Size<T: Sized, const MAX_SIZE: usize>(PhantomData<T>);
+
+impl<T: Sized, const MAX_SIZE: usize> CheckPow2Size<T, MAX_SIZE> {
+    const IS_POW2: () =
+        assert!(std::mem::size_of::<T>().is_power_of_two() && std::mem::size_of::<T>() <= MAX_SIZE);
+}
+
+struct CheckSameSize<T: Sized, const SIZE: i32>(PhantomData<T>);
+
+impl<T: Sized, const SIZE: i32> CheckSameSize<T, SIZE> {
+    const SAME_SIZE: () = assert!(std::mem::size_of::<T>() == SIZE as usize);
+}
 
 #[inline]
 #[target_feature(enable = "avx")]
@@ -72,7 +105,7 @@ pub fn _mm256_store_masked_u8<
     unsafe {
         _mm256_storeu_si256(
             data.get_slice_mut().as_mut_ptr().add(start.get()) as *mut _,
-            _mm256_and_si256(_mm256_set1_epi8(VALUE_BOUND as i8 - 1), value),
+            _mm256_and_si256(_mm256_set1_epi8(VALUE_BOUND as i8), value),
         );
     }
 }
@@ -90,14 +123,14 @@ pub fn _mm256_store_masked_u32<
     value: __m256i,
 ) {
     let _ = CheckLengthsSimd::<u32, SLICE_BOUND, START_BOUND, AVX_VECTOR_SIZE>::CHECK_GE;
-    let _ = CheckPow2::<VALUE_BOUND>::IS_POW2;
+    let _ = CheckPow2::<VALUE_BOUND>::IS_POW2_MINUS_ONE;
     // SAFETY: safety ensured by target_feature_11 + the above length check, which ensures that a
     // full vector can still be read after `start`; the `BoundedU32` invariant is upheld by the
     // `_mm256_and_si256` operation.
     unsafe {
         _mm256_storeu_si256(
             data.get_slice_mut().as_mut_ptr().add(start.get()) as *mut _,
-            _mm256_and_si256(_mm256_set1_epi32(VALUE_BOUND as i32 - 1), value),
+            _mm256_and_si256(_mm256_set1_epi32(VALUE_BOUND as i32), value),
         );
     }
 }
@@ -170,14 +203,14 @@ pub fn _mm_store_masked_u8<
     value: __m128i,
 ) {
     let _ = CheckLengthsSimd::<u8, SLICE_BOUND, START_BOUND, SSE_VECTOR_SIZE>::CHECK_GE;
-    let _ = CheckPow2::<VALUE_BOUND>::IS_POW2;
+    let _ = CheckPow2::<VALUE_BOUND>::IS_POW2_MINUS_ONE;
     // SAFETY: safety ensured by target_feature_11 + the above length check, which ensures that a
     // full vector can still be read after `start`; the `BoundedU8` invariant is upheld by the
     // `_mm_and_si128` operation.
     unsafe {
         _mm_storeu_si128(
             data.get_slice_mut().as_mut_ptr().add(start.get()) as *mut _,
-            _mm_and_si128(_mm_set1_epi8(VALUE_BOUND as i8 - 1), value),
+            _mm_and_si128(_mm_set1_epi8(VALUE_BOUND as i8), value),
         );
     }
 }
@@ -195,14 +228,14 @@ pub fn _mm_store_masked_u32<
     value: __m128i,
 ) {
     let _ = CheckLengthsSimd::<u32, SLICE_BOUND, START_BOUND, SSE_VECTOR_SIZE>::CHECK_GE;
-    let _ = CheckPow2::<VALUE_BOUND>::IS_POW2;
+    let _ = CheckPow2::<VALUE_BOUND>::IS_POW2_MINUS_ONE;
     // SAFETY: safety ensured by target_feature_11 + the above length check, which ensures that a
     // full vector can still be read after `start`; the `BoundedU32` invariant is upheld by the
     // `_mm_and_si128` operation.
     unsafe {
         _mm_storeu_si128(
             data.get_slice_mut().as_mut_ptr().add(start.get()) as *mut _,
-            _mm_and_si128(_mm_set1_epi32(VALUE_BOUND as i32 - 1), value),
+            _mm_and_si128(_mm_set1_epi32(VALUE_BOUND as i32), value),
         );
     }
 }

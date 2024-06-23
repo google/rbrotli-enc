@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies]
 libc = "0.2.153"
+zerocopy = { version = "0.7.32" }
 
 [lints]
 workspace = true

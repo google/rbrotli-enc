@@ -20,53 +20,48 @@
 use std::ops::{BitAnd, BitOr};
 
 use paste::paste;
-use zerocopy::AsBytes;
+use zerocopy::{AsBytes, FromZeroes};
 
-struct CheckPow2<const VAL: usize> {}
+// Safety note: we assume in a few places that addition of a small number of
+// `usize`s will not overflow a `u128`.
+const _: () = assert!(std::mem::size_of::<usize>() < std::mem::size_of::<u128>());
 
-impl<const VAL: usize> CheckPow2<VAL> {
-    pub const IS_POW2: () = assert!(VAL.is_power_of_two());
+struct CheckPow2MinusOne<const VAL: usize> {}
+impl<const VAL: usize> CheckPow2MinusOne<VAL> {
+    const IS_POW2_MINUS_ONE: () = assert!((VAL as u128 + 1).is_power_of_two());
+}
+
+struct CheckBound<const N: usize, const M: usize, const ADD: usize>;
+impl<const N: usize, const M: usize, const ADD: usize> CheckBound<N, M, ADD> {
+    const CHECK_GT: () = assert!((N as u128) > (M as u128 + ADD as u128));
+    const CHECK_GE: () = assert!((N as u128) >= (M as u128 + ADD as u128));
 }
 
 macro_rules! make_bounded_type {
-    ($d:tt, $BoundedType:ident, $Check:ident, $CheckAdd:ident, $array_macro:ident, $ty:ident) => {
-        struct $Check<const N: usize, const M: $ty>;
-
-        impl<const N: usize, const M: $ty> $Check<N, M> {
-            const CHECK_GT: () = assert!(N > M as usize);
-        }
-
-        struct $CheckAdd<const N: usize, const M: usize, const ADD: $ty>;
-        impl<const N: usize, const M: usize, const ADD: $ty> $CheckAdd<N, M, ADD> {
-            const CHECK_GE: () = assert!(
-                N >= match M.checked_add(ADD as usize) {
-                    Some(t) => t as usize,
-                    None => panic!("bound overflow"),
-                }
-            );
-        }
-
-        /// A struct containing a `$ty` guaranteed to be smaller than `UPPER_BOUND`.
-        // Invariant: self.0 < UPPER_BOUND.
-        #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug, AsBytes)]
+    ($d:tt, $BoundedType:ident, $array_macro:ident, $ty:ident) => {
+        /// A struct containing a `$ty` guaranteed to be smaller than `MAX`.
+        // Invariant: self.0 <= MAX.
+        #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug, AsBytes, FromZeroes)]
         #[repr(transparent)]
-        pub struct $BoundedType<const UPPER_BOUND: usize>($ty);
+        pub struct $BoundedType<const MAX: usize>($ty);
 
-        impl<const UPPER_BOUND: usize> $BoundedType<UPPER_BOUND> {
+        impl<const MAX: usize> $BoundedType<MAX> {
+            pub const MAX: Self = $BoundedType(MAX as $ty);
+
             /// Constructs a new $BoundedType without checking that the bound
             /// is indeed satisfied.
             ///
             /// # Safety
-            /// `val` must be strictly less than `UPPER_BOUND`.
-            pub const unsafe fn new_unchecked(val: $ty) -> $BoundedType<UPPER_BOUND> {
+            /// `val` must be less than or equal to `MAX`.
+            pub const unsafe fn new_unchecked(val: $ty) -> $BoundedType<MAX> {
                 const _CHECK_TYPE_SIZE: () =
                     assert!(std::mem::size_of::<$ty>() <= std::mem::size_of::<usize>());
-                debug_assert!((val as usize) < UPPER_BOUND);
+                debug_assert!((val as usize) <= MAX);
                 $BoundedType(val)
             }
 
-            pub const fn new(val: $ty) -> Option<$BoundedType<UPPER_BOUND>> {
-                if (val as usize) < UPPER_BOUND {
+            pub const fn new(val: $ty) -> Option<$BoundedType<MAX>> {
+                if (val as usize) <= MAX {
                     const _CHECK_TYPE_SIZE: () =
                         assert!(std::mem::size_of::<$ty>() <= std::mem::size_of::<usize>());
                     Some($BoundedType(val))
@@ -75,14 +70,15 @@ macro_rules! make_bounded_type {
                 }
             }
 
-            pub const fn new_masked(val: $ty) -> $BoundedType<UPPER_BOUND> {
-                let _ = CheckPow2::<UPPER_BOUND>::IS_POW2;
-                $BoundedType(val & (UPPER_BOUND as $ty - 1))
+            pub const fn new_masked(val: $ty) -> $BoundedType<MAX> {
+                let _ = CheckPow2MinusOne::<MAX>::IS_POW2_MINUS_ONE;
+                $BoundedType(val & (MAX as $ty))
             }
 
-            pub const fn constant<const VAL: $ty>() -> $BoundedType<UPPER_BOUND> {
-                let _ = $Check::<UPPER_BOUND, VAL>::CHECK_GT;
-                $BoundedType(VAL)
+            pub const fn constant<const VAL: usize>() -> $BoundedType<MAX> {
+                let _ = CheckBound::<{ $ty::MAX as usize }, VAL, 0>::CHECK_GE;
+                let _ = CheckBound::<MAX, VAL, 0>::CHECK_GE;
+                $BoundedType(VAL as $ty)
             }
 
             pub const fn get(&self) -> $ty {
@@ -90,47 +86,48 @@ macro_rules! make_bounded_type {
             }
 
             pub const fn tighten<const NEW_BOUND: usize>(&self) -> Option<$BoundedType<NEW_BOUND>> {
-                if (self.0 as usize) < NEW_BOUND {
+                if (self.0 as usize) <= NEW_BOUND {
                     Some($BoundedType(self.0))
                 } else {
                     None
                 }
             }
 
-            pub fn sub<const NEW_BOUND: usize, const SUB: $ty>(
+            pub fn sub<const NEW_BOUND: usize, const SUB: usize>(
                 &self,
             ) -> Option<$BoundedType<NEW_BOUND>> {
-                let _ = $CheckAdd::<UPPER_BOUND, NEW_BOUND, SUB>::CHECK_GE;
-                self.0.checked_sub(SUB).map(|x| $BoundedType(x))
+                let _ = CheckBound::<MAX, NEW_BOUND, SUB>::CHECK_GE;
+                let _ = CheckBound::<{ $ty::MAX as usize }, SUB, 0>::CHECK_GE;
+                self.0.checked_sub(SUB as $ty).map(|x| $BoundedType(x))
             }
 
             pub const fn widen<const NEW_BOUND: usize>(&self) -> $BoundedType<NEW_BOUND> {
-                let _ = CheckLengthsUsize::<NEW_BOUND, UPPER_BOUND>::CHECK_GE;
+                let _ = CheckBound::<NEW_BOUND, MAX, 0>::CHECK_GE;
                 $BoundedType(self.0)
             }
 
-            pub const fn add<const NEW_BOUND: usize, const ADD: $ty>(
+            pub const fn add<const NEW_BOUND: usize, const ADD: usize>(
                 &self,
             ) -> $BoundedType<NEW_BOUND> {
-                let _ = $CheckAdd::<NEW_BOUND, UPPER_BOUND, ADD>::CHECK_GE;
-                $BoundedType(self.0 + ADD)
+                let _ = CheckBound::<NEW_BOUND, MAX, ADD>::CHECK_GE;
+                $BoundedType(self.0 + ADD as $ty)
             }
 
-            pub const fn mod_add(&self, val: $ty) -> $BoundedType<UPPER_BOUND> {
-                $BoundedType(((self.0 as usize + val as usize) % UPPER_BOUND) as $ty)
+            pub const fn mod_add(&self, val: $ty) -> $BoundedType<MAX> {
+                $BoundedType(((self.0 as usize + val as usize) % (MAX + 1)) as $ty)
             }
         }
 
-        impl<const UPPER_BOUND: usize> BitOr for $BoundedType<UPPER_BOUND> {
-            type Output = $BoundedType<UPPER_BOUND>;
+        impl<const MAX: usize> BitOr for $BoundedType<MAX> {
+            type Output = $BoundedType<MAX>;
             fn bitor(self, rhs: Self) -> Self::Output {
-                let _ = CheckPow2::<UPPER_BOUND>::IS_POW2;
+                let _ = CheckPow2MinusOne::<MAX>::IS_POW2_MINUS_ONE;
                 $BoundedType(self.0 | rhs.0)
             }
         }
 
-        impl<const UPPER_BOUND: usize> BitAnd for $BoundedType<UPPER_BOUND> {
-            type Output = $BoundedType<UPPER_BOUND>;
+        impl<const MAX: usize> BitAnd for $BoundedType<MAX> {
+            type Output = $BoundedType<MAX>;
             fn bitand(self, rhs: Self) -> Self::Output {
                 $BoundedType(self.0 & rhs.0)
             }
@@ -149,16 +146,14 @@ macro_rules! make_bounded_type {
 make_bounded_type!(
     $,
     BoundedUsize,
-    CheckLengthsUsize,
-    CheckAddUsize,
     bounded_usize_array,
     usize
 );
-make_bounded_type!($, BoundedU8, CheckLengthsU8, CheckAddU8, bounded_u8_array, u8);
-make_bounded_type!($, BoundedU32, CheckLengthsU32, CheckAddU32, bounded_u32_array, u32);
+make_bounded_type!($, BoundedU8, bounded_u8_array, u8);
+make_bounded_type!($, BoundedU32, bounded_u32_array, u32);
 
-impl BoundedUsize<256> {
-    pub fn from_u8(val: u8) -> BoundedUsize<256> {
+impl BoundedUsize<255> {
+    pub fn from_u8(val: u8) -> BoundedUsize<255> {
         BoundedUsize(val as usize)
     }
 }
@@ -174,19 +169,6 @@ impl<const BOUND: usize> From<BoundedU32<BOUND>> for BoundedUsize<BOUND> {
         const _: () = assert!(std::mem::size_of::<u32>() <= std::mem::size_of::<usize>());
         BoundedUsize(value.0 as usize)
     }
-}
-
-impl<const N: usize, const M: usize> CheckLengthsUsize<N, M> {
-    const CHECK_GE: () = assert!(N >= M);
-}
-
-pub struct CheckLengthsArray<const N: usize, const M: usize, const LEN: usize>;
-
-impl<const N: usize, const M: usize, const LEN: usize> CheckLengthsArray<N, M, LEN> {
-    pub const CHECK_GE: () = assert!(match (N.checked_add(1), M.checked_add(LEN)) {
-        (Some(a), Some(b)) => a >= b,
-        _ => false,
-    });
 }
 
 /// A slice guaranteed to have a length of at least `LOWER_BOUND`.
@@ -217,7 +199,7 @@ impl<T, const LOWER_BOUND: usize> BoundedSlice<T, LOWER_BOUND> {
     pub fn new_from_array<const ARR_SIZE: usize>(
         arr: &[T; ARR_SIZE],
     ) -> &BoundedSlice<T, LOWER_BOUND> {
-        let _ = CheckLengthsUsize::<ARR_SIZE, LOWER_BOUND>::CHECK_GE;
+        let _ = CheckBound::<ARR_SIZE, LOWER_BOUND, 0>::CHECK_GE;
         // SAFETY: the above check verifies that the slice has sufficient length.
         unsafe { Self::from_slice_unchecked(arr) }
     }
@@ -225,7 +207,7 @@ impl<T, const LOWER_BOUND: usize> BoundedSlice<T, LOWER_BOUND> {
     pub fn new_from_array_mut<const ARR_SIZE: usize>(
         arr: &mut [T; ARR_SIZE],
     ) -> &mut BoundedSlice<T, LOWER_BOUND> {
-        let _ = CheckLengthsUsize::<ARR_SIZE, LOWER_BOUND>::CHECK_GE;
+        let _ = CheckBound::<ARR_SIZE, LOWER_BOUND, 0>::CHECK_GE;
         // SAFETY: the above check verifies that the slice has sufficient length.
         unsafe { Self::from_slice_unchecked_mut(arr) }
     }
@@ -263,7 +245,7 @@ impl<T, const LOWER_BOUND: usize> BoundedSlice<T, LOWER_BOUND> {
     pub fn offset<const NEW_LOWER_BOUND: usize, const INCREASE: usize>(
         &self,
     ) -> &BoundedSlice<T, NEW_LOWER_BOUND> {
-        let _ = CheckAddUsize::<LOWER_BOUND, NEW_LOWER_BOUND, INCREASE>::CHECK_GE;
+        let _ = CheckBound::<LOWER_BOUND, NEW_LOWER_BOUND, INCREASE>::CHECK_GE;
         // SAFETY: same layout and interpretation of metadata. Bound checks guaranteed by
         // CheckAddUsize.
         unsafe { &*(self.0.split_at_unchecked(INCREASE).1 as *const [T] as *const _) }
@@ -273,21 +255,19 @@ impl<T, const LOWER_BOUND: usize> BoundedSlice<T, LOWER_BOUND> {
         &self,
         offset: BoundedUsize<INCREASE_BOUND>,
     ) -> &BoundedSlice<T, NEW_LOWER_BOUND> {
-        let _ = CheckLengthsArray::<LOWER_BOUND, NEW_LOWER_BOUND, INCREASE_BOUND>::CHECK_GE;
+        let _ = CheckBound::<LOWER_BOUND, NEW_LOWER_BOUND, INCREASE_BOUND>::CHECK_GE;
         // SAFETY: same layout and interpretation of metadata. Bound checks guaranteed by
         // CheckAddUsize.
         unsafe { &*(self.0.split_at_unchecked(offset.get()).1 as *const [T] as *const _) }
     }
 
     pub fn reduce_bound<const NEW_LOWER_BOUND: usize>(&self) -> &BoundedSlice<T, NEW_LOWER_BOUND> {
-        let _ = CheckLengthsUsize::<LOWER_BOUND, NEW_LOWER_BOUND>::CHECK_GE;
-        // SAFETY: same layout and interpretation of metadata.
-        unsafe { &*(self as *const Self as *const _) }
+        self.offset::<NEW_LOWER_BOUND, 0>()
     }
 
     pub fn get<const INDEX_BOUND: usize>(&self, index: BoundedUsize<INDEX_BOUND>) -> &T {
-        let _ = CheckLengthsUsize::<LOWER_BOUND, INDEX_BOUND>::CHECK_GE;
-        // SAFETY: index.0 < INDEX_BOUND <= LOWER_BOUND <= self.0.len().
+        let _ = CheckBound::<LOWER_BOUND, INDEX_BOUND, 0>::CHECK_GT;
+        // SAFETY: index.0 <= INDEX_BOUND < LOWER_BOUND <= self.0.len().
         unsafe { self.0.get_unchecked(index.0) }
     }
 
@@ -295,7 +275,7 @@ impl<T, const LOWER_BOUND: usize> BoundedSlice<T, LOWER_BOUND> {
         &mut self,
         index: BoundedUsize<INDEX_BOUND>,
     ) -> &mut T {
-        let _ = CheckLengthsUsize::<LOWER_BOUND, INDEX_BOUND>::CHECK_GE;
+        let _ = CheckBound::<LOWER_BOUND, INDEX_BOUND, 0>::CHECK_GT;
         // SAFETY: index.0 < INDEX_BOUND <= LOWER_BOUND <= self.0.len().
         unsafe { self.0.get_unchecked_mut(index.0) }
     }
@@ -304,8 +284,8 @@ impl<T, const LOWER_BOUND: usize> BoundedSlice<T, LOWER_BOUND> {
         &self,
         offset: BoundedUsize<OFFSET_BOUND>,
     ) -> &[T; SIZE] {
-        let _ = CheckLengthsArray::<LOWER_BOUND, OFFSET_BOUND, SIZE>::CHECK_GE;
-        // SAFETY: offset.0 + SIZE <= OFFSET_BOUND - 1 + SIZE <= LOWER_BOUND <= self.0.len().
+        let _ = CheckBound::<LOWER_BOUND, OFFSET_BOUND, SIZE>::CHECK_GE;
+        // SAFETY: offset.0 + SIZE <= OFFSET_BOUND + SIZE <= LOWER_BOUND <= self.0.len().
         unsafe {
             &*(self
                 .0
@@ -321,8 +301,8 @@ impl<T, const LOWER_BOUND: usize> BoundedSlice<T, LOWER_BOUND> {
         &mut self,
         offset: BoundedUsize<OFFSET_BOUND>,
     ) -> &mut [T; SIZE] {
-        let _ = CheckLengthsArray::<LOWER_BOUND, OFFSET_BOUND, SIZE>::CHECK_GE;
-        // SAFETY: offset.0 + SIZE <= OFFSET_BOUND - 1 + SIZE <= LOWER_BOUND <= self.0.len().
+        let _ = CheckBound::<LOWER_BOUND, OFFSET_BOUND, SIZE>::CHECK_GE;
+        // SAFETY: offset.0 + SIZE <= OFFSET_BOUND + SIZE <= LOWER_BOUND <= self.0.len().
         unsafe {
             &mut *(self
                 .0
@@ -391,7 +371,7 @@ macro_rules! impl_bounded_iterable {
                         assert!(
                             [< start_ $bound:lower >].checked_add(
                                 n.checked_mul([< step_ $bound:lower >]).unwrap()
-                            ).unwrap() < [< BOUND_ $bound >].checked_add([< step_ $bound:lower >]).unwrap()
+                            ).unwrap() <= [< BOUND_ $bound >].checked_add([< step_ $bound:lower >]).unwrap()
                         );
                     )*
                     BoundedIterator {
@@ -407,7 +387,7 @@ macro_rules! impl_bounded_iterable {
                         assert!(
                             [< start_ $bound:lower >].checked_add(
                                 n.checked_mul([< step_ $bound:lower >]).unwrap()
-                            ).unwrap() < [< BOUND_ $bound >].checked_add([< step_ $bound:lower >]).unwrap()
+                            ).unwrap() <= [< BOUND_ $bound >].checked_add([< step_ $bound:lower >]).unwrap()
                         );
                     )*
                     BoundedIterator {

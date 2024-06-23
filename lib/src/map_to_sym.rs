@@ -194,8 +194,8 @@ pub fn insert_copy_len_to_sym_and_bits_simd<const SLICE_BOUND: usize, const INDE
     nbits_count_buf: &mut [u32; 8],
     distance_ctx_buf: &mut [u32; 8],
 ) {
-    const ZERO: BoundedUsize<1> = BoundedUsize::constant::<0>();
-    const FOUR: BoundedUsize<5> = BoundedUsize::constant::<4>();
+    const ZERO: BoundedUsize<0> = BoundedUsize::MAX;
+    const FOUR: BoundedUsize<4> = BoundedUsize::MAX;
 
     let insert_len = _mm256_load(insert, index);
     let (insert_code, insert_nbits, insert_bits) = insert_len_to_sym_and_bits_simd(insert_len);
@@ -397,7 +397,7 @@ pub fn distance_to_sym_and_bits_simd<
         _mm256_castsi256_ps(last_matches),
     ));
 
-    const ZERO: BoundedUsize<1> = BoundedUsize::constant::<0>();
+    const ZERO: BoundedUsize<0> = BoundedUsize::MAX;
 
     let shifted_ctx = _mm256_slli_epi32::<LOG_MAX_DIST>(_mm256_load(
         BoundedSlice::new_from_equal_array(distance_ctx_buf),
@@ -495,9 +495,9 @@ mod test {
                     distances[i] = if i % 2 == 0 { d } else { d + 2 } as u32;
                 }
             }
-            distance_to_sym_and_bits_simd::<1024, 1, 3>(
+            distance_to_sym_and_bits_simd::<1024, 0, 2>(
                 BoundedSlice::new_from_array(&distances),
-                BoundedUsize::<1>::constant::<0>(),
+                BoundedUsize::MAX,
                 &distance_ctx_buf,
                 &mut distance_sym_buf,
                 &mut distance_bits_buf,
@@ -556,7 +556,7 @@ mod test {
                 insert_copy_len_to_sym_and_bits_simd(
                     BoundedSlice::new_from_equal_array(&insert),
                     BoundedSlice::new_from_equal_array(&copy),
-                    BoundedUsize::<1>::constant::<0>(),
+                    BoundedUsize::<0>::MAX,
                     &mut sym_buf,
                     &mut bits_buf,
                     &mut nbits_pat_buf,
@@ -591,7 +591,7 @@ mod test {
             for x in 0..8 {
                 insert[x] = (i + x) as u32;
             }
-            const ZERO: BoundedUsize<1> = BoundedUsize::constant::<0>();
+            const ZERO: BoundedUsize<0> = BoundedUsize::MAX;
             let (sym, nbits, bits) = insert_len_to_sym_and_bits_simd(_mm256_load(
                 BoundedSlice::new_from_equal_array(&insert),
                 ZERO,
@@ -631,7 +631,7 @@ mod test {
             for x in 0..8 {
                 copy[x] = (i + x) as u32;
             }
-            const ZERO: BoundedUsize<1> = BoundedUsize::constant::<0>();
+            const ZERO: BoundedUsize<0> = BoundedUsize::MAX;
             let (sym, nbits, bits) = copy_len_to_sym_and_bits_simd(_mm256_load(
                 BoundedSlice::new_from_equal_array(&copy),
                 ZERO,

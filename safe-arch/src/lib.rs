@@ -19,41 +19,6 @@
 #![cfg_attr(feature = "nightly", feature(target_feature_11))]
 #![allow(clippy::let_unit_value)]
 
-use std::marker::PhantomData;
-
 pub use safe_arch_macro::*;
 
 pub mod x86_64;
-
-struct CheckLengthsSimd<T, const N: usize, const M: usize, const SIMD_SIZE: usize>(PhantomData<T>);
-
-impl<T, const N: usize, const M: usize, const SIMD_SIZE: usize>
-    CheckLengthsSimd<T, N, M, SIMD_SIZE>
-{
-    pub(crate) const CHECK_GE: () = assert!(match (
-        N.checked_add(1),
-        M.checked_add(SIMD_SIZE / std::mem::size_of::<T>())
-    ) {
-        (Some(a), Some(b)) => a >= b,
-        _ => false,
-    });
-}
-
-struct CheckPow2<const VAL: usize> {}
-
-impl<const VAL: usize> CheckPow2<VAL> {
-    pub const IS_POW2: () = assert!(VAL.is_power_of_two());
-}
-
-struct CheckPow2Size<T: Sized, const MAX_SIZE: usize>(PhantomData<T>);
-
-impl<T: Sized, const MAX_SIZE: usize> CheckPow2Size<T, MAX_SIZE> {
-    const IS_POW2: () =
-        assert!(std::mem::size_of::<T>().is_power_of_two() && std::mem::size_of::<T>() <= MAX_SIZE);
-}
-
-struct CheckSameSize<T: Sized, const SIZE: i32>(PhantomData<T>);
-
-impl<T: Sized, const SIZE: i32> CheckSameSize<T, SIZE> {
-    const SAME_SIZE: () = assert!(std::mem::size_of::<T>() == SIZE as usize);
-}

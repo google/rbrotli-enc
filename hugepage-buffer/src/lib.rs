@@ -34,9 +34,10 @@ pub struct BoxedHugePageArray<T: Copy + 'static, const LEN: usize> {
 /// Safety:
 /// - T must not be a ZST
 /// - Layout must be a valid layout for an array of `T`s
-unsafe fn allocate<T>(layout: Layout) -> *mut T {
+unsafe fn allocate<T>(layout: Layout, zeroed: bool) -> *mut T {
     #[cfg(all(target_os = "linux", not(miri)))]
     {
+        let _ = zeroed;
         use libc::{
             sysconf, MADV_HUGEPAGE, MAP_ANONYMOUS, MAP_FAILED, MAP_PRIVATE, PROT_READ, PROT_WRITE,
             _SC_PAGE_SIZE,
@@ -63,7 +64,11 @@ unsafe fn allocate<T>(layout: Layout) -> *mut T {
     }
     #[cfg(any(not(target_os = "linux"), miri))]
     {
-        let ptr = std::alloc::alloc(layout);
+        let ptr = if zeroed {
+            std::alloc::alloc_zeroed(layout)
+        } else {
+            std::alloc::alloc(layout)
+        };
         assert_ne!(ptr, null_mut());
         ptr as *mut T
     }
@@ -90,12 +95,27 @@ impl<T: Copy, const LEN: usize> BoxedHugePageArray<T, LEN> {
         let layout = Layout::array::<T>(LEN).unwrap();
         assert_ne!(std::mem::size_of::<T>(), 0);
         // SAFETY: `layout` is created above with Layout::array. We assert that T is not of size 0.
-        let mem = unsafe { allocate::<T>(layout) };
+        let mem = unsafe { allocate::<T>(layout, false) };
         for i in 0..LEN {
             // SAFETY: `mem` is guaranteed to point to an array of LEN `T`s, so these `write`s are
             // safe.
             unsafe { mem.add(i).write(t) };
         }
+        BoxedHugePageArray {
+            // SAFETY: `mem` was allocated with the correct layout. `T` is guaranteed to live for
+            // 'static. The allocation is guaranteed to live until `drop` is called, after which
+            // the slice will not be accessible anymore.
+            data: unsafe { (mem as *mut [T; LEN]).as_mut().unwrap_unchecked() },
+        }
+    }
+}
+
+impl<T: zerocopy::FromZeroes + Copy, const LEN: usize> BoxedHugePageArray<T, LEN> {
+    pub fn new_zeroed() -> BoxedHugePageArray<T, LEN> {
+        let layout = Layout::array::<T>(LEN).unwrap();
+        assert_ne!(std::mem::size_of::<T>(), 0);
+        // SAFETY: `layout` is created above with Layout::array. We assert that T is not of size 0.
+        let mem = unsafe { allocate::<T>(layout, true) };
         BoxedHugePageArray {
             // SAFETY: `mem` was allocated with the correct layout. `T` is guaranteed to live for
             // 'static. The allocation is guaranteed to live until `drop` is called, after which

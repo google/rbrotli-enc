@@ -26,15 +26,15 @@ use hugepage_buffer::BoxedHugePageArray;
 use lsb_bitwriter::BitWriter;
 use safe_arch::{safe_arch, safe_arch_entrypoint, x86_64::*};
 use std::mem::MaybeUninit;
-use zerocopy::{transmute, transmute_mut, AsBytes};
+use zerocopy::{transmute, transmute_mut, AsBytes, FromZeroes};
 
 use crate::constants::*;
 
-#[derive(Debug, Clone, Copy, AsBytes)]
+#[derive(Debug, Clone, Copy, AsBytes, FromZeroes)]
 #[repr(C)]
 struct Literal {
     value: u8,
-    context: BoundedU8<64>,
+    context: BoundedU8<63>,
 }
 
 pub struct MetablockData {
@@ -58,7 +58,7 @@ struct LiteralHistogram {
     total: u32,
 }
 
-#[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2,bmi1,bmi2,popcnt,fma")]
+#[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2")]
 #[safe_arch::safe_arch]
 fn histogram_distance(a: &LiteralHistogram, b: &LiteralHistogram) -> i32 {
     if a.total == 0 || b.total == 0 {
@@ -76,7 +76,7 @@ fn histogram_distance(a: &LiteralHistogram, b: &LiteralHistogram) -> i32 {
             _mm256_srli_epi32::<23>(_mm256_castps_si256(x)),
         )
     };
-    for i in BoundedUsize::<{ 256 - 7 }>::iter(0, 32, 8) {
+    for i in BoundedUsize::<{ 256 - 8 }>::iter(0, 32, 8) {
         let av = _mm256_load(BoundedSlice::new_from_equal_array(&a.data), i);
         let bv = _mm256_load(BoundedSlice::new_from_equal_array(&b.data), i);
         let totv = _mm256_add_epi32(av, bv);
@@ -113,7 +113,7 @@ fn histogram_distance(a: &LiteralHistogram, b: &LiteralHistogram) -> i32 {
 }
 
 #[inline(never)]
-#[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2,bmi1,bmi2,popcnt,fma")]
+#[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2")]
 #[safe_arch::safe_arch]
 fn cluster_histograms(histograms: [LiteralHistogram; 64]) -> (Vec<LiteralHistogram>, [u8; 64]) {
     let mut used = [false; 64];
@@ -191,19 +191,15 @@ fn cluster_histograms(histograms: [LiteralHistogram; 64]) -> (Vec<LiteralHistogr
 
 impl MetablockData {
     fn new() -> MetablockData {
-        let trivial_literal = Literal {
-            context: BoundedU8::constant::<0>(),
-            value: 0,
-        };
         MetablockData {
-            literals: BoxedHugePageArray::new(trivial_literal),
+            literals: BoxedHugePageArray::new_zeroed(),
             total_literals: 0,
-            insert_len: BoxedHugePageArray::new(0),
-            copy_len: BoxedHugePageArray::new(2),
-            distance: BoxedHugePageArray::new(1),
-            symbol_or_nbits: BoxedHugePageArray::new(0),
-            bits: BoxedHugePageArray::new(0),
-            histogram_buf: BoxedHugePageArray::new(HuffmanCodeEntry::default()),
+            insert_len: BoxedHugePageArray::new_zeroed(),
+            copy_len: BoxedHugePageArray::new_zeroed(),
+            distance: BoxedHugePageArray::new_zeroed(),
+            symbol_or_nbits: BoxedHugePageArray::new_zeroed(),
+            bits: BoxedHugePageArray::new_zeroed(),
+            histogram_buf: BoxedHugePageArray::new_zeroed(),
             total_icd: 0,
             iac_literals: 0,
             context_mode: ContextMode::Signed,
@@ -226,7 +222,7 @@ impl MetablockData {
     }
 
     #[inline]
-    pub fn add_literal(&mut self, context: BoundedU8<64>, value: u8, do_add: bool) {
+    pub fn add_literal(&mut self, context: BoundedU8<63>, value: u8, do_add: bool) {
         self.literals[self.total_literals as usize] = Literal { context, value };
         self.total_literals += if do_add { 1 } else { 0 };
     }
@@ -247,20 +243,17 @@ impl MetablockData {
     }
 
     #[inline]
-    #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2,bmi1,bmi2,popcnt,fma")]
+    #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2")]
     #[safe_arch]
     fn add_literals(&mut self, count: u32, literals_cmap: &[u8; 64]) {
         if count == 0 {
             return;
         }
         let cmap = BoundedSlice::new_from_equal_array(literals_cmap);
-        let tbl0 = _mm256_broadcastsi128_si256(_mm_load(cmap, BoundedUsize::<1>::constant::<0>()));
-        let tbl1 =
-            _mm256_broadcastsi128_si256(_mm_load(cmap, BoundedUsize::<17>::constant::<16>()));
-        let tbl2 =
-            _mm256_broadcastsi128_si256(_mm_load(cmap, BoundedUsize::<33>::constant::<32>()));
-        let tbl3 =
-            _mm256_broadcastsi128_si256(_mm_load(cmap, BoundedUsize::<49>::constant::<48>()));
+        let tbl0 = _mm256_broadcastsi128_si256(_mm_load(cmap, BoundedUsize::<0>::MAX));
+        let tbl1 = _mm256_broadcastsi128_si256(_mm_load(cmap, BoundedUsize::<16>::MAX));
+        let tbl2 = _mm256_broadcastsi128_si256(_mm_load(cmap, BoundedUsize::<32>::MAX));
+        let tbl3 = _mm256_broadcastsi128_si256(_mm_load(cmap, BoundedUsize::<48>::MAX));
 
         let literals = BoundedSlice::new_from_equal_array(&self.literals);
         let syms = BoundedSlice::new_from_equal_array_mut(&mut self.symbol_or_nbits);
@@ -270,8 +263,8 @@ impl MetablockData {
         // TODO(veluca): the checked_ operations in `::iter` cause a small but measurable slowdown
         // (~0.7% overall). The compiler could, in principle, figure out that they are not needed.
         for (idx, out_idx) in <(
-            BoundedUsize<{ LITERAL_BUF_SIZE - 15 }>,
-            BoundedUsize<{ SYMBOL_BUF_SIZE - 15 }>,
+            BoundedUsize<{ LITERAL_BUF_SIZE - 16 }>,
+            BoundedUsize<{ SYMBOL_BUF_SIZE - 16 }>,
         )>::iter(start, num as usize, (16, 16))
         {
             let lits = _mm256_load(literals, idx);
@@ -309,7 +302,7 @@ impl MetablockData {
 
     #[allow(clippy::too_many_arguments)]
     #[inline]
-    #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2,bmi1,bmi2,popcnt,fma")]
+    #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2")]
     #[safe_arch]
     fn add_iac(
         &mut self,
@@ -350,19 +343,19 @@ impl MetablockData {
         );
 
         *BoundedSlice::new_from_equal_array_mut(iac_hist_flat).get_mut(BoundedUsize::<
-            IAC_HIST_BUF_SIZE,
+            { IAC_HIST_BUF_SIZE - 1 },
         >::new_masked(
             iac_sym_off as usize - SYMBOL_MASK as usize,
         )) += 1;
         *BoundedSlice::new_from_equal_array_mut(dist_hist_flat).get_mut(BoundedUsize::<
-            { MAX_DIST * 2 },
+            { MAX_DIST * 2 - 1 },
         >::new_masked(
             dist_sym_off as usize - (SYMBOL_MASK + DIST_BASE) as usize,
         )) += 1;
     }
 
     #[inline(never)]
-    #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2,bmi1,bmi2,popcnt,fma")]
+    #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2")]
     #[safe_arch]
     fn compute_symbols_and_icd_histograms(
         &mut self,
@@ -383,7 +376,7 @@ impl MetablockData {
         self.num_syms = BoundedUsize::constant::<0>();
         self.iac_literals = 0;
         let total_icd = self.total_icd as usize;
-        const ICD_BUF_LIMIT: usize = ICD_BUF_SIZE - 16;
+        const ICD_BUF_LIMIT: usize = ICD_BUF_SIZE - 17;
         debug_assert!(ICD_BUF_LIMIT >= total_icd);
         for i in BoundedUsize::iter(0, (total_icd + 7) / 8, 8) {
             insert_copy_len_to_sym_and_bits_simd(
@@ -463,7 +456,7 @@ impl MetablockData {
     }
 
     #[inline]
-    #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2,bmi1,bmi2,popcnt,fma")]
+    #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2")]
     #[safe_arch]
     fn write_bits(&mut self, bw: &mut BitWriter) {
         let get_sym_mask = _mm256_set1_epi16(!SYMBOL_MASK as i16);
@@ -514,7 +507,7 @@ impl MetablockData {
 
                 let mut bitsa = [0u64; 4];
                 let mut nbitsa = [0u64; 4];
-                const ZERO: BoundedUsize<1> = BoundedUsize::constant::<0>();
+                const ZERO: BoundedUsize<0> = BoundedUsize::MAX;
                 _mm256_store(
                     BoundedSlice::new_from_equal_array_mut(&mut bitsa),
                     ZERO,
@@ -553,7 +546,7 @@ impl MetablockData {
     }
 
     #[inline]
-    #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2,bmi1,bmi2,popcnt,fma")]
+    #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2")]
     #[safe_arch]
     fn write(&mut self, bw: &mut BitWriter, count: usize) {
         let mut header = metablock::Header {
@@ -577,7 +570,7 @@ impl MetablockData {
             );
             *histo.get_mut(BoundedUsize::from_u8(lit.value)) += 1;
         }
-        for ctx in BoundedUsize::<64>::iter(0, 64, 1) {
+        for ctx in BoundedUsize::<63>::iter(0, 64, 1) {
             let lit_hist = BoundedSlice::new_from_equal_array_mut(&mut lit_hist);
             let lh = lit_hist.get_mut(ctx);
             lh.total = lh.data.iter().copied().sum::<u32>();
@@ -628,41 +621,38 @@ impl MetablockData {
 
 struct EncoderInternal<
     const ENTRY_SIZE: usize,
-    const ENTRY_SIZE_PLUS_ONE: usize,
-    const ENTRY_SIZE_MINUS_SEVEN: usize,
+    const ENTRY_SIZE_MINUS_ONE: usize,
+    const ENTRY_SIZE_MINUS_EIGHT: usize,
     const FAST_MATCHING: bool,
     const MIN_GAIN_FOR_GREEDY: i32,
     const USE_LAST_DISTANCES: bool,
 > {
-    ht: HashTable<ENTRY_SIZE, ENTRY_SIZE_PLUS_ONE, ENTRY_SIZE_MINUS_SEVEN>,
+    ht: HashTable<ENTRY_SIZE, ENTRY_SIZE_MINUS_ONE, ENTRY_SIZE_MINUS_EIGHT>,
     md: MetablockData,
     bwbuf: Vec<u8>,
 }
 
 struct CheckEncoderParams<
     const ENTRY_SIZE: usize,
-    const ENTRY_SIZE_PLUS_ONE: usize,
-    const ENTRY_SIZE_MINUS_SEVEN: usize,
+    const ENTRY_SIZE_MINUS_ONE: usize,
+    const ENTRY_SIZE_MINUS_EIGHT: usize,
 > {}
 impl<
         const ENTRY_SIZE: usize,
-        const ENTRY_SIZE_PLUS_ONE: usize,
-        const ENTRY_SIZE_MINUS_SEVEN: usize,
-    > CheckEncoderParams<ENTRY_SIZE, ENTRY_SIZE_PLUS_ONE, ENTRY_SIZE_MINUS_SEVEN>
+        const ENTRY_SIZE_MINUS_ONE: usize,
+        const ENTRY_SIZE_MINUS_EIGHT: usize,
+    > CheckEncoderParams<ENTRY_SIZE, ENTRY_SIZE_MINUS_ONE, ENTRY_SIZE_MINUS_EIGHT>
 {
     const CHECK_ENTRY_SIZE: () = assert!(ENTRY_SIZE <= 64);
-    const CHECK_ENTRY_SIZE_PLUS_ONE: () = assert!(ENTRY_SIZE + 1 == ENTRY_SIZE_PLUS_ONE);
-    const CHECK_ENTRY_SIZE_MINUS_SEVEN: () = assert!(ENTRY_SIZE - 7 == ENTRY_SIZE_MINUS_SEVEN);
+    const CHECK_ENTRY_SIZE_MINUS_ONE: () = assert!(ENTRY_SIZE - 1 == ENTRY_SIZE_MINUS_ONE);
+    const CHECK_ENTRY_SIZE_MINUS_EIGHT: () = assert!(ENTRY_SIZE - 8 == ENTRY_SIZE_MINUS_EIGHT);
 }
 
-#[safe_arch_entrypoint(
-    "sse", "sse2", "sse3", "ssse3", "sse4.1", "sse4.2", "avx", "avx2", "bmi1", "bmi2", "popcnt",
-    "fma"
-)]
+#[safe_arch_entrypoint("sse", "sse2", "sse3", "ssse3", "sse4.1", "sse4.2", "avx", "avx2")]
 fn compress_one_metablock<
     const ENTRY_SIZE: usize,
-    const ENTRY_SIZE_PLUS_ONE: usize,
-    const ENTRY_SIZE_MINUS_SEVEN: usize,
+    const ENTRY_SIZE_MINUS_ONE: usize,
+    const ENTRY_SIZE_MINUS_EIGHT: usize,
     const FAST_MATCHING: bool,
     const MIN_GAIN_FOR_GREEDY: i32,
     const USE_LAST_DISTANCES: bool,
@@ -670,7 +660,7 @@ fn compress_one_metablock<
     data: &[u8],
     pos: usize,
     bw: &mut BitWriter,
-    ht: &mut HashTable<ENTRY_SIZE, ENTRY_SIZE_PLUS_ONE, ENTRY_SIZE_MINUS_SEVEN>,
+    ht: &mut HashTable<ENTRY_SIZE, ENTRY_SIZE_MINUS_ONE, ENTRY_SIZE_MINUS_EIGHT>,
     md: &mut MetablockData,
 ) -> usize {
     let count = (data.len() - pos).min(METABLOCK_SIZE);
@@ -684,16 +674,16 @@ fn compress_one_metablock<
 
 impl<
         const ENTRY_SIZE: usize,
-        const ENTRY_SIZE_PLUS_ONE: usize,
-        const ENTRY_SIZE_MINUS_SEVEN: usize,
+        const ENTRY_SIZE_MINUS_ONE: usize,
+        const ENTRY_SIZE_MINUS_EIGHT: usize,
         const FAST_MATCHING: bool,
         const MIN_GAIN_FOR_GREEDY: i32,
         const USE_LAST_DISTANCES: bool,
     >
     EncoderInternal<
         ENTRY_SIZE,
-        ENTRY_SIZE_PLUS_ONE,
-        ENTRY_SIZE_MINUS_SEVEN,
+        ENTRY_SIZE_MINUS_ONE,
+        ENTRY_SIZE_MINUS_EIGHT,
         FAST_MATCHING,
         MIN_GAIN_FOR_GREEDY,
         USE_LAST_DISTANCES,
@@ -719,16 +709,16 @@ trait EncoderImpl {
 
 impl<
         const ENTRY_SIZE: usize,
-        const ENTRY_SIZE_PLUS_ONE: usize,
-        const ENTRY_SIZE_MINUS_SEVEN: usize,
+        const ENTRY_SIZE_MINUS_ONE: usize,
+        const ENTRY_SIZE_MINUS_EIGHT: usize,
         const FAST_MATCHING: bool,
         const MIN_GAIN_FOR_GREEDY: i32,
         const USE_LAST_DISTANCES: bool,
     > EncoderImpl
     for EncoderInternal<
         ENTRY_SIZE,
-        ENTRY_SIZE_PLUS_ONE,
-        ENTRY_SIZE_MINUS_SEVEN,
+        ENTRY_SIZE_MINUS_ONE,
+        ENTRY_SIZE_MINUS_EIGHT,
         FAST_MATCHING,
         MIN_GAIN_FOR_GREEDY,
         USE_LAST_DISTANCES,
@@ -750,9 +740,9 @@ impl<
         data: &[u8],
         out_buf: Option<&'a mut [MaybeUninit<u8>]>,
     ) -> Option<&'a [u8]> {
-        let _ = CheckEncoderParams::<ENTRY_SIZE, ENTRY_SIZE_PLUS_ONE, ENTRY_SIZE_MINUS_SEVEN>::CHECK_ENTRY_SIZE;
-        let _ = CheckEncoderParams::<ENTRY_SIZE, ENTRY_SIZE_PLUS_ONE, ENTRY_SIZE_MINUS_SEVEN>::CHECK_ENTRY_SIZE_PLUS_ONE;
-        let _ = CheckEncoderParams::<ENTRY_SIZE, ENTRY_SIZE_PLUS_ONE, ENTRY_SIZE_MINUS_SEVEN>::CHECK_ENTRY_SIZE_MINUS_SEVEN;
+        let _ = CheckEncoderParams::<ENTRY_SIZE, ENTRY_SIZE_MINUS_ONE, ENTRY_SIZE_MINUS_EIGHT>::CHECK_ENTRY_SIZE;
+        let _ = CheckEncoderParams::<ENTRY_SIZE, ENTRY_SIZE_MINUS_ONE, ENTRY_SIZE_MINUS_EIGHT>::CHECK_ENTRY_SIZE_MINUS_ONE;
+        let _ = CheckEncoderParams::<ENTRY_SIZE, ENTRY_SIZE_MINUS_ONE, ENTRY_SIZE_MINUS_EIGHT>::CHECK_ENTRY_SIZE_MINUS_EIGHT;
         if !(is_x86_feature_detected!("avx2")
             && is_x86_feature_detected!("avx")
             && is_x86_feature_detected!("sse")
@@ -760,11 +750,7 @@ impl<
             && is_x86_feature_detected!("sse3")
             && is_x86_feature_detected!("ssse3")
             && is_x86_feature_detected!("sse4.1")
-            && is_x86_feature_detected!("sse4.2")
-            && is_x86_feature_detected!("bmi1")
-            && is_x86_feature_detected!("bmi2")
-            && is_x86_feature_detected!("popcnt")
-            && is_x86_feature_detected!("fma"))
+            && is_x86_feature_detected!("sse4.2"))
         {
             return None;
         }
@@ -804,8 +790,8 @@ impl<
             self.md.reset(ContextMode::UTF8, pos == 0);
             pos += compress_one_metablock::<
                 ENTRY_SIZE,
-                ENTRY_SIZE_PLUS_ONE,
-                ENTRY_SIZE_MINUS_SEVEN,
+                ENTRY_SIZE_MINUS_ONE,
+                ENTRY_SIZE_MINUS_EIGHT,
                 FAST_MATCHING,
                 MIN_GAIN_FOR_GREEDY,
                 USE_LAST_DISTANCES,
@@ -839,19 +825,19 @@ impl Encoder {
     pub fn new(quality: u32) -> Encoder {
         match quality {
             0..=3 => Encoder {
-                inner: Box::new(EncoderInternal::<8, 9, 1, true, 0, false>::new()),
+                inner: Box::new(EncoderInternal::<8, 7, 0, true, 0, false>::new()),
             },
             4 => Encoder {
-                inner: Box::new(EncoderInternal::<8, 9, 1, false, 0, false>::new()),
+                inner: Box::new(EncoderInternal::<8, 7, 0, false, 0, false>::new()),
             },
             5 => Encoder {
-                inner: Box::new(EncoderInternal::<16, 17, 9, false, 2560, false>::new()),
+                inner: Box::new(EncoderInternal::<16, 15, 8, false, 2560, false>::new()),
             },
             6 => Encoder {
-                inner: Box::new(EncoderInternal::<16, 17, 9, false, 4096, true>::new()),
+                inner: Box::new(EncoderInternal::<16, 15, 8, false, 4096, true>::new()),
             },
             _ => Encoder {
-                inner: Box::new(EncoderInternal::<32, 33, 25, false, { i32::MAX }, true>::new()),
+                inner: Box::new(EncoderInternal::<32, 31, 24, false, { i32::MAX }, true>::new()),
             },
         }
     }

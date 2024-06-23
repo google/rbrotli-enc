@@ -15,12 +15,12 @@
 use std::{cmp::Reverse, collections::HashSet};
 
 use lsb_bitwriter::BitWriter;
-use zerocopy::AsBytes;
+use zerocopy::{AsBytes, FromZeroes};
 
 const MAX_BITS: usize = 15;
 
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy, AsBytes)]
+#[derive(Debug, Default, Clone, Copy, AsBytes, FromZeroes)]
 pub struct HuffmanCodeEntry {
     pub(crate) len: u16,
     pub(crate) bits: u16,
