@@ -310,7 +310,7 @@ impl<T, const LOWER_BOUND: usize> BoundedSlice<T, LOWER_BOUND> {
                 .1
                 .split_at_mut_unchecked(SIZE)
                 .0
-                .as_ptr() as *mut _)
+                .as_mut_ptr() as *mut _)
         }
     }
 
