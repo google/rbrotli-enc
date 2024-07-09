@@ -13,7 +13,10 @@
 // limitations under the License.
 
 use clap::Parser;
+#[cfg(feature = "color-eyre")]
 use color_eyre::eyre::Result;
+#[cfg(not(feature = "color-eyre"))]
+use eyre::Result;
 use rbrotli_enc_lib::Encoder;
 use std::{fs, mem::MaybeUninit, path::PathBuf, time::Instant};
 
@@ -35,6 +38,7 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    #[cfg(feature = "color-eyre")]
     color_eyre::install()?;
     let args = Args::parse();
 

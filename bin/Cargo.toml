@@ -8,7 +8,11 @@ edition = "2021"
 [dependencies]
 rbrotli-enc-lib = {path = "../lib"}
 clap = { version = "4.4.13", features = ["derive"] }
-color-eyre = "0.6.2"
+eyre = "0.6.2"
+color-eyre = { version = "0.6.2", optional = true }
 
 [lints]
 workspace = true
+
+[features]
+default = ["color-eyre"]
