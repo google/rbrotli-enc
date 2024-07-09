@@ -15,13 +15,13 @@
 use proc_macro::TokenStream;
 use syn::{parse::Parser, FnArg, GenericParam};
 
-#[cfg(feature = "nightly")]
+#[cfg(not(feature = "stable-compat"))]
 #[proc_macro_attribute]
 pub fn safe_arch(_: TokenStream, input: TokenStream) -> TokenStream {
     input
 }
 
-#[cfg(not(feature = "nightly"))]
+#[cfg(feature = "stable-compat")]
 #[proc_macro_attribute]
 pub fn safe_arch(_: TokenStream, input: TokenStream) -> TokenStream {
     use quote::quote;
@@ -135,11 +135,11 @@ pub fn safe_arch_entrypoint(args: TokenStream, input: TokenStream) -> TokenStrea
         })
         .collect::<Vec<_>>();
 
-    #[cfg(not(feature = "nightly"))]
-    let inner_unsafety = quote! { unsafe };
-
-    #[cfg(feature = "nightly")]
+    #[cfg(not(feature = "stable-compat"))]
     let inner_unsafety = quote! {};
+
+    #[cfg(feature = "stable-compat")]
+    let inner_unsafety = quote! { unsafe };
 
     quote! {
         #(#attrs)* #vis #constness #asyncness #abi

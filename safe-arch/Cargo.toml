@@ -12,7 +12,7 @@ zerocopy = "0.7.32"
 bounded-utils = { path = "../bounded-utils" }
 
 [features]
-nightly = ["safe-arch-macro/nightly"]
+stable-compat = ["safe-arch-macro/stable-compat"]
 
 [lints]
 workspace = true

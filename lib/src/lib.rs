@@ -1,4 +1,4 @@
-#![cfg_attr(feature = "nightly", feature(target_feature_11))]
+#![cfg_attr(not(feature = "stable-compat"), feature(target_feature_11))]
 // Copyright 2024 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,7 +12,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
 #![deny(unsafe_code)]
 #![allow(clippy::let_unit_value)]
 

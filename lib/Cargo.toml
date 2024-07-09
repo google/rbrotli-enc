@@ -13,7 +13,7 @@ zerocopy = { version = "0.7.32", features = ["derive"] }
 bounded-utils = { path = "../bounded-utils", features = ["lsb-bitwriter"] }
 
 [features]
-nightly = ["safe-arch/nightly"]
+stable-compat = ["safe-arch/stable-compat"]
 
 [dev-dependencies]
 criterion = "0.5.1"
