@@ -7,10 +7,10 @@ edition = "2021"
 
 [dependencies]
 hugepage-buffer = { path = "../hugepage-buffer" }
-lsb-bitwriter = { path = "../lsb-bitwriter" }
+lsb-bitwriter = { path = "../lsb-bitwriter", features = ["bounded-utils"] }
 safe-arch = { path = "../safe-arch" }
 zerocopy = { version = "0.7.32", features = ["derive"] }
-bounded-utils = { path = "../bounded-utils", features = ["lsb-bitwriter"] }
+bounded-utils = { path = "../bounded-utils" }
 
 [features]
 stable-compat = ["safe-arch/stable-compat"]

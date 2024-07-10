@@ -448,9 +448,3 @@ impl<T: BoundedIterable> ExactSizeIterator for BoundedIterator<T> {
         self.remaining_steps
     }
 }
-
-#[cfg(feature = "lsb-bitwriter")]
-use lsb_bitwriter::GuaranteedSizeIterator;
-#[cfg(feature = "lsb-bitwriter")]
-// SAFETY: BoundedIterator always knows its exact length.
-unsafe impl<T: BoundedIterable> GuaranteedSizeIterator for BoundedIterator<T> {}

@@ -186,3 +186,9 @@ impl<'a> BitWriter<'a> {
         unsafe { std::mem::transmute(&self.buf[..self.bytes_written]) }
     }
 }
+
+#[cfg(feature = "bounded-utils")]
+use bounded_utils::{BoundedIterable, BoundedIterator};
+#[cfg(feature = "bounded-utils")]
+// SAFETY: BoundedIterator always knows its exact length.
+unsafe impl<T: BoundedIterable> GuaranteedSizeIterator for BoundedIterator<T> {}

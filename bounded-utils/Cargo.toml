@@ -8,7 +8,6 @@ edition = "2021"
 [dependencies]
 paste = "1.0.14"
 zerocopy = { version = "0.7.32", features = ["derive"] }
-lsb-bitwriter = { path = "../lsb-bitwriter", optional = true }
 
 [lints]
 workspace = true
