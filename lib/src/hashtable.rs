@@ -897,9 +897,9 @@ mod test {
     #[test]
     #[safe_arch_entrypoint("avx", "avx2")]
     fn test_gain() {
-        for dist in 1..1024 {
-            for len in 4..2048 {
-                let last_distances = [(dist + len) % 1024, (dist - len) % 1024];
+        for dist in 1u32..1024 {
+            for len in 4u32..2048 {
+                let last_distances = [(dist + len) % 1024, dist.saturating_sub(len) % 1024];
                 let vdist = _mm256_set1_epi32(dist as i32);
                 let vlen = _mm256_set1_epi32(len as i32);
                 let vgain = gain_from_len_and_dist_simd::<true>(
