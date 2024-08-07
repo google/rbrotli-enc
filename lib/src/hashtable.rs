@@ -713,7 +713,7 @@ impl<
         bpos += self.parse_and_emit_interior::<MIN_GAIN_FOR_GREEDY, USE_LAST_DISTANCES>(
             data,
             bpos,
-            (bpos + count).min(data.len() - INTERIOR_MARGIN) - bpos,
+            (bpos + count).min(data.len().saturating_sub(INTERIOR_MARGIN)) - bpos,
             metablock_data,
         );
         while bpos < start + count {
@@ -860,7 +860,7 @@ impl<
         bpos += self.parse_and_emit_interior_fast::<USE_LAST_DISTANCES>(
             data,
             bpos,
-            (bpos + count).min(data.len() - INTERIOR_MARGIN) - bpos,
+            (bpos + count).min(data.len().saturating_sub(INTERIOR_MARGIN)) - bpos,
             metablock_data,
         );
         while bpos < start + count {
