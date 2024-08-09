@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::{
-    hashtable::HashTable,
+    hashtable::{HashTable, Lz77Dictionary, NoDictionary, SharedDictionary},
     huffman::{ContextMap, HuffmanCode, HuffmanCodeEntry},
     map_to_sym::{
         distance_to_sym_and_bits_simd, insert_copy_len_to_sym_and_bits,
@@ -626,8 +626,9 @@ struct EncoderInternal<
     const FAST_MATCHING: bool,
     const MIN_GAIN_FOR_GREEDY: i32,
     const USE_LAST_DISTANCES: bool,
+    Dictionary: SharedDictionary<ENTRY_SIZE>,
 > {
-    ht: HashTable<ENTRY_SIZE, ENTRY_SIZE_MINUS_ONE, ENTRY_SIZE_MINUS_EIGHT>,
+    ht: HashTable<ENTRY_SIZE, ENTRY_SIZE_MINUS_ONE, ENTRY_SIZE_MINUS_EIGHT, Dictionary>,
     md: MetablockData,
     bwbuf: Vec<u8>,
 }
@@ -656,11 +657,12 @@ fn compress_one_metablock<
     const FAST_MATCHING: bool,
     const MIN_GAIN_FOR_GREEDY: i32,
     const USE_LAST_DISTANCES: bool,
+    Dictionary: SharedDictionary<ENTRY_SIZE>,
 >(
     data: &[u8],
     pos: usize,
     bw: &mut BitWriter,
-    ht: &mut HashTable<ENTRY_SIZE, ENTRY_SIZE_MINUS_ONE, ENTRY_SIZE_MINUS_EIGHT>,
+    ht: &mut HashTable<ENTRY_SIZE, ENTRY_SIZE_MINUS_ONE, ENTRY_SIZE_MINUS_EIGHT, Dictionary>,
     md: &mut MetablockData,
 ) -> usize {
     let count = (data.len() - pos).min(METABLOCK_SIZE);
@@ -672,29 +674,47 @@ fn compress_one_metablock<
     count
 }
 
-impl<
-        const ENTRY_SIZE: usize,
-        const ENTRY_SIZE_MINUS_ONE: usize,
-        const ENTRY_SIZE_MINUS_EIGHT: usize,
-        const FAST_MATCHING: bool,
-        const MIN_GAIN_FOR_GREEDY: i32,
-        const USE_LAST_DISTANCES: bool,
-    >
-    EncoderInternal<
-        ENTRY_SIZE,
-        ENTRY_SIZE_MINUS_ONE,
-        ENTRY_SIZE_MINUS_EIGHT,
-        FAST_MATCHING,
-        MIN_GAIN_FOR_GREEDY,
-        USE_LAST_DISTANCES,
-    >
-{
-    fn new() -> Self {
-        EncoderInternal {
-            ht: HashTable::new(),
-            md: MetablockData::new(),
-            bwbuf: vec![],
-        }
+fn new_encoder<
+    const ENTRY_SIZE: usize,
+    const ENTRY_SIZE_MINUS_ONE: usize,
+    const ENTRY_SIZE_MINUS_EIGHT: usize,
+    const FAST_MATCHING: bool,
+    const MIN_GAIN_FOR_GREEDY: i32,
+    const USE_LAST_DISTANCES: bool,
+>(
+    dictionary: Option<&[u8]>,
+) -> Encoder {
+    Encoder {
+        inner: match dictionary {
+            Some(dictionary) => Box::new(EncoderInternal::<
+                ENTRY_SIZE,
+                ENTRY_SIZE_MINUS_ONE,
+                ENTRY_SIZE_MINUS_EIGHT,
+                FAST_MATCHING,
+                MIN_GAIN_FOR_GREEDY,
+                USE_LAST_DISTANCES,
+                _,
+            > {
+                ht: HashTable::new(Lz77Dictionary::<ENTRY_SIZE, ENTRY_SIZE_MINUS_EIGHT>::new::<
+                    ENTRY_SIZE_MINUS_ONE,
+                >(dictionary)),
+                md: MetablockData::new(),
+                bwbuf: vec![],
+            }),
+            None => Box::new(EncoderInternal::<
+                ENTRY_SIZE,
+                ENTRY_SIZE_MINUS_ONE,
+                ENTRY_SIZE_MINUS_EIGHT,
+                FAST_MATCHING,
+                MIN_GAIN_FOR_GREEDY,
+                USE_LAST_DISTANCES,
+                _,
+            > {
+                ht: HashTable::new(NoDictionary::new()),
+                md: MetablockData::new(),
+                bwbuf: vec![],
+            }),
+        },
     }
 }
 
@@ -714,6 +734,7 @@ impl<
         const FAST_MATCHING: bool,
         const MIN_GAIN_FOR_GREEDY: i32,
         const USE_LAST_DISTANCES: bool,
+        Dictionary: SharedDictionary<ENTRY_SIZE>,
     > EncoderImpl
     for EncoderInternal<
         ENTRY_SIZE,
@@ -722,6 +743,7 @@ impl<
         FAST_MATCHING,
         MIN_GAIN_FOR_GREEDY,
         USE_LAST_DISTANCES,
+        Dictionary,
     >
 {
     fn max_required_size(&self, input_len: usize) -> usize {
@@ -795,6 +817,7 @@ impl<
                 FAST_MATCHING,
                 MIN_GAIN_FOR_GREEDY,
                 USE_LAST_DISTANCES,
+                _,
             >(
                 &data[virtual_start..],
                 pos - virtual_start,
@@ -822,23 +845,13 @@ pub struct Encoder {
 }
 
 impl Encoder {
-    pub fn new(quality: u32) -> Encoder {
+    pub fn new(quality: u32, dictionary: Option<&[u8]>) -> Encoder {
         match quality {
-            0..=3 => Encoder {
-                inner: Box::new(EncoderInternal::<8, 7, 0, true, 0, false>::new()),
-            },
-            4 => Encoder {
-                inner: Box::new(EncoderInternal::<8, 7, 0, false, 0, false>::new()),
-            },
-            5 => Encoder {
-                inner: Box::new(EncoderInternal::<16, 15, 8, false, 2560, false>::new()),
-            },
-            6 => Encoder {
-                inner: Box::new(EncoderInternal::<16, 15, 8, false, 4096, true>::new()),
-            },
-            _ => Encoder {
-                inner: Box::new(EncoderInternal::<32, 31, 24, false, { i32::MAX }, true>::new()),
-            },
+            0..=3 => new_encoder::<8, 7, 0, true, 0, false>(dictionary),
+            4 => new_encoder::<8, 7, 0, false, 0, false>(dictionary),
+            5 => new_encoder::<16, 15, 8, false, 2560, false>(dictionary),
+            6 => new_encoder::<16, 15, 8, false, 4096, true>(dictionary),
+            _ => new_encoder::<32, 31, 24, false, { i32::MAX }, true>(dictionary),
         }
     }
     pub fn max_required_size(&self, input_len: usize) -> usize {

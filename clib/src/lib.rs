@@ -17,9 +17,20 @@ use std::ptr::{slice_from_raw_parts, slice_from_raw_parts_mut};
 use rbrotli_enc_lib::Encoder;
 
 /// Creates a new encoder for a given quality.
+///
+/// # Safety
+/// If `dictionary_ptr` is not a null pointer, it must point to the start of a memory region that
+/// is at least `dictionary_len` bytes long.
 #[no_mangle]
-pub extern "C" fn RBrotliEncMakeEncoder(quality: u32) -> *mut Encoder {
-    let encoder = Box::new(Encoder::new(quality));
+pub unsafe extern "C" fn RBrotliEncMakeEncoder(
+    quality: u32,
+    dictionary_ptr: *const u8,
+    dictionary_len: usize,
+) -> *mut Encoder {
+    let encoder = Box::new(Encoder::new(
+        quality,
+        slice_from_raw_parts(dictionary_ptr, dictionary_len).as_ref(),
+    ));
     Box::leak(encoder) as *mut Encoder
 }
 

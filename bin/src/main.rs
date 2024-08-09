@@ -30,6 +30,9 @@ struct Args {
     #[arg(value_name = "OUTPUT_FILE")]
     output: PathBuf,
 
+    #[clap(short, long)]
+    dictionary: Option<PathBuf>,
+
     #[clap(short, long, default_value = "1")]
     num_reps: usize,
 
@@ -44,7 +47,9 @@ fn main() -> Result<()> {
 
     let input = fs::read(args.input)?;
 
-    let mut encoder = Encoder::new(args.quality);
+    let dictionary = args.dictionary.map(|x| fs::read(x)).transpose()?;
+
+    let mut encoder = Encoder::new(args.quality, dictionary.as_deref());
 
     let mut outbuf = vec![MaybeUninit::uninit(); encoder.max_required_size(input.len())];
     let start = Instant::now();
