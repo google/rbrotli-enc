@@ -24,7 +24,9 @@ extern "C" {
 
 struct RBrotliEncoder;
 
-struct RBrotliEncoder *RBrotliEncMakeEncoder(uint32_t quality);
+struct RBrotliEncoder *RBrotliEncMakeEncoder(uint32_t quality,
+                                             const uint8_t *dictionary_ptr,
+                                             uintptr_t dictionary_len);
 
 bool RBrotliEncCompress(struct RBrotliEncoder *encoder, const uint8_t *data,
                         uintptr_t len, uint8_t **out_data, uintptr_t *out_len);
@@ -35,5 +37,5 @@ uintptr_t RBrotliEncMaxRequiredSize(struct RBrotliEncoder *encoder,
 void RBrotliEncFreeEncoder(struct RBrotliEncoder *encoder);
 
 #ifdef __cplusplus
-} // extern "C"
+}  // extern "C"
 #endif

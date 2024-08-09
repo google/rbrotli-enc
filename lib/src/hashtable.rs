@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::usize;
+
 use crate::compress::MetablockData;
 use crate::constants::*;
 use bounded_utils::{
@@ -22,7 +24,7 @@ use safe_arch::{safe_arch, x86_64::*};
 use zerocopy::FromZeroes;
 
 const LOG_TABLE_SIZE: usize = 16;
-const PREFETCH_OFFSET: usize = 4;
+const PREFETCH_OFFSET: usize = 2;
 const LEN_MULT: i32 = 129;
 const GAIN_OFF: i32 = 177;
 const DIST_SHIFT: i32 = 5;
@@ -63,7 +65,7 @@ fn fill_entry_inner<const ENTRY_SIZE: usize, const ENTRY_SIZE_MINUS_ONE: usize>(
 
 #[derive(Clone, Copy, FromZeroes)]
 #[repr(C, align(32))]
-struct HashTableEntry<const ENTRY_SIZE: usize> {
+pub struct HashTableEntry<const ENTRY_SIZE: usize> {
     pos: [u32; ENTRY_SIZE],
     chunk1: [u32; ENTRY_SIZE],
     chunk2: [u32; ENTRY_SIZE],
@@ -73,15 +75,18 @@ struct HashTableEntry<const ENTRY_SIZE: usize> {
 #[inline]
 #[target_feature(enable = "avx,avx2")]
 #[safe_arch]
-fn longest_match(data: &[u8], pos1: u32, pos2: usize) -> usize {
+fn longest_match(data1: &[u8], pos1: u32, data2: &[u8], pos2: usize) -> usize {
     let pos1 = pos1 as usize;
-    let max = (data.len() - pos2.max(pos1) - INTERIOR_MARGIN).min(MAX_COPY_LEN);
+    let max = (data1.len().saturating_sub(pos1))
+        .min(data2.len().saturating_sub(pos2))
+        .saturating_sub(INTERIOR_MARGIN)
+        .min(MAX_COPY_LEN);
     let mut i = 12; // We already know 12 bytes match from the HT search.
     while i + 64 <= max {
         // TODO(veluca): the bound checks here cause a slight-but-measurable slowdown (<1%).
         // In principle, they could be avoided.
-        let slice1 = BoundedSlice::<_, 64>::new(&data[pos1 + i..]).unwrap();
-        let slice2 = BoundedSlice::<_, 64>::new(&data[pos2 + i..]).unwrap();
+        let slice1 = BoundedSlice::<_, 64>::new(&data1[pos1 + i..]).unwrap();
+        let slice2 = BoundedSlice::<_, 64>::new(&data2[pos2 + i..]).unwrap();
 
         let data1a = _mm256_load(slice1, BoundedUsize::<0>::MAX);
         let data2a = _mm256_load(slice2, BoundedUsize::<0>::MAX);
@@ -99,7 +104,7 @@ fn longest_match(data: &[u8], pos1: u32, pos2: usize) -> usize {
         i += 64;
     }
     while i < max {
-        if data[pos1 + i] != data[pos2 + i] {
+        if data1[pos1 + i] != data2[pos2 + i] {
             return i;
         }
         i += 1;
@@ -168,7 +173,9 @@ fn gain_from_len_and_dist_simd<const USE_LAST_DISTANCES: bool>(
 fn update_with_long_matches<const ENTRY_SIZE: usize, const USE_LAST_DISTANCES: bool>(
     data: &[u8],
     pos: usize,
-    table: &mut HashTableEntry<ENTRY_SIZE>,
+    dist_pos: usize,
+    table: &HashTableEntry<ENTRY_SIZE>,
+    table_data: &[u8],
     last_distances: [u32; 2],
     mut len12p_mask: u64,
     mut d: u32,
@@ -178,8 +185,8 @@ fn update_with_long_matches<const ENTRY_SIZE: usize, const USE_LAST_DISTANCES: b
     while len12p_mask > 0 {
         let p = len12p_mask.trailing_zeros() as usize;
         len12p_mask &= len12p_mask - 1;
-        let len = longest_match(data, table.pos[p], pos) as u32;
-        let dist = pos as u32 - table.pos[p];
+        let len = longest_match(table_data, table.pos[p], data, pos) as u32;
+        let dist = dist_pos as u32 - table.pos[p];
         let gain = gain_from_len_and_dist::<USE_LAST_DISTANCES>(len, dist, last_distances);
         if gain > g {
             (d, l, g) = (dist, len, gain);
@@ -216,8 +223,9 @@ fn table_search<
     chunk1: u32,
     chunk2: u32,
     chunk3: u32,
-    table: &mut HashTableEntry<ENTRY_SIZE>,
+    table: &HashTableEntry<ENTRY_SIZE>,
     last_distances: [u32; 2],
+    distance_limit: u32,
 ) -> (u32, u32, i32, u64) {
     let mut best_distance = _mm256_setzero_si256();
     let mut best_len = _mm256_setzero_si256();
@@ -227,6 +235,7 @@ fn table_search<
     let vchunk1 = _mm256_set1_epi32(chunk1 as i32);
     let vchunk2 = _mm256_set1_epi32(chunk2 as i32);
     let vchunk3 = _mm256_set1_epi32(chunk3 as i32);
+    let vdistance_limit = _mm256_set1_epi32(distance_limit as i32);
 
     let ld0 = _mm256_set1_epi32(last_distances[0] as i32);
     let ld1 = _mm256_set1_epi32(last_distances[1] as i32);
@@ -241,7 +250,7 @@ fn table_search<
 
         let dist = _mm256_sub_epi32(vpos, hpos);
         let valid_mask = _mm256_andnot_si256(
-            _mm256_cmpgt_epi32(dist, _mm256_set1_epi32(WSIZE as i32)),
+            _mm256_cmpgt_epi32(dist, vdistance_limit),
             _mm256_cmpeq_epi32(vchunk1, hchunk1),
         );
 
@@ -296,6 +305,135 @@ fn table_search<
     let g = _mm256_extract_epi32::<0>(_mm256_permutevar8x32_epi32(best_gain, max_pos));
 
     (d, l, g, len12p_mask)
+}
+
+pub trait SharedDictionary<const ENTRY_SIZE: usize> {
+    const HAS_DICTIONARY: bool;
+    fn dict(&self) -> &[u8];
+    fn table(&self) -> &BoxedHugePageArray<HashTableEntry<ENTRY_SIZE>, TABLE_SIZE>;
+}
+
+pub struct NoDictionary {}
+
+impl NoDictionary {
+    pub fn new() -> Self {
+        NoDictionary {}
+    }
+}
+
+impl<const ENTRY_SIZE: usize> SharedDictionary<ENTRY_SIZE> for NoDictionary {
+    const HAS_DICTIONARY: bool = false;
+    fn dict(&self) -> &[u8] {
+        panic!("no dictionary")
+    }
+    fn table(&self) -> &BoxedHugePageArray<HashTableEntry<ENTRY_SIZE>, TABLE_SIZE> {
+        panic!("no dictionary")
+    }
+}
+
+pub struct Lz77Dictionary<const ENTRY_SIZE: usize, const ENTRY_SIZE_MINUS_EIGHT: usize> {
+    dict: Vec<u8>,
+    table: BoxedHugePageArray<HashTableEntry<ENTRY_SIZE>, TABLE_SIZE>,
+}
+
+impl<const ENTRY_SIZE: usize, const ENTRY_SIZE_MINUS_EIGHT: usize> SharedDictionary<ENTRY_SIZE>
+    for Lz77Dictionary<ENTRY_SIZE, ENTRY_SIZE_MINUS_EIGHT>
+{
+    const HAS_DICTIONARY: bool = true;
+    fn dict(&self) -> &[u8] {
+        &self.dict
+    }
+    fn table(&self) -> &BoxedHugePageArray<HashTableEntry<ENTRY_SIZE>, TABLE_SIZE> {
+        &self.table
+    }
+}
+
+const MAX_DICT_LEN: usize = 50331660; // same as cbrotli
+
+impl<const ENTRY_SIZE: usize, const ENTRY_SIZE_MINUS_EIGHT: usize>
+    Lz77Dictionary<ENTRY_SIZE, ENTRY_SIZE_MINUS_EIGHT>
+{
+    pub fn new<const ENTRY_SIZE_MINUS_ONE: usize>(dict: &[u8]) -> Self {
+        assert!(dict.len() <= MAX_DICT_LEN);
+        let mut dictionary = Lz77Dictionary {
+            dict: dict.to_owned(),
+            table: BoxedHugePageArray::new_zeroed(),
+        };
+        let mut replacement_idx = BoxedHugePageArray::<BoundedU8<ENTRY_SIZE>, TABLE_SIZE>::new(
+            BoundedU8::constant::<1>(),
+        );
+        for t in dictionary.table.iter_mut() {
+            let noentry = 0usize.wrapping_sub(WSIZE + MAX_DICT_LEN + 1) as u32;
+            t.pos.fill(noentry);
+        }
+        for pos in 0..dict.len().saturating_sub(INTERIOR_MARGIN) {
+            let data_slice = BoundedSlice::<_, INTERIOR_MARGIN>::new_at_offset(dict, pos).unwrap();
+            let (chunk1, chunk2, chunk3) = get_chunks(data_slice);
+            let hash = hash(u32::from_le_bytes(
+                *data_slice.get_array(BoundedUsize::<PRECOMPUTE_SIZE>::constant::<0>()),
+            )) as usize;
+            let table = &mut dictionary.table[hash];
+            let replacement_idx = &mut replacement_idx[hash];
+            fill_entry_inner::<ENTRY_SIZE, ENTRY_SIZE_MINUS_ONE>(
+                pos,
+                chunk1,
+                chunk2,
+                chunk3,
+                table,
+                replacement_idx,
+            );
+        }
+
+        dictionary
+    }
+}
+
+#[target_feature(enable = "sse,sse2,ssse3,sse4.1,avx,avx2")]
+#[safe_arch]
+fn dictionary_match<
+    const ENTRY_SIZE: usize,
+    const ENTRY_SIZE_MINUS_EIGHT: usize,
+    const USE_LAST_DISTANCES: bool,
+    Dictionary: SharedDictionary<ENTRY_SIZE>,
+>(
+    dictionary: &Dictionary,
+    data: &[u8],
+    pos: usize,
+    chunk1: u32,
+    chunk2: u32,
+    chunk3: u32,
+    hash: BoundedUsize<{ TABLE_SIZE - 1 }>,
+    last_distances: [u32; 2],
+) -> (u32, u32, i32) {
+    if !Dictionary::HAS_DICTIONARY {
+        return (0, 0, i32::MIN);
+    }
+    let dict = dictionary.dict();
+    let table = BoundedSlice::new_from_equal_array(dictionary.table()).get(hash);
+    let dist_pos = pos.min(WSIZE) + dict.len();
+    let (dist, len, gain, len12p_mask) =
+        table_search::<ENTRY_SIZE, ENTRY_SIZE_MINUS_EIGHT, USE_LAST_DISTANCES>(
+            dist_pos,
+            chunk1,
+            chunk2,
+            chunk3,
+            table,
+            last_distances,
+            (WSIZE + MAX_DICT_LEN) as u32,
+        );
+
+    update_with_long_matches::<ENTRY_SIZE, USE_LAST_DISTANCES>(
+        data,
+        pos,
+        dist_pos,
+        table,
+        dict,
+        last_distances,
+        len12p_mask,
+        dist,
+        len,
+        gain,
+    )
 }
 
 const CONTEXT_LUT0: [BoundedU8<63>; 256] = bounded_u8_array![
@@ -465,21 +603,25 @@ pub struct HashTable<
     const ENTRY_SIZE: usize,
     const ENTRY_SIZE_MINUS_ONE: usize,
     const ENTRY_SIZE_MINUS_EIGHT: usize,
+    Dictionary: SharedDictionary<ENTRY_SIZE>,
 > {
     table: BoxedHugePageArray<HashTableEntry<ENTRY_SIZE>, TABLE_SIZE>,
     replacement_idx: BoxedHugePageArray<BoundedU8<ENTRY_SIZE>, TABLE_SIZE>,
+    dictionary: Dictionary,
 }
 
 impl<
         const ENTRY_SIZE: usize,
         const ENTRY_SIZE_MINUS_ONE: usize,
         const ENTRY_SIZE_MINUS_EIGHT: usize,
-    > HashTable<ENTRY_SIZE, ENTRY_SIZE_MINUS_ONE, ENTRY_SIZE_MINUS_EIGHT>
+        Dictionary: SharedDictionary<ENTRY_SIZE>,
+    > HashTable<ENTRY_SIZE, ENTRY_SIZE_MINUS_ONE, ENTRY_SIZE_MINUS_EIGHT, Dictionary>
 {
-    pub fn new() -> Self {
+    pub fn new(dictionary: Dictionary) -> Self {
         HashTable {
             table: BoxedHugePageArray::new_zeroed(),
             replacement_idx: BoxedHugePageArray::new_zeroed(),
+            dictionary,
         }
     }
 
@@ -498,11 +640,15 @@ impl<
     #[inline]
     #[target_feature(enable = "sse")]
     #[safe_arch]
-    fn prefetch_pos(&self, pos: BoundedUsize<{ TABLE_SIZE - 1 }>) {
+    fn prefetch_pos(&self, pos: BoundedUsize<{ TABLE_SIZE - 1 }>, prefetch_dictionary: bool) {
         let entry = BoundedSlice::new_from_equal_array(&self.table).get(pos);
         let ridx = BoundedSlice::new_from_equal_array(&self.replacement_idx).get(pos);
         _mm_safe_prefetch::<_MM_HINT_ET0, _>(entry);
         _mm_safe_prefetch::<_MM_HINT_ET0, _>(ridx);
+        if Dictionary::HAS_DICTIONARY && prefetch_dictionary {
+            let dentry = BoundedSlice::new_from_equal_array(&self.dictionary.table()).get(pos);
+            _mm_safe_prefetch::<_MM_HINT_ET0, _>(dentry);
+        }
     }
 
     /// Returns the number of bytes that were written to the output. Updates the hash table with
@@ -557,6 +703,7 @@ impl<
                 (*BoundedSlice::new_from_equal_array(&hashes)
                     .get(po.add::<{ PRECOMPUTE_SIZE - 1 }, PREFETCH_OFFSET>()))
                 .into(),
+                skip == 0,
             );
 
             let (chunk1, chunk2, chunk3) =
@@ -578,17 +725,41 @@ impl<
                             chunk3,
                             table,
                             last_distances,
+                            WSIZE as u32,
                         );
-                    update_with_long_matches::<ENTRY_SIZE, USE_LAST_DISTANCES>(
+                    let (dist, len, gain) =
+                        update_with_long_matches::<ENTRY_SIZE, USE_LAST_DISTANCES>(
+                            data,
+                            pos,
+                            pos,
+                            table,
+                            data,
+                            last_distances,
+                            len12p_mask,
+                            dist,
+                            len,
+                            gain,
+                        );
+                    let (dict_dist, dict_len, dict_gain) = dictionary_match::<
+                        ENTRY_SIZE,
+                        ENTRY_SIZE_MINUS_EIGHT,
+                        USE_LAST_DISTANCES,
+                        _,
+                    >(
+                        &self.dictionary,
                         data,
                         pos,
-                        table,
+                        chunk1,
+                        chunk2,
+                        chunk3,
+                        hash,
                         last_distances,
-                        len12p_mask,
-                        dist,
-                        len,
-                        gain,
-                    )
+                    );
+                    if dict_gain > gain {
+                        (dict_dist, dict_len, dict_gain)
+                    } else {
+                        (dist, len, gain)
+                    }
                 };
                 let ctx = *BoundedSlice::new_from_equal_array(&context).get(po);
                 let lit = *data_slice.get(BoundedUsize::<{ CONTEXT_OFFSET + 1 }>::constant::<
@@ -664,6 +835,7 @@ impl<
                 (*BoundedSlice::new_from_equal_array(&hashes)
                     .get(po.add::<{ PRECOMPUTE_SIZE - 1 }, PREFETCH_OFFSET>()))
                 .into(),
+                false,
             );
 
             let (chunk1, chunk2, chunk3) =
@@ -772,6 +944,7 @@ impl<
                 (*BoundedSlice::new_from_equal_array(&hashes)
                     .get(po.add::<{ PRECOMPUTE_SIZE - 1 }, PREFETCH_OFFSET>()))
                 .into(),
+                true,
             );
 
             let (chunk1, chunk2, chunk3) = get_chunks(data_slice);
@@ -791,17 +964,36 @@ impl<
                         chunk3,
                         table,
                         last_distances,
+                        WSIZE as u32,
                     );
-                update_with_long_matches::<ENTRY_SIZE, USE_LAST_DISTANCES>(
+                let (dist, len, gain) = update_with_long_matches::<ENTRY_SIZE, USE_LAST_DISTANCES>(
                     data,
                     pos,
+                    pos,
                     table,
+                    data,
                     last_distances,
                     len12p_mask,
                     dist,
                     len,
                     gain,
-                )
+                );
+                let (dict_dist, dict_len, dict_gain) =
+                    dictionary_match::<ENTRY_SIZE, ENTRY_SIZE_MINUS_EIGHT, USE_LAST_DISTANCES, _>(
+                        &self.dictionary,
+                        data,
+                        pos,
+                        chunk1,
+                        chunk2,
+                        chunk3,
+                        hash,
+                        last_distances,
+                    );
+                if dict_gain > gain {
+                    (dict_dist, dict_len, dict_gain)
+                } else {
+                    (dist, len, gain)
+                }
             };
             fill_entry_inner::<ENTRY_SIZE, ENTRY_SIZE_MINUS_ONE>(
                 pos,
@@ -814,7 +1006,7 @@ impl<
             let lit = *data_slice.get(BoundedUsize::<1>::constant::<0>());
             let (lit_params, copy_params) = if len >= 4 {
                 const _: () = assert!(PREFETCH_OFFSET <= 4);
-                for i in 1..PREFETCH_OFFSET {
+                for i in 1..4 {
                     let (chunk1, chunk2, chunk3) =
                         get_chunks(data_slice.varoffset::<12, 7>(BoundedUsize::new_masked(i)));
                     let hash = hashes[po.get() + i].into();
