@@ -519,6 +519,9 @@ impl<
     ) -> usize {
         let end_upper_bound = data.len() - INTERIOR_MARGIN + 1;
         let end = end_upper_bound.min(count + start);
+        if end <= start {
+            return 0;
+        }
 
         let mut context = [BoundedU8::constant::<0>(); PRECOMPUTE_SIZE];
         let mut hashes = [BoundedU32::constant::<0>(); PRECOMPUTE_SIZE];
@@ -713,7 +716,9 @@ impl<
         bpos += self.parse_and_emit_interior::<MIN_GAIN_FOR_GREEDY, USE_LAST_DISTANCES>(
             data,
             bpos,
-            (bpos + count).min(data.len().saturating_sub(INTERIOR_MARGIN)) - bpos,
+            (bpos + count)
+                .min(data.len().saturating_sub(INTERIOR_MARGIN))
+                .saturating_sub(bpos),
             metablock_data,
         );
         while bpos < start + count {
@@ -860,7 +865,9 @@ impl<
         bpos += self.parse_and_emit_interior_fast::<USE_LAST_DISTANCES>(
             data,
             bpos,
-            (bpos + count).min(data.len().saturating_sub(INTERIOR_MARGIN)) - bpos,
+            (bpos + count)
+                .min(data.len().saturating_sub(INTERIOR_MARGIN))
+                .saturating_sub(bpos),
             metablock_data,
         );
         while bpos < start + count {
