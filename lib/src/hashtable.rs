@@ -743,7 +743,7 @@ impl<
         count: usize,
         metablock_data: &mut MetablockData,
     ) -> usize {
-        let end_upper_bound = data.len() - INTERIOR_MARGIN + 1;
+        let end_upper_bound = data.len().saturating_sub(INTERIOR_MARGIN - 1);
         let end = end_upper_bound.min(count + start);
 
         let mut hashes = [BoundedU32::constant::<0>(); PRECOMPUTE_SIZE];
