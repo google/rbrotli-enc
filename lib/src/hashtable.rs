@@ -517,7 +517,7 @@ impl<
         count: usize,
         metablock_data: &mut MetablockData,
     ) -> usize {
-        let end_upper_bound = data.len() - INTERIOR_MARGIN + 1;
+        let end_upper_bound = data.len().saturating_sub(INTERIOR_MARGIN - 1);
         let end = end_upper_bound.min(count + start);
         if end <= start {
             return 0;
@@ -710,8 +710,11 @@ impl<
         let mut bpos = start;
         if bpos == 0 {
             metablock_data.add_literal(BoundedU8::constant::<0>(), data[0], true);
-            metablock_data.add_literal(CONTEXT_LUT0[data[0] as usize], data[1], true);
-            bpos += 2;
+            bpos += 1;
+            if bpos < data.len() {
+                metablock_data.add_literal(CONTEXT_LUT0[data[0] as usize], data[1], true);
+                bpos += 1;
+            }
         }
         bpos += self.parse_and_emit_interior::<MIN_GAIN_FOR_GREEDY, USE_LAST_DISTANCES>(
             data,
@@ -745,6 +748,9 @@ impl<
     ) -> usize {
         let end_upper_bound = data.len().saturating_sub(INTERIOR_MARGIN - 1);
         let end = end_upper_bound.min(count + start);
+        if end <= start {
+            return 0;
+        }
 
         let mut hashes = [BoundedU32::constant::<0>(); PRECOMPUTE_SIZE];
 
