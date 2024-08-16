@@ -62,7 +62,7 @@ void RBrotliEncFreeEncoder(RBrotliEncoder *encoder);
 /**
  * Returns true if this machine is supported by the encoder.
  */
-bool RBrotliEncCanEncode(void);
+bool RBrotliEncIsSupported(void);
 
 #ifdef __cplusplus
 } // extern "C"

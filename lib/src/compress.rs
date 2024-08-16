@@ -854,7 +854,7 @@ impl Encoder {
     ) -> Option<&'a [u8]> {
         self.inner.compress(data, out_buf)
     }
-    pub fn can_encode() -> bool {
+    pub fn is_supported() -> bool {
         is_cpu_supported()
     }
 }

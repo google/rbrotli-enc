@@ -93,6 +93,6 @@ pub unsafe extern "C" fn RBrotliEncFreeEncoder(encoder: *mut RBrotliEncoder) {
 
 /// Returns true if this machine is supported by the encoder.
 #[no_mangle]
-pub extern "C" fn RBrotliEncCanEncode() -> bool {
-    RBrotliEncoder::can_encode()
+pub extern "C" fn RBrotliEncIsSupported() -> bool {
+    RBrotliEncoder::is_supported()
 }
