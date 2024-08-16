@@ -698,6 +698,17 @@ impl<
     }
 }
 
+fn is_cpu_supported() -> bool {
+    is_x86_feature_detected!("avx2")
+        && is_x86_feature_detected!("avx")
+        && is_x86_feature_detected!("sse")
+        && is_x86_feature_detected!("sse2")
+        && is_x86_feature_detected!("sse3")
+        && is_x86_feature_detected!("ssse3")
+        && is_x86_feature_detected!("sse4.1")
+        && is_x86_feature_detected!("sse4.2")
+}
+
 trait EncoderImpl {
     fn max_required_size(&self, input_len: usize) -> usize;
     fn compress<'a>(
@@ -743,15 +754,7 @@ impl<
         let _ = CheckEncoderParams::<ENTRY_SIZE, ENTRY_SIZE_MINUS_ONE, ENTRY_SIZE_MINUS_EIGHT>::CHECK_ENTRY_SIZE;
         let _ = CheckEncoderParams::<ENTRY_SIZE, ENTRY_SIZE_MINUS_ONE, ENTRY_SIZE_MINUS_EIGHT>::CHECK_ENTRY_SIZE_MINUS_ONE;
         let _ = CheckEncoderParams::<ENTRY_SIZE, ENTRY_SIZE_MINUS_ONE, ENTRY_SIZE_MINUS_EIGHT>::CHECK_ENTRY_SIZE_MINUS_EIGHT;
-        if !(is_x86_feature_detected!("avx2")
-            && is_x86_feature_detected!("avx")
-            && is_x86_feature_detected!("sse")
-            && is_x86_feature_detected!("sse2")
-            && is_x86_feature_detected!("sse3")
-            && is_x86_feature_detected!("ssse3")
-            && is_x86_feature_detected!("sse4.1")
-            && is_x86_feature_detected!("sse4.2"))
-        {
+        if !is_cpu_supported() {
             return None;
         }
 
@@ -850,5 +853,8 @@ impl Encoder {
         out_buf: Option<&'a mut [MaybeUninit<u8>]>,
     ) -> Option<&'a [u8]> {
         self.inner.compress(data, out_buf)
+    }
+    pub fn can_encode() -> bool {
+        is_cpu_supported()
     }
 }

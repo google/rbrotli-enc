@@ -1,0 +1,6 @@
+language = "C"
+include_guard = "RBROTLI_ENC_RBROTLI_ENC_H"
+cpp_compat = true
+after_includes = """
+
+typedef struct RBrotliEncoder RBrotliEncoder;"""
