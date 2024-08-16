@@ -14,13 +14,14 @@
 
 use std::ptr::{slice_from_raw_parts, slice_from_raw_parts_mut};
 
-use rbrotli_enc_lib::Encoder;
+/// cbindgen:ignore
+type RBrotliEncoder = rbrotli_enc_lib::Encoder;
 
 /// Creates a new encoder for a given quality.
 #[no_mangle]
-pub extern "C" fn RBrotliEncMakeEncoder(quality: u32) -> *mut Encoder {
-    let encoder = Box::new(Encoder::new(quality));
-    Box::leak(encoder) as *mut Encoder
+pub extern "C" fn RBrotliEncMakeEncoder(quality: u32) -> *mut RBrotliEncoder {
+    let encoder = Box::new(RBrotliEncoder::new(quality));
+    Box::into_raw(encoder)
 }
 
 /// Compresses `len` bytes of data starting at `*data` using `encoder`, writing the result to
@@ -40,7 +41,7 @@ pub extern "C" fn RBrotliEncMakeEncoder(quality: u32) -> *mut Encoder {
 /// must be accessible.
 #[no_mangle]
 pub unsafe extern "C" fn RBrotliEncCompress(
-    encoder: *mut Encoder,
+    encoder: *mut RBrotliEncoder,
     data: *const u8,
     len: usize,
     out_data: *mut *mut u8,
@@ -70,7 +71,10 @@ pub unsafe extern "C" fn RBrotliEncCompress(
 /// `encoder` must be a valid Encoder created by RBrotliEncMakeEncoder that has not been
 /// freed yet.
 #[no_mangle]
-pub unsafe extern "C" fn RBrotliEncMaxRequiredSize(encoder: *mut Encoder, in_size: usize) -> usize {
+pub unsafe extern "C" fn RBrotliEncMaxRequiredSize(
+    encoder: *mut RBrotliEncoder,
+    in_size: usize,
+) -> usize {
     let Some(encoder) = encoder.as_mut() else {
         return usize::MAX;
     };
@@ -83,6 +87,12 @@ pub unsafe extern "C" fn RBrotliEncMaxRequiredSize(encoder: *mut Encoder, in_siz
 /// `encoder` must be a valid Encoder created by RBrotliEncMakeEncoder that has not been
 /// freed yet.
 #[no_mangle]
-pub unsafe extern "C" fn RBrotliEncFreeEncoder(encoder: *mut Encoder) {
+pub unsafe extern "C" fn RBrotliEncFreeEncoder(encoder: *mut RBrotliEncoder) {
     drop(Box::from_raw(encoder));
+}
+
+/// Returns true if this machine is supported by the encoder.
+#[no_mangle]
+pub extern "C" fn RBrotliEncCanEncode() -> bool {
+    RBrotliEncoder::can_encode()
 }

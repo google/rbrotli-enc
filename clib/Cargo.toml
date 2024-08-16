@@ -11,5 +11,8 @@ crate-type = ["cdylib"]
 [dependencies]
 rbrotli-enc-lib = { path = "../lib" }
 
+[build-dependencies]
+cbindgen = "0.24.0"
+
 [lints]
 workspace = true
