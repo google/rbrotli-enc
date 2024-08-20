@@ -37,6 +37,18 @@ struct Literal {
     context: BoundedU8<63>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct LiteralHistogram {
+    data: [u32; MAX_LIT],
+    total: u32,
+}
+
+struct HistogramBuffers {
+    iac_hist: BoxedHugePageArray<u32, IAC_HIST_BUF_SIZE>,
+    dist_hist: BoxedHugePageArray<[u32; MAX_DIST], 2>,
+    lit_hist: BoxedHugePageArray<LiteralHistogram, 64>,
+}
+
 pub struct MetablockData {
     literals: BoxedHugePageArray<Literal, LITERAL_BUF_SIZE>,
     total_literals: u32,
@@ -50,12 +62,6 @@ pub struct MetablockData {
     iac_literals: u32,
     context_mode: ContextMode,
     num_syms: BoundedUsize<SYMBOL_BUF_LIMIT>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct LiteralHistogram {
-    data: [u32; MAX_LIT],
-    total: u32,
 }
 
 #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2")]
@@ -115,7 +121,7 @@ fn histogram_distance(a: &LiteralHistogram, b: &LiteralHistogram) -> i32 {
 #[inline(never)]
 #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2")]
 #[safe_arch::safe_arch]
-fn cluster_histograms(histograms: [LiteralHistogram; 64]) -> (Vec<LiteralHistogram>, [u8; 64]) {
+fn cluster_histograms(histograms: &[LiteralHistogram; 64]) -> (Vec<LiteralHistogram>, [u8; 64]) {
     let mut used = [false; 64];
     let mut cmap = [0; 64];
     let mut output_histograms = Vec::with_capacity(64);
@@ -548,7 +554,7 @@ impl MetablockData {
     #[inline]
     #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2")]
     #[safe_arch]
-    fn write(&mut self, bw: &mut BitWriter, count: usize) {
+    fn write(&mut self, bw: &mut BitWriter, histo_buf: &mut HistogramBuffers, count: usize) {
         let mut header = metablock::Header {
             len: count,
             ndirect: 0,
@@ -556,22 +562,26 @@ impl MetablockData {
             ..Default::default()
         };
 
-        let mut iac_hist = [0u32; IAC_HIST_BUF_SIZE];
-        let mut dist_hist = [[0u32; MAX_DIST]; 2];
+        histo_buf.iac_hist.fill(0);
+        histo_buf.dist_hist[0].fill(0);
+        histo_buf.dist_hist[1].fill(0);
+        for i in 0..64 {
+            histo_buf.lit_hist[i].data.fill(0);
+            histo_buf.lit_hist[i].total = 0;
+        }
+        let iac_hist = &mut histo_buf.iac_hist;
+        let dist_hist = &mut histo_buf.dist_hist;
+        let lit_hist = &mut histo_buf.lit_hist;
 
-        let mut lit_hist = [LiteralHistogram {
-            data: [0u32; MAX_LIT],
-            total: 0,
-        }; 64];
         for lit in &self.literals[..self.total_literals as usize] {
-            let lit_hist = BoundedSlice::new_from_equal_array_mut(&mut lit_hist);
+            let lit_hist = BoundedSlice::new_from_equal_array_mut(lit_hist);
             let histo = BoundedSlice::new_from_equal_array_mut(
                 &mut lit_hist.get_mut(lit.context.into()).data,
             );
             *histo.get_mut(BoundedUsize::from_u8(lit.value)) += 1;
         }
         for ctx in BoundedUsize::<63>::iter(0, 64, 1) {
-            let lit_hist = BoundedSlice::new_from_equal_array_mut(&mut lit_hist);
+            let lit_hist = BoundedSlice::new_from_equal_array_mut(lit_hist);
             let lh = lit_hist.get_mut(ctx);
             lh.total = lh.data.iter().copied().sum::<u32>();
         }
@@ -585,11 +595,7 @@ impl MetablockData {
 
         assert!(self.total_icd <= ICD_BUF_SIZE as u32 + 16);
 
-        self.compute_symbols_and_icd_histograms(
-            &mut iac_hist,
-            &mut dist_hist,
-            &cmap[..].try_into().unwrap(),
-        );
+        self.compute_symbols_and_icd_histograms(iac_hist, dist_hist, &cmap[..].try_into().unwrap());
 
         for histo in dist_hist.iter_mut() {
             if histo.iter().sum::<u32>() == 0 {
@@ -629,6 +635,7 @@ struct EncoderInternal<
 > {
     ht: HashTable<ENTRY_SIZE, ENTRY_SIZE_MINUS_ONE, ENTRY_SIZE_MINUS_EIGHT>,
     md: MetablockData,
+    hb: HistogramBuffers,
     bwbuf: Vec<u8>,
 }
 
@@ -662,13 +669,14 @@ fn compress_one_metablock<
     bw: &mut BitWriter,
     ht: &mut HashTable<ENTRY_SIZE, ENTRY_SIZE_MINUS_ONE, ENTRY_SIZE_MINUS_EIGHT>,
     md: &mut MetablockData,
+    hb: &mut HistogramBuffers,
 ) -> usize {
     let count = (data.len() - pos).min(METABLOCK_SIZE);
     let count = ht
         .parse_and_emit_metablock::<FAST_MATCHING, MIN_GAIN_FOR_GREEDY, USE_LAST_DISTANCES>(
             data, pos, count, md,
         );
-    md.write(bw, count);
+    md.write(bw, hb, count);
     count
 }
 
@@ -693,6 +701,14 @@ impl<
         EncoderInternal {
             ht: HashTable::new(),
             md: MetablockData::new(),
+            hb: HistogramBuffers {
+                lit_hist: BoxedHugePageArray::new(LiteralHistogram {
+                    data: [0; MAX_LIT],
+                    total: 0,
+                }),
+                iac_hist: BoxedHugePageArray::new_zeroed(),
+                dist_hist: BoxedHugePageArray::new_zeroed(),
+            },
             bwbuf: vec![],
         }
     }
@@ -804,6 +820,7 @@ impl<
                 &mut bw,
                 &mut self.ht,
                 &mut self.md,
+                &mut self.hb,
             );
             if pos >= SHIFT_INTERVAL * 2 + virtual_start {
                 self.ht.shift_back(SHIFT_INTERVAL as u32);
