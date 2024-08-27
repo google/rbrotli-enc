@@ -25,9 +25,12 @@ RBrotliEncoder *RBrotliEncMakeEncoder(uint32_t quality);
  *
  * `*out_len` is overwritten with the total size of the encoded data.
  *
+ * If this function returns `true`, the first `*out_len` bytes pointed at by `*out_data` will be
+ * initialized.
+ *
  * # Safety
- * `encoder` must be a valid Encoder created by RBrotliEncMakeEncoder that has not been
- * freed yet.
+ * `encoder` must be a valid Encoder created by RBrotliEncMakeEncoder that has not been freed yet,
+ * and that encoder must not be used elsewhere during the call to `RBrotliEncCompress`.
  * The `len` bytes of memory starting at `data` must be initialized.
  * `out_len` must not be a null pointer, and `*out_len` must be initialized.
  * `out_data` must not be a null pointer.
@@ -46,16 +49,17 @@ bool RBrotliEncCompress(RBrotliEncoder *encoder,
  *
  * # Safety
  * `encoder` must be a valid Encoder created by RBrotliEncMakeEncoder that has not been
- * freed yet.
+ * freed yet. During the call to `RBrotliEncMaxRequiredSize`, the referenced encoder must not be
+ * mutated.
  */
-uintptr_t RBrotliEncMaxRequiredSize(RBrotliEncoder *encoder, uintptr_t in_size);
+uintptr_t RBrotliEncMaxRequiredSize(const RBrotliEncoder *encoder, uintptr_t in_size);
 
 /**
  * Frees `encoder`.
  *
  * # Safety
  * `encoder` must be a valid Encoder created by RBrotliEncMakeEncoder that has not been
- * freed yet.
+ * freed yet; the encoder must not be used afterwards.
  */
 void RBrotliEncFreeEncoder(RBrotliEncoder *encoder);
 

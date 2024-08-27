@@ -183,8 +183,11 @@ impl<T, const LOWER_BOUND: usize> BoundedSlice<T, LOWER_BOUND> {
     /// # Safety
     /// Caller must guarantee slice.len() >= LOWER_BOUND.
     pub unsafe fn from_slice_unchecked(slice: &[T]) -> &BoundedSlice<T, LOWER_BOUND> {
-        // SAFETY: same layout and interpretation of metadata.
-        &*(slice as *const [T] as *const Self)
+        let ptr_to_self = slice as *const [T] as *const Self;
+        // SAFETY: `Self` is a repr(transparent) wrapper around `[T]`, so it has the same memory
+        // layout. Dereferencing the pointer is then valid, and the lifetimes in the function
+        // signature guarantee that the returned slice does not outlive the input slice.
+        unsafe { &*ptr_to_self }
     }
 
     /// Constructs a new mutable BoundedSlice without checking that its length is sufficient.
@@ -192,8 +195,11 @@ impl<T, const LOWER_BOUND: usize> BoundedSlice<T, LOWER_BOUND> {
     /// # Safety
     /// Caller must guarantee slice.len() >= LOWER_BOUND.
     pub unsafe fn from_slice_unchecked_mut(slice: &mut [T]) -> &mut BoundedSlice<T, LOWER_BOUND> {
-        // SAFETY: same layout and interpretation of metadata.
-        &mut *(slice as *mut [T] as *mut Self)
+        let ptr_to_self = slice as *mut [T] as *mut Self;
+        // SAFETY: `Self` is a repr(transparent) wrapper around `[T]`, so it has the same memory
+        // layout. Dereferencing the pointer is then valid, and the lifetimes in the function
+        // signature guarantee that the returned slice does not outlive the input slice.
+        unsafe { &mut *ptr_to_self }
     }
 
     pub fn new_from_array<const ARR_SIZE: usize>(
@@ -406,7 +412,12 @@ macro_rules! impl_bounded_iterable {
 
                 #[inline(always)]
                 unsafe fn internal_make(($([< state_ $bound:lower >]),*): Self::State) -> Self {
-                    ($(BoundedUsize::new_unchecked([< state_ $bound:lower >])),*)
+                    // SAFETY: the safety invariant on `internal_make` guarantees that the `usize`
+                    // passed to `new_unchecked` is indeed bounded by the required bound, thanks to
+                    // the checks done in `iter` and `riter`.
+                    unsafe {
+                        ($(BoundedUsize::new_unchecked([< state_ $bound:lower >])),*)
+                    }
                 }
             }
         }

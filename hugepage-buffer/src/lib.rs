@@ -42,22 +42,27 @@ unsafe fn allocate<T>(layout: Layout, zeroed: bool) -> *mut T {
             sysconf, MADV_HUGEPAGE, MAP_ANONYMOUS, MAP_FAILED, MAP_PRIVATE, PROT_READ, PROT_WRITE,
             _SC_PAGE_SIZE,
         };
-        let page_size = sysconf(_SC_PAGE_SIZE);
+        // SAFETY: `sysconf` is always safe.
+        let page_size = unsafe { sysconf(_SC_PAGE_SIZE) };
         assert!(page_size >= 0);
         let page_size = page_size as u64;
         const _: () = assert!(std::mem::size_of::<u64>() >= std::mem::size_of::<usize>());
         assert_eq!(page_size as u64 % layout.align() as u64, 0);
-        let mem = libc::mmap(
-            null_mut(),
-            layout.size(),
-            PROT_READ | PROT_WRITE,
-            MAP_PRIVATE | MAP_ANONYMOUS,
-            -1,
-            0,
-        );
-        libc::madvise(mem, layout.size(), MADV_HUGEPAGE);
+        // SAFETY: creating anonymous mappings is always safe.
+        let mem = unsafe {
+            libc::mmap(
+                null_mut(),
+                layout.size(),
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
         assert_ne!(mem, MAP_FAILED);
-        // SAFETY: mmap guarantees that the returned pointer is aligned to a page size and points
+        // SAFETY: `madvise(MADV_HUGEPAGE)` is always safe.
+        unsafe { libc::madvise(mem, layout.size(), MADV_HUGEPAGE) };
+        // Safety note: mmap guarantees that the returned pointer is aligned to a page size and points
         // to an allocated region at least as long as its `len` argument. We check that the
         // required alignment is compatible with the page size before calling mmap.
         mem as *mut T
@@ -78,16 +83,23 @@ unsafe fn allocate<T>(layout: Layout, zeroed: bool) -> *mut T {
 ///
 /// Safety:
 /// - `ptr` must have been allocated with `allocate`, with the same `layout` passed to this
-///   function.
+///   function, and not have been deallocated yet.
 /// - The memory pointed by `ptr` must still be valid.
 unsafe fn deallocate<T>(ptr: *mut T, layout: Layout) {
     #[cfg(all(target_os = "linux", not(miri)))]
     {
         use libc::c_void;
-        libc::munmap(ptr as *mut c_void, layout.size());
+        // SAFETY: `ptr` comes from a call to `mmap` with the same size as passed to this call to
+        // `munmap`, and the memory was not unmapped before.
+        unsafe {
+            libc::munmap(ptr as *mut c_void, layout.size());
+        }
     }
     #[cfg(any(not(target_os = "linux"), miri))]
-    std::alloc::dealloc(ptr as *mut u8, layout)
+    // SAFETY: the memory was allocated with `std::alloc::alloc` and not deallocated yet.
+    unsafe {
+        std::alloc::dealloc(ptr as *mut u8, layout)
+    }
 }
 
 impl<T: Copy, const LEN: usize> BoxedHugePageArray<T, LEN> {

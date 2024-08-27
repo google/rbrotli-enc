@@ -99,11 +99,18 @@ impl<'a> BitWriter<'a> {
         self.bit_buffer |= bits << self.bits_in_buffer;
         let shift = 64 - self.bits_in_buffer;
         self.bits_in_buffer += count;
-        copy_nonoverlapping(
-            (&mut self.bit_buffer.to_le()) as *mut u64 as *mut u8,
-            self.buf.as_mut_ptr().add(self.bytes_written).cast(),
-            8,
-        );
+        // SAFETY: It is always safe to bit-copy `u8`s to `MaybeUninit<u8>`s. `src` points to an
+        // 8-byte local buffer (as returned by `to_le_bytes`), and `dst` points to the buffer
+        // provided by the user when creating the BitWriter, which for sure does not overlap it.
+        // The caller guarantees at least `8` bytes are available in `self.buf` after
+        // `self.bytes_written`.
+        unsafe {
+            copy_nonoverlapping(
+                self.bit_buffer.to_le_bytes().as_ptr(),
+                self.buf.as_mut_ptr().add(self.bytes_written).cast(),
+                8,
+            );
+        }
         if self.bits_in_buffer >= 64 {
             self.bit_buffer = bits >> shift;
             self.bits_in_buffer -= 64;
