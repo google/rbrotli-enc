@@ -587,10 +587,8 @@ impl MetablockData {
         }
 
         let (mut clusters, cmap) = cluster_histograms(lit_hist);
-        if clusters.len() == 1 {
-            if clusters[0].data.iter().sum::<u32>() == 0 {
-                clusters[0].data[0] += 1;
-            }
+        if clusters.len() == 1 && clusters[0].data.iter().sum::<u32>() == 0 {
+            clusters[0].data[0] += 1;
         }
 
         assert!(self.total_icd <= ICD_BUF_SIZE as u32 + 16);

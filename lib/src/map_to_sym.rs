@@ -433,6 +433,7 @@ pub fn distance_to_sym_and_bits_simd<
 }
 
 #[cfg(test)]
+#[allow(clippy::needless_range_loop)]
 mod test {
     use super::{
         copy_len_to_sym_and_bits, copy_len_to_sym_and_bits_simd, distance_to_sym_and_bits_simd,
@@ -519,7 +520,7 @@ mod test {
                     + (SYMBOL_MASK + DIST_BASE)
                     + distance_ctx_buf[i] as u16 * MAX_DIST as u16;
                 assert_eq!(adj_sym as u32, distance_sym_buf[i]);
-                assert_eq!(bits as u32, distance_bits_buf[i]);
+                assert_eq!(bits, distance_bits_buf[i]);
                 assert_eq!(
                     nbits as u64,
                     get_nbits(
@@ -565,16 +566,13 @@ mod test {
                 );
                 for x in 0..8 {
                     let (sym, nbits, bits) = insert_copy_len_to_sym_and_bits(insert[x], copy[x]);
-                    assert_eq!((sym | SYMBOL_MASK) as u32, sym_buf[x as usize]);
+                    assert_eq!((sym | SYMBOL_MASK) as u32, sym_buf[x]);
                     assert_eq!(
                         nbits as u64,
-                        get_nbits(nbits_pat_buf[x as usize], nbits_count_buf[x as usize])
+                        get_nbits(nbits_pat_buf[x], nbits_count_buf[x])
                     );
-                    assert_eq!(bits, bits_buf[x as usize]);
-                    assert_eq!(
-                        if copy[x] <= 4 { 0 } else { 1 },
-                        distance_ctx_buf[x as usize]
-                    )
+                    assert_eq!(bits, bits_buf[x]);
+                    assert_eq!(if copy[x] <= 4 { 0 } else { 1 }, distance_ctx_buf[x])
                 }
             }
         }
@@ -613,7 +611,7 @@ mod test {
             );
             for x in 0..8 {
                 let (sym, nbits, bits) = insert_len_to_sym_and_bits(i as u32 + x);
-                assert_eq!(sym as u32, sym_buf[x as usize]);
+                assert_eq!(sym, sym_buf[x as usize]);
                 assert_eq!(nbits, nbits_buf[x as usize]);
                 assert_eq!(bits, bits_buf[x as usize]);
             }
@@ -653,7 +651,7 @@ mod test {
             );
             for x in 0..8 {
                 let (sym, nbits, bits) = copy_len_to_sym_and_bits(i as u32 + x);
-                assert_eq!(sym as u32, sym_buf[x as usize]);
+                assert_eq!(sym, sym_buf[x as usize]);
                 assert_eq!(nbits, nbits_buf[x as usize]);
                 assert_eq!(bits, bits_buf[x as usize]);
             }

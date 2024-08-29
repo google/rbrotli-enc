@@ -165,6 +165,7 @@ fn gain_from_len_and_dist_simd<const USE_LAST_DISTANCES: bool>(
 #[inline]
 #[target_feature(enable = "avx,avx2")]
 #[safe_arch]
+#[allow(clippy::too_many_arguments)]
 fn update_with_long_matches<const ENTRY_SIZE: usize, const USE_LAST_DISTANCES: bool>(
     data: &[u8],
     pos: usize,
