@@ -57,7 +57,7 @@ pub unsafe extern "C" fn RBrotliEncCompress(
     // SAFETY: caller guarantees the pointer to be dereferenceable, that the pointer points to a
     // valid encoder created with RBrotliEncMakeEncoder, and that the encoder will not be
     // read or written through other pointers during the function call.
-    let encoder = unsafe { encoder.as_mut() }.unwrap();
+    let encoder = unsafe { &mut *encoder };
     // SAFETY: caller guarantees `data` to point at `len` bytes of initialized memory.
     let data = unsafe { slice_from_raw_parts(data, len).as_ref() };
     let Some(data) = data else {
@@ -94,7 +94,7 @@ pub unsafe extern "C" fn RBrotliEncMaxRequiredSize(
     // SAFETY: caller guarantees the pointer to be dereferenceable, that the pointer points to a
     // valid encoder created with RBrotliEncMakeEncoder, and that the encoder will not be
     // mutated during the call.
-    let encoder = unsafe { encoder.as_ref() }.unwrap();
+    let encoder = unsafe { &*encoder };
     encoder.max_required_size(in_size)
 }
 
