@@ -18,8 +18,6 @@
           devShells.default = mkShell {
             buildInputs = [
               brotli
-              cargo
-              rustfmt
               (python3.withPackages (ps: with ps; [ brotli ]))
               (rust-bin.fromRustupToolchainFile ./rust-toolchain.toml)
             ];
