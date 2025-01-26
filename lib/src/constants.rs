@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // File format choices.
-pub const METABLOCK_SIZE: usize = 1 << 22;
+pub const METABLOCK_SIZE: usize = 1 << 17;
 pub const WBITS: usize = 24;
 pub const WSIZE: usize = (1 << WBITS) - 16;
 

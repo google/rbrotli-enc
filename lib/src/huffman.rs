@@ -79,6 +79,12 @@ impl<'a> HuffmanCode<'a> {
         assert!(counts.len() <= (1 << max_len));
         assert!(counts.iter().all(|x| *x < (1u32 << 30)));
         let total: u32 = counts.iter().sum();
+        let (total, counts) = if total != 0 {
+            (total, counts)
+        } else {
+            const FALLBACK_COUNTS: &[u32] = &[1];
+            (1, FALLBACK_COUNTS)
+        };
         assert_ne!(total, 0);
 
         let n = counts.len();
