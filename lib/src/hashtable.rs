@@ -68,7 +68,7 @@ struct HashTableEntry<const ENTRY_SIZE: usize> {
 }
 
 #[inline]
-#[target_feature(enable = "avx,avx2")]
+#[target_feature(enable = "avx2")]
 #[safe_arch]
 fn longest_match(data: &[u8], pos1: u32, pos2: usize) -> usize {
     let pos1 = pos1 as usize;
@@ -124,7 +124,7 @@ fn gain_from_len_and_dist<const USE_LAST_DISTANCES: bool>(
 }
 
 #[inline]
-#[target_feature(enable = "avx,avx2")]
+#[target_feature(enable = "avx2")]
 #[safe_arch]
 fn gain_from_len_and_dist_simd<const USE_LAST_DISTANCES: bool>(
     len: __m256i,
@@ -160,7 +160,7 @@ fn gain_from_len_and_dist_simd<const USE_LAST_DISTANCES: bool>(
 }
 
 #[inline]
-#[target_feature(enable = "avx,avx2")]
+#[target_feature(enable = "avx2")]
 #[safe_arch]
 #[allow(clippy::too_many_arguments)]
 fn update_with_long_matches<const ENTRY_SIZE: usize, const USE_LAST_DISTANCES: bool>(
@@ -195,7 +195,7 @@ fn get_chunks<const SIZE: usize>(data_slice: &BoundedSlice<u8, SIZE>) -> (u32, u
 }
 
 #[inline]
-#[target_feature(enable = "avx,avx2")]
+#[target_feature(enable = "avx2")]
 #[safe_arch]
 fn _mm256_ilog2_epi32(x: __m256i) -> __m256i {
     let float = _mm256_castps_si256(_mm256_cvtepi32_ps(x));
@@ -203,7 +203,7 @@ fn _mm256_ilog2_epi32(x: __m256i) -> __m256i {
 }
 
 #[inline]
-#[target_feature(enable = "avx,avx2")]
+#[target_feature(enable = "avx2")]
 #[safe_arch]
 fn table_search<
     const ENTRY_SIZE: usize,
@@ -299,7 +299,7 @@ fn table_search<
 const PRECOMPUTE_SIZE: usize = 16;
 
 #[inline]
-#[target_feature(enable = "sse2,ssse3,sse4.1,avx,avx2")]
+#[target_feature(enable = "avx2")]
 #[safe_arch]
 fn compute_hash_at(
     data_slice: &BoundedSlice<u8, INTERIOR_MARGIN>,
@@ -380,7 +380,7 @@ impl<
     }
 
     #[inline]
-    #[target_feature(enable = "sse")]
+    #[target_feature(enable = "avx2")]
     #[safe_arch]
     fn prefetch_pos(&self, pos: BoundedUsize<{ TABLE_SIZE - 1 }>) {
         let entry = BoundedSlice::new_from_equal_array(&self.table).get(pos);
@@ -391,7 +391,7 @@ impl<
 
     /// Returns the number of bytes that were written to the output. Updates the hash table with
     /// strings starting at all of those bytes, if within the margin.
-    #[target_feature(enable = "sse,sse2,ssse3,sse4.1,avx,avx2")]
+    #[target_feature(enable = "avx2")]
     #[safe_arch]
     #[inline(never)]
     fn parse_and_emit_interior<const MIN_GAIN_FOR_GREEDY: i32, const USE_LAST_DISTANCES: bool>(
@@ -548,7 +548,7 @@ impl<
         end + skip as usize - start
     }
 
-    #[target_feature(enable = "sse,sse2,ssse3,sse4.1,avx,avx2")]
+    #[target_feature(enable = "avx2")]
     #[safe_arch]
     pub fn parse_and_emit_metablock<
         const FAST_MATCHING: bool,
@@ -589,7 +589,7 @@ impl<
 
     /// Returns the number of bytes that were written to the output. Updates the hash table with
     /// strings starting at all of those bytes, if within the margin.
-    #[target_feature(enable = "sse,sse2,ssse3,sse4.1,avx,avx2")]
+    #[target_feature(enable = "avx2")]
     #[safe_arch]
     #[inline(never)]
     fn parse_and_emit_interior_fast<const USE_LAST_DISTANCES: bool>(
@@ -711,7 +711,7 @@ impl<
         pos - start
     }
 
-    #[target_feature(enable = "sse,sse2,ssse3,sse4.1,avx,avx2")]
+    #[target_feature(enable = "avx2")]
     #[safe_arch]
     pub fn parse_and_emit_metablock_fast<const USE_LAST_DISTANCES: bool>(
         &mut self,
@@ -739,11 +739,8 @@ impl<
 
 #[cfg(test)]
 mod test {
-    use super::{
-        _mm256_ilog2_epi32, gain_from_len_and_dist, gain_from_len_and_dist_simd, PRECOMPUTE_SIZE,
-    };
+    use super::{_mm256_ilog2_epi32, gain_from_len_and_dist, gain_from_len_and_dist_simd};
     use crate::constants::*;
-    use bounded_utils::{BoundedSlice, BoundedU8};
     use safe_arch::{
         safe_arch_entrypoint,
         x86_64::{_mm256_extract_epi32, _mm256_set1_epi32},

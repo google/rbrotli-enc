@@ -111,7 +111,7 @@ impl MetablockData {
     }
 
     #[inline]
-    #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2")]
+    #[target_feature(enable = "avx2")]
     #[safe_arch]
     fn add_literals(&mut self, count: u32) {
         if count == 0 {
@@ -151,7 +151,7 @@ impl MetablockData {
 
     #[allow(clippy::too_many_arguments)]
     #[inline]
-    #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2")]
+    #[target_feature(enable = "avx2")]
     #[safe_arch]
     fn add_iac(
         &mut self,
@@ -203,7 +203,7 @@ impl MetablockData {
     }
 
     #[inline(never)]
-    #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2")]
+    #[target_feature(enable = "avx2")]
     #[safe_arch]
     fn compute_symbols_and_icd_histograms(
         &mut self,
@@ -301,7 +301,7 @@ impl MetablockData {
     }
 
     #[inline]
-    #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2")]
+    #[target_feature(enable = "avx2")]
     #[safe_arch]
     fn write_bits(&mut self, bw: &mut BitWriter) {
         let get_sym_mask = _mm256_set1_epi16(!SYMBOL_MASK as i16);
@@ -391,7 +391,7 @@ impl MetablockData {
     }
 
     #[inline]
-    #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2")]
+    #[target_feature(enable = "avx2")]
     #[safe_arch]
     fn write(&mut self, bw: &mut BitWriter, histo_buf: &mut HistogramBuffers, count: usize) {
         let mut header = metablock::Header {
