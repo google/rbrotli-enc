@@ -21,21 +21,14 @@ use crate::{
     },
     metablock::{self, ContextMode},
 };
-use bounded_utils::{BoundedIterable, BoundedSlice, BoundedU8, BoundedUsize};
+use bounded_utils::{BoundedIterable, BoundedSlice, BoundedUsize};
 use hugepage_buffer::BoxedHugePageArray;
 use lsb_bitwriter::BitWriter;
 use safe_arch::{safe_arch, safe_arch_entrypoint, x86_64::*};
 use std::mem::MaybeUninit;
-use zerocopy::{transmute, transmute_mut, AsBytes, FromZeroes};
+use zerocopy::{transmute, transmute_mut};
 
 use crate::constants::*;
-
-#[derive(Debug, Clone, Copy, AsBytes, FromZeroes)]
-#[repr(C)]
-struct Literal {
-    value: u8,
-    context: BoundedU8<63>,
-}
 
 #[derive(Clone, Copy, Debug)]
 struct LiteralHistogram {
@@ -46,11 +39,11 @@ struct LiteralHistogram {
 struct HistogramBuffers {
     iac_hist: BoxedHugePageArray<u32, IAC_HIST_BUF_SIZE>,
     dist_hist: BoxedHugePageArray<[u32; MAX_DIST], 2>,
-    lit_hist: BoxedHugePageArray<LiteralHistogram, 64>,
+    lit_hist: BoxedHugePageArray<LiteralHistogram, 1>,
 }
 
 pub struct MetablockData {
-    literals: BoxedHugePageArray<Literal, LITERAL_BUF_SIZE>,
+    literals: BoxedHugePageArray<u8, LITERAL_BUF_SIZE>,
     total_literals: u32,
     copy_len: BoxedHugePageArray<u32, ICD_BUF_SIZE>,
     insert_len: BoxedHugePageArray<u32, ICD_BUF_SIZE>,
@@ -62,137 +55,6 @@ pub struct MetablockData {
     iac_literals: u32,
     context_mode: ContextMode,
     num_syms: BoundedUsize<SYMBOL_BUF_LIMIT>,
-}
-
-#[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2")]
-#[safe_arch::safe_arch]
-fn histogram_distance(a: &LiteralHistogram, b: &LiteralHistogram) -> i32 {
-    if a.total == 0 || b.total == 0 {
-        return 0;
-    }
-    let inv_a = _mm256_set1_ps(1.0 / a.total as f32);
-    let inv_b = _mm256_set1_ps(1.0 / b.total as f32);
-    let inv_total = _mm256_set1_ps(1.0 / (a.total + b.total) as f32);
-    let mut total_distance0 = _mm256_setzero_si256();
-    let mut total_distance1 = _mm256_setzero_si256();
-    let mut total_distance2 = _mm256_setzero_si256();
-    let ceil_nlog2 = |x| {
-        _mm256_sub_epi32(
-            _mm256_set1_epi32(127),
-            _mm256_srli_epi32::<23>(_mm256_castps_si256(x)),
-        )
-    };
-    for i in BoundedUsize::<{ 256 - 8 }>::iter(0, 32, 8) {
-        let av = _mm256_load(BoundedSlice::new_from_equal_array(&a.data), i);
-        let bv = _mm256_load(BoundedSlice::new_from_equal_array(&b.data), i);
-        let totv = _mm256_add_epi32(av, bv);
-        let af32 = _mm256_cvtepi32_ps(av);
-        let bf32 = _mm256_cvtepi32_ps(bv);
-        let totf32 = _mm256_cvtepi32_ps(totv);
-        let proba = _mm256_mul_ps(af32, inv_a);
-        let probb = _mm256_mul_ps(bf32, inv_b);
-        let probtot = _mm256_mul_ps(totf32, inv_total);
-        let nbitsa = ceil_nlog2(proba);
-        let nbitsb = ceil_nlog2(probb);
-        let nbitstot = ceil_nlog2(probtot);
-        total_distance0 = _mm256_add_epi32(_mm256_mullo_epi32(nbitstot, totv), total_distance0);
-        total_distance1 = _mm256_add_epi32(_mm256_mullo_epi32(nbitsa, av), total_distance1);
-        total_distance2 = _mm256_add_epi32(_mm256_mullo_epi32(nbitsb, bv), total_distance2);
-    }
-    let mut total_distance = _mm256_sub_epi32(
-        total_distance0,
-        _mm256_add_epi32(total_distance1, total_distance2),
-    );
-    total_distance = _mm256_add_epi32(
-        total_distance,
-        _mm256_shuffle_epi32::<0b10110001>(total_distance),
-    );
-    total_distance = _mm256_add_epi32(
-        total_distance,
-        _mm256_shuffle_epi32::<0b01001110>(total_distance),
-    );
-    total_distance = _mm256_add_epi32(
-        total_distance,
-        _mm256_permute4x64_epi64::<0b01001110>(total_distance),
-    );
-    _mm256_extract_epi32::<0>(total_distance)
-}
-
-#[inline(never)]
-#[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2")]
-#[safe_arch::safe_arch]
-fn cluster_histograms(histograms: &[LiteralHistogram; 64]) -> (Vec<LiteralHistogram>, [u8; 64]) {
-    let mut used = [false; 64];
-    let mut cmap = [0; 64];
-    let mut output_histograms = Vec::with_capacity(64);
-
-    let best_histogram_index = histograms
-        .iter()
-        .enumerate()
-        .map(|(a, b)| (a, b.total))
-        .max_by_key(|(_, a)| *a)
-        .map(|(a, _)| a)
-        .unwrap();
-
-    output_histograms.push(histograms[best_histogram_index]);
-    used[best_histogram_index] = true;
-    cmap[best_histogram_index] = 0;
-
-    const MIN_HISTOGRAM_GAIN: i32 = 256;
-
-    let mut hd = [0i32; 64];
-    for i in 0..64 {
-        if !used[i] {
-            hd[i] = histogram_distance(&output_histograms[0], &histograms[i]);
-        }
-    }
-
-    loop {
-        let (best_histogram_index, gain) = hd
-            .iter()
-            .cloned()
-            .enumerate()
-            .max_by_key(|(_, a)| *a)
-            .unwrap();
-        if gain < MIN_HISTOGRAM_GAIN {
-            break;
-        }
-        cmap[best_histogram_index] = output_histograms.len() as u8;
-        output_histograms.push(histograms[best_histogram_index]);
-        used[best_histogram_index] = true;
-        for i in 0..64 {
-            if !used[i] {
-                hd[i] = hd[i].min(histogram_distance(
-                    output_histograms.last().unwrap(),
-                    &histograms[i],
-                ));
-            } else {
-                hd[i] = 0;
-            }
-        }
-    }
-
-    for i in 0..64 {
-        if used[i] {
-            continue;
-        }
-
-        let best_histogram_index = output_histograms
-            .iter()
-            .enumerate()
-            .map(|(a, h)| (a, histogram_distance(h, &histograms[i])))
-            .min_by_key(|(_, a)| *a)
-            .map(|(a, _)| a)
-            .unwrap();
-
-        cmap[i] = best_histogram_index as u8;
-        output_histograms[best_histogram_index].total += histograms[i].total;
-        for t in 0..MAX_LIT {
-            output_histograms[best_histogram_index].data[t] += histograms[i].data[t];
-        }
-    }
-
-    (output_histograms, cmap)
 }
 
 impl MetablockData {
@@ -228,8 +90,8 @@ impl MetablockData {
     }
 
     #[inline]
-    pub fn add_literal(&mut self, context: BoundedU8<63>, value: u8, do_add: bool) {
-        self.literals[self.total_literals as usize] = Literal { context, value };
+    pub fn add_literal(&mut self, value: u8, do_add: bool) {
+        self.literals[self.total_literals as usize] = value;
         self.total_literals += if do_add { 1 } else { 0 };
     }
 
@@ -251,16 +113,10 @@ impl MetablockData {
     #[inline]
     #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2")]
     #[safe_arch]
-    fn add_literals(&mut self, count: u32, literals_cmap: &[u8; 64]) {
+    fn add_literals(&mut self, count: u32) {
         if count == 0 {
             return;
         }
-        let cmap = BoundedSlice::new_from_equal_array(literals_cmap);
-        let tbl0 = _mm256_broadcastsi128_si256(_mm_load(cmap, BoundedUsize::<0>::MAX));
-        let tbl1 = _mm256_broadcastsi128_si256(_mm_load(cmap, BoundedUsize::<16>::MAX));
-        let tbl2 = _mm256_broadcastsi128_si256(_mm_load(cmap, BoundedUsize::<32>::MAX));
-        let tbl3 = _mm256_broadcastsi128_si256(_mm_load(cmap, BoundedUsize::<48>::MAX));
-
         let literals = BoundedSlice::new_from_equal_array(&self.literals);
         let syms = BoundedSlice::new_from_equal_array_mut(&mut self.symbol_or_nbits);
 
@@ -273,23 +129,10 @@ impl MetablockData {
             BoundedUsize<{ SYMBOL_BUF_SIZE - 16 }>,
         )>::iter(start, num as usize, (16, 16))
         {
-            let lits = _mm256_load(literals, idx);
-            let ctx_lookup_idx = _mm256_and_si256(_mm256_set1_epi8(0xF), lits);
-            let ctx0 = _mm256_shuffle_epi8(tbl0, ctx_lookup_idx);
-            let ctx1 = _mm256_shuffle_epi8(tbl1, ctx_lookup_idx);
-            let ctx2 = _mm256_shuffle_epi8(tbl2, ctx_lookup_idx);
-            let ctx3 = _mm256_shuffle_epi8(tbl3, ctx_lookup_idx);
-            let is13 = _mm256_slli_epi16::<3>(lits);
-            let is23 = _mm256_slli_epi16::<2>(lits);
-            let ctx01 = _mm256_blendv_epi8(ctx0, ctx1, is13);
-            let ctx23 = _mm256_blendv_epi8(ctx2, ctx3, is13);
-            let ctx_shifted = _mm256_and_si256(
-                _mm256_set1_epi16(0xFF00u16 as i16),
-                _mm256_blendv_epi8(ctx01, ctx23, is23),
-            );
-            let val = _mm256_and_si256(lits, _mm256_set1_epi16(0xFF));
+            let lits = _mm_load(literals, idx);
+            let lits = _mm256_cvtepu8_epi16(lits);
             let off = _mm256_set1_epi16((LIT_BASE + SYMBOL_MASK) as i16);
-            let res = _mm256_add_epi16(_mm256_add_epi16(off, val), ctx_shifted);
+            let res = _mm256_add_epi16(off, lits);
             _mm256_store(syms, out_idx, res);
         }
         self.num_syms = self.num_syms.mod_add(count as usize);
@@ -324,7 +167,6 @@ impl MetablockData {
         distance_sym_buf: &[u32; 8],
         iac_hist_flat: &mut [u32; IAC_HIST_BUF_SIZE],
         dist_hist_flat: &mut [u32; MAX_DIST * 2],
-        literals_cmap: &[u8; 64],
     ) {
         let iac_sym_off = insert_and_copy_sym_buf[ii] as u16;
         *BoundedSlice::new_from_equal_array_mut(&mut self.symbol_or_nbits).get_mut(self.num_syms) =
@@ -336,7 +178,7 @@ impl MetablockData {
             insert_and_copy_bits_buf[ii],
         );
 
-        self.add_literals(self.insert_len[i + ii], literals_cmap);
+        self.add_literals(self.insert_len[i + ii]);
 
         let dist_sym_off = distance_sym_buf[ii];
         *BoundedSlice::new_from_equal_array_mut(&mut self.symbol_or_nbits).get_mut(self.num_syms) =
@@ -367,7 +209,6 @@ impl MetablockData {
         &mut self,
         iac_hist: &mut [u32; IAC_HIST_BUF_SIZE],
         dist_hist: &mut [[u32; MAX_DIST]; 2],
-        literals_cmap: &[u8; 64],
     ) {
         let mut insert_and_copy_bits_buf = [0; 8];
         let mut insert_and_copy_nbits_pat_buf = [0; 8];
@@ -420,7 +261,6 @@ impl MetablockData {
                         &distance_sym_buf,
                         iac_hist,
                         transmute_mut!(dist_hist),
-                        literals_cmap,
                     );
                 }
             } else {
@@ -438,7 +278,6 @@ impl MetablockData {
                         &distance_sym_buf,
                         iac_hist,
                         transmute_mut!(dist_hist),
-                        literals_cmap,
                     );
                 }
             }
@@ -457,7 +296,7 @@ impl MetablockData {
                 last_iac_nbits -= last_iac_nbits.min(16);
                 self.num_syms = self.num_syms.mod_add(1);
             }
-            self.add_literals(remaining, literals_cmap);
+            self.add_literals(remaining);
         };
     }
 
@@ -565,35 +404,21 @@ impl MetablockData {
         histo_buf.iac_hist.fill(0);
         histo_buf.dist_hist[0].fill(0);
         histo_buf.dist_hist[1].fill(0);
-        for i in 0..64 {
-            histo_buf.lit_hist[i].data.fill(0);
-            histo_buf.lit_hist[i].total = 0;
-        }
+        histo_buf.lit_hist[0].data.fill(0);
+        histo_buf.lit_hist[0].total = 0;
         let iac_hist = &mut histo_buf.iac_hist;
         let dist_hist = &mut histo_buf.dist_hist;
-        let lit_hist = &mut histo_buf.lit_hist;
+        let lit_hist = &mut histo_buf.lit_hist[0];
 
         for lit in &self.literals[..self.total_literals as usize] {
-            let lit_hist = BoundedSlice::new_from_equal_array_mut(lit_hist);
-            let histo = BoundedSlice::new_from_equal_array_mut(
-                &mut lit_hist.get_mut(lit.context.into()).data,
-            );
-            *histo.get_mut(BoundedUsize::from_u8(lit.value)) += 1;
+            let histo = BoundedSlice::new_from_equal_array_mut(&mut lit_hist.data);
+            *histo.get_mut(BoundedUsize::from_u8(*lit)) += 1;
         }
-        for ctx in BoundedUsize::<63>::iter(0, 64, 1) {
-            let lit_hist = BoundedSlice::new_from_equal_array_mut(lit_hist);
-            let lh = lit_hist.get_mut(ctx);
-            lh.total = lh.data.iter().copied().sum::<u32>();
-        }
-
-        let (mut clusters, cmap) = cluster_histograms(lit_hist);
-        if clusters.len() == 1 && clusters[0].data.iter().sum::<u32>() == 0 {
-            clusters[0].data[0] += 1;
-        }
+        lit_hist.total = lit_hist.data.iter().sum();
 
         assert!(self.total_icd <= ICD_BUF_SIZE as u32 + 16);
 
-        self.compute_symbols_and_icd_histograms(iac_hist, dist_hist, &cmap[..].try_into().unwrap());
+        self.compute_symbols_and_icd_histograms(iac_hist, dist_hist);
 
         for histo in dist_hist.iter_mut() {
             if histo.iter().sum::<u32>() == 0 {
@@ -612,11 +437,9 @@ impl MetablockData {
             header.distance_codes.push(code);
         }
 
-        header.literals_cmap = ContextMap::new(&cmap);
-        for histo in clusters {
-            (buf, code) = HuffmanCode::from_counts(&histo.data, 15, buf);
-            header.literals_codes.push(code);
-        }
+        header.literals_cmap = ContextMap::new(&[0; 64]);
+        (_, code) = HuffmanCode::from_counts(&lit_hist.data, 15, buf);
+        header.literals_codes.push(code);
         header.write(bw);
 
         self.write_bits(bw);

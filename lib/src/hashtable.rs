@@ -14,9 +14,7 @@
 
 use crate::compress::MetablockData;
 use crate::constants::*;
-use bounded_utils::{
-    bounded_u8_array, BoundedIterable, BoundedSlice, BoundedU32, BoundedU8, BoundedUsize,
-};
+use bounded_utils::{BoundedIterable, BoundedSlice, BoundedU32, BoundedU8, BoundedUsize};
 use hugepage_buffer::BoxedHugePageArray;
 use safe_arch::{safe_arch, x86_64::*};
 use zerocopy::FromZeroes;
@@ -31,7 +29,6 @@ const LD_MAXDIFF: i32 = 3;
 const LD_OFF: i32 = 150;
 
 const INTERIOR_MARGIN: usize = 32;
-const CONTEXT_OFFSET: usize = 2;
 
 fn hash(data: u32) -> u32 {
     data.wrapping_mul(0x1E35A7BD) >> (32 - LOG_TABLE_SIZE)
@@ -299,106 +296,7 @@ fn table_search<
     (d, l, g, len12p_mask)
 }
 
-const CONTEXT_LUT0: [BoundedU8<63>; 256] = bounded_u8_array![
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    8, 12, 16, 12, 12, 20, 12, 16, 24, 28, 12, 12, 32, 12, 36, 12, 44, 44, 44, 44, 44, 44, 44, 44,
-    44, 44, 32, 32, 24, 40, 28, 12, 12, 48, 52, 52, 52, 48, 52, 52, 52, 48, 52, 52, 52, 52, 52, 48,
-    52, 52, 52, 52, 52, 48, 52, 52, 52, 52, 52, 24, 12, 28, 12, 12, 12, 56, 60, 60, 60, 56, 60, 60,
-    60, 56, 60, 60, 60, 60, 60, 56, 60, 60, 60, 60, 60, 56, 60, 60, 60, 60, 60, 24, 12, 28, 12, 0,
-    0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
-    0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
-    2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3,
-    2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3,
-];
-
-const CONTEXT_LUT1: [BoundedU8<63>; 256] = bounded_u8_array![
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1,
-    1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1,
-    1, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 1, 1, 1, 1, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
-];
-
 const PRECOMPUTE_SIZE: usize = 16;
-
-#[inline]
-#[target_feature(enable = "sse2,ssse3,sse4.1,avx,avx2")]
-#[safe_arch]
-fn compute_context(
-    data_slice: &BoundedSlice<u8, { INTERIOR_MARGIN + CONTEXT_OFFSET }>,
-    context: &mut [BoundedU8<63>; PRECOMPUTE_SIZE],
-) {
-    let ctx_in = _mm_load(data_slice, BoundedUsize::<1>::constant::<0>());
-    // low 64 bits: data[-2], high 64 bits: data[-1].
-    let ctx_in_128 = _mm_shuffle_epi8(
-        ctx_in,
-        _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 1, 2, 3, 4, 5, 6, 7, 8),
-    );
-    let ctx_in = _mm256_broadcastsi128_si256(ctx_in_128);
-    let tbl1 = _mm256_setr_epi32(
-        0x00000000,
-        0x00100110,
-        0x00000000,
-        0x00000000,
-        0x43533432,
-        0x39383376,
-        0xbbbbbbbbu32 as i32,
-        0x37a688bb,
-    );
-    let tbl2 = _mm256_setr_epi32(
-        0xddcdddc3u32 as i32,
-        0xcdddddcdu32 as i32,
-        0xddcdddddu32 as i32,
-        0x33736ddd,
-        0xffefffe3u32 as i32,
-        0xefffffefu32 as i32,
-        0xffefffffu32 as i32,
-        0x03736fff,
-    );
-    let ctx_in_div2 =
-        _mm256_and_si256(_mm256_srli_epi16::<1>(ctx_in), _mm256_set1_epi8(0b01111111));
-    let ctx_lookup = _mm256_blendv_epi8(
-        _mm256_shuffle_epi8(tbl1, ctx_in_div2),
-        _mm256_shuffle_epi8(tbl2, ctx_in_div2),
-        _mm256_slli_epi16::<1>(ctx_in),
-    );
-    let high_nibble = _mm256_cmpeq_epi8(
-        _mm256_and_si256(ctx_in, _mm256_set1_epi8(1)),
-        _mm256_set1_epi8(1),
-    );
-    let ctx_lookup = _mm256_and_si256(
-        _mm256_blendv_epi8(ctx_lookup, _mm256_srli_epi16::<4>(ctx_lookup), high_nibble),
-        _mm256_set1_epi8(0xF),
-    );
-    let ctx0_low_div4 = _mm_blendv_epi8(
-        _mm256_extracti128_si256::<0>(ctx_lookup),
-        _mm256_extracti128_si256::<1>(ctx_lookup),
-        _mm_slli_epi16::<2>(ctx_in_128),
-    );
-    let ctx0_to_ctx1_low = _mm_setr_epi8(0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 3, 3);
-    let ctx1_low = _mm_shuffle_epi8(ctx0_to_ctx1_low, ctx0_low_div4);
-    let ctx0_low = _mm_slli_epi16::<2>(ctx0_low_div4);
-
-    let ctx0_hi = _mm_or_si128(
-        _mm_and_si128(ctx_in_128, _mm_set1_epi8(1)),
-        _mm_and_si128(_mm_srli_epi16::<5>(ctx_in_128), _mm_set1_epi8(2)),
-    );
-    let ctx1_hi = _mm_and_si128(
-        _mm_cmpgt_epi8(ctx_in_128, _mm_set1_epi8(-33)),
-        _mm_set1_epi8(2),
-    );
-    let ctx0 = _mm_blendv_epi8(ctx0_low, ctx0_hi, ctx_in_128);
-    let ctx1 = _mm_blendv_epi8(ctx1_low, ctx1_hi, ctx_in_128);
-    let ctx = _mm_or_si128(ctx1, _mm_alignr_epi8::<8>(ctx0, ctx0));
-    _mm_store_masked_u8(
-        BoundedSlice::new_from_equal_array_mut(context),
-        BoundedUsize::<0>::MAX,
-        ctx,
-    );
-}
 
 #[inline]
 #[target_feature(enable = "sse2,ssse3,sse4.1,avx,avx2")]
@@ -446,21 +344,6 @@ fn compute_hash_at(
 }
 
 const TABLE_SIZE: usize = 1 << LOG_TABLE_SIZE;
-
-#[inline]
-#[target_feature(enable = "sse2,ssse3,sse4.1,avx,avx2")]
-#[safe_arch]
-fn compute_hash_and_context_at(
-    data_slice: &BoundedSlice<u8, { INTERIOR_MARGIN + CONTEXT_OFFSET }>,
-    context: &mut [BoundedU8<63>; PRECOMPUTE_SIZE],
-    hashes: &mut [BoundedU32<{ TABLE_SIZE - 1 }>; PRECOMPUTE_SIZE],
-) {
-    compute_hash_at(
-        data_slice.offset::<INTERIOR_MARGIN, CONTEXT_OFFSET>(),
-        hashes,
-    );
-    compute_context(data_slice, context);
-}
 
 pub struct HashTable<
     const ENTRY_SIZE: usize,
@@ -524,34 +407,24 @@ impl<
             return 0;
         }
 
-        let mut context = [BoundedU8::constant::<0>(); PRECOMPUTE_SIZE];
         let mut hashes = [BoundedU32::constant::<0>(); PRECOMPUTE_SIZE];
-
-        let zero_ctx = BoundedU8::constant::<0>();
 
         let mut last_dist = 0;
         let mut last_len = 0;
         let mut last_gain = 0;
-        let mut last_ctx = zero_ctx;
         let mut last_lit = 0;
         let mut has_lazy = false;
 
         let mut last_distances = [0; 2];
 
-        debug_assert!(start >= CONTEXT_OFFSET);
-
         let mut skip = 0;
         for pos in start..end {
             let data_slice =
-                BoundedSlice::<_, { INTERIOR_MARGIN + CONTEXT_OFFSET }>::new_at_offset(
-                    data,
-                    pos - CONTEXT_OFFSET,
-                )
-                .unwrap();
+                BoundedSlice::<_, { INTERIOR_MARGIN }>::new_at_offset(data, pos).unwrap();
 
             let po = BoundedUsize::<{ PRECOMPUTE_SIZE / 2 - 1 }>::new_masked(pos - start);
             if po.get() == 0 {
-                compute_hash_and_context_at(data_slice, &mut context, &mut hashes);
+                compute_hash_at(data_slice, &mut hashes);
             }
 
             self.prefetch_pos(
@@ -560,8 +433,7 @@ impl<
                 .into(),
             );
 
-            let (chunk1, chunk2, chunk3) =
-                get_chunks(data_slice.offset::<INTERIOR_MARGIN, CONTEXT_OFFSET>());
+            let (chunk1, chunk2, chunk3) = get_chunks(data_slice);
             let hash = (*BoundedSlice::new_from_equal_array(&hashes).get(po)).into();
             let table = BoundedSlice::new_from_equal_array_mut(&mut self.table).get_mut(hash);
             let replacement_idx =
@@ -591,25 +463,21 @@ impl<
                         gain,
                     )
                 };
-                let ctx = *BoundedSlice::new_from_equal_array(&context).get(po);
-                let lit = *data_slice.get(BoundedUsize::<{ CONTEXT_OFFSET + 1 }>::constant::<
-                    CONTEXT_OFFSET,
-                >());
+                let lit = *data_slice.get(BoundedUsize::<1>::constant::<0>());
 
                 let (lit_params, copy_params) = if has_lazy && gain <= last_gain + GAIN_FOR_LAZY {
-                    let val = ((zero_ctx, 0, false), (last_len, last_dist, true));
+                    let val = ((0, false), (last_len, last_dist, true));
                     skip = last_len - 2;
                     has_lazy = false;
                     val
                 } else if gain > MIN_GAIN_FOR_GREEDY {
-                    let val = ((last_ctx, last_lit, has_lazy), (len, dist, true));
+                    let val = ((last_lit, has_lazy), (len, dist, true));
                     skip = len - 1;
                     has_lazy = false;
                     val
                 } else if len >= 4 {
-                    let val = ((last_ctx, last_lit, has_lazy), (0, 0, false));
+                    let val = ((last_lit, has_lazy), (0, 0, false));
                     last_lit = lit;
-                    last_ctx = ctx;
                     last_dist = dist;
                     last_len = len;
                     last_gain = gain;
@@ -617,9 +485,9 @@ impl<
                     val
                 } else {
                     debug_assert!(!has_lazy);
-                    ((ctx, lit, true), (0, 0, false))
+                    ((lit, true), (0, 0, false))
                 };
-                metablock_data.add_literal(lit_params.0, lit_params.1, lit_params.2);
+                metablock_data.add_literal(lit_params.0, lit_params.1);
                 metablock_data.add_copy(copy_params.0, copy_params.1, copy_params.2);
                 if USE_LAST_DISTANCES {
                     last_distances = if copy_params.2 {
@@ -650,15 +518,11 @@ impl<
         let skip_end = end_upper_bound.min(end + skip as usize);
         for pos in end..skip_end {
             let data_slice =
-                BoundedSlice::<_, { INTERIOR_MARGIN + CONTEXT_OFFSET }>::new_at_offset(
-                    data,
-                    pos - CONTEXT_OFFSET,
-                )
-                .unwrap();
+                BoundedSlice::<_, { INTERIOR_MARGIN }>::new_at_offset(data, pos).unwrap();
 
             let po = BoundedUsize::<{ PRECOMPUTE_SIZE / 2 - 1 }>::new_masked(pos - start);
             if po.get() == 0 {
-                compute_hash_and_context_at(data_slice, &mut context, &mut hashes);
+                compute_hash_at(data_slice, &mut hashes);
             }
 
             self.prefetch_pos(
@@ -667,8 +531,7 @@ impl<
                 .into(),
             );
 
-            let (chunk1, chunk2, chunk3) =
-                get_chunks(data_slice.offset::<INTERIOR_MARGIN, CONTEXT_OFFSET>());
+            let (chunk1, chunk2, chunk3) = get_chunks(data_slice);
             let hash = (*BoundedSlice::new_from_equal_array(&hashes).get(po)).into();
             let table = BoundedSlice::new_from_equal_array_mut(&mut self.table).get_mut(hash);
             let replacement_idx =
@@ -709,14 +572,6 @@ impl<
         // TODO(veluca): for some reason, not enabling target features on this function results in
         // slightly faster code.
         let mut bpos = start;
-        if bpos == 0 {
-            metablock_data.add_literal(BoundedU8::constant::<0>(), data[0], true);
-            bpos += 1;
-            if bpos < data.len() {
-                metablock_data.add_literal(CONTEXT_LUT0[data[0] as usize], data[1], true);
-                bpos += 1;
-            }
-        }
         bpos += self.parse_and_emit_interior::<MIN_GAIN_FOR_GREEDY, USE_LAST_DISTANCES>(
             data,
             bpos,
@@ -726,10 +581,7 @@ impl<
             metablock_data,
         );
         while bpos < start + count {
-            let a = data[bpos - 1];
-            let b = data[bpos - 2];
-            let context = CONTEXT_LUT0[a as usize] | CONTEXT_LUT1[b as usize];
-            metablock_data.add_literal(context, data[bpos], true);
+            metablock_data.add_literal(data[bpos], true);
             bpos += 1;
         }
         bpos - start
@@ -845,7 +697,7 @@ impl<
                 pos += 1;
                 ((lit, true), (0, 0, false))
             };
-            metablock_data.add_literal(BoundedU8::constant::<0>(), lit_params.0, lit_params.1);
+            metablock_data.add_literal(lit_params.0, lit_params.1);
             metablock_data.add_copy(copy_params.0, copy_params.1, copy_params.2);
             if USE_LAST_DISTANCES {
                 last_distances = if copy_params.2 {
@@ -878,7 +730,7 @@ impl<
             metablock_data,
         );
         while bpos < start + count {
-            metablock_data.add_literal(BoundedU8::constant::<0>(), data[bpos], true);
+            metablock_data.add_literal(data[bpos], true);
             bpos += 1;
         }
         bpos - start
@@ -888,8 +740,7 @@ impl<
 #[cfg(test)]
 mod test {
     use super::{
-        _mm256_ilog2_epi32, compute_context, gain_from_len_and_dist, gain_from_len_and_dist_simd,
-        CONTEXT_LUT0, CONTEXT_LUT1, PRECOMPUTE_SIZE,
+        _mm256_ilog2_epi32, gain_from_len_and_dist, gain_from_len_and_dist_simd, PRECOMPUTE_SIZE,
     };
     use crate::constants::*;
     use bounded_utils::{BoundedSlice, BoundedU8};
@@ -924,30 +775,6 @@ mod test {
                 );
                 let gain = gain_from_len_and_dist::<true>(len, dist, last_distances);
                 assert_eq!(_mm256_extract_epi32::<0>(vgain), gain);
-            }
-        }
-    }
-
-    #[test]
-    #[safe_arch_entrypoint("sse2", "ssse3", "sse4.1", "avx", "avx2")]
-    fn test_compute_context() {
-        let mut context = [BoundedU8::constant::<0>(); PRECOMPUTE_SIZE];
-        let mut data = [0; 256];
-        for i in 0..=255 {
-            for j in 0..=255 {
-                for x in 0..8 {
-                    data[2 * x] = i;
-                    data[2 * x + 1] = j;
-                }
-                compute_context(BoundedSlice::new(&data).unwrap(), &mut context);
-                for x in 0..PRECOMPUTE_SIZE / 2 {
-                    let a = data[x + 1];
-                    let b = data[x];
-                    assert_eq!(
-                        context[x],
-                        CONTEXT_LUT0[a as usize] | CONTEXT_LUT1[b as usize]
-                    );
-                }
             }
         }
     }

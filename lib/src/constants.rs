@@ -41,7 +41,7 @@ const _: () = assert!(ICD_BUF_SIZE * 6 + LITERAL_BUF_SIZE <= SYMBOL_BUF_SIZE);
 // Encoding for symbol writing
 pub const DIST_BASE: u16 = MAX_IAC as u16;
 pub const LIT_BASE: u16 = DIST_BASE + MAX_DIST as u16 * 2;
-pub const MAX_SYM_COUNT: usize = LIT_BASE as usize + MAX_LIT * 64;
+pub const MAX_SYM_COUNT: usize = LIT_BASE as usize + MAX_LIT;
 pub const HISTOGRAM_BUF_SIZE: usize = if MAX_SYM_COUNT + MAX_IAC < (1 << 16) {
     1 << 16
 } else {
