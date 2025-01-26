@@ -21,7 +21,7 @@ use zerocopy::FromZeroes;
 
 const LOG_TABLE_SIZE: usize = 16;
 const PREFETCH_OFFSET: usize = 4;
-const LEN_MULT: i32 = 129;
+const LEN_MULT: i32 = 153;
 const GAIN_OFF: i32 = 177;
 const DIST_SHIFT: i32 = 5;
 const GAIN_FOR_LAZY: i32 = 77;
