@@ -8,7 +8,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build_and_test:
+  build_and_test_nightly:
     name: rbrotli - latest
     runs-on: ubuntu-latest
     steps:
@@ -16,3 +16,11 @@ jobs:
       - run: rustup update nightly && rustup default nightly
       - run: cargo build --verbose
       - run: cargo test --verbose
+  build_and_test:
+    name: rbrotli - latest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install . # install version specified in rust-toolchain.toml
+      - run: cargo build --verbose
+      - run: cargo test --verbose # This will skip Miri since it's not nightly
