@@ -1,4 +1,4 @@
-// Copyright 2024 Google LLC
+// Cpyright 2024 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,7 +24,9 @@ use crate::{
 use bounded_utils::{BoundedIterable, BoundedSlice, BoundedU8, BoundedUsize};
 use hugepage_buffer::BoxedHugePageArray;
 use lsb_bitwriter::BitWriter;
-use safe_arch::{safe_arch, safe_arch_entrypoint, x86_64::*};
+use safe_arch::x86_64 as safe_x86_64;
+use safe_arch::{safe_arch, safe_arch_entrypoint};
+use std::arch::x86_64::*;
 use std::mem::MaybeUninit;
 use zerocopy::{transmute, transmute_mut, AsBytes, FromZeroes};
 
@@ -83,8 +85,8 @@ fn histogram_distance(a: &LiteralHistogram, b: &LiteralHistogram) -> i32 {
         )
     };
     for i in BoundedUsize::<{ 256 - 8 }>::iter(0, 32, 8) {
-        let av = _mm256_load(BoundedSlice::new_from_equal_array(&a.data), i);
-        let bv = _mm256_load(BoundedSlice::new_from_equal_array(&b.data), i);
+        let av = safe_x86_64::_mm256_load(BoundedSlice::new_from_equal_array(&a.data), i);
+        let bv = safe_x86_64::_mm256_load(BoundedSlice::new_from_equal_array(&b.data), i);
         let totv = _mm256_add_epi32(av, bv);
         let af32 = _mm256_cvtepi32_ps(av);
         let bf32 = _mm256_cvtepi32_ps(bv);
@@ -256,10 +258,13 @@ impl MetablockData {
             return;
         }
         let cmap = BoundedSlice::new_from_equal_array(literals_cmap);
-        let tbl0 = _mm256_broadcastsi128_si256(_mm_load(cmap, BoundedUsize::<0>::MAX));
-        let tbl1 = _mm256_broadcastsi128_si256(_mm_load(cmap, BoundedUsize::<16>::MAX));
-        let tbl2 = _mm256_broadcastsi128_si256(_mm_load(cmap, BoundedUsize::<32>::MAX));
-        let tbl3 = _mm256_broadcastsi128_si256(_mm_load(cmap, BoundedUsize::<48>::MAX));
+        let tbl0 = _mm256_broadcastsi128_si256(safe_x86_64::_mm_load(cmap, BoundedUsize::<0>::MAX));
+        let tbl1 =
+            _mm256_broadcastsi128_si256(safe_x86_64::_mm_load(cmap, BoundedUsize::<16>::MAX));
+        let tbl2 =
+            _mm256_broadcastsi128_si256(safe_x86_64::_mm_load(cmap, BoundedUsize::<32>::MAX));
+        let tbl3 =
+            _mm256_broadcastsi128_si256(safe_x86_64::_mm_load(cmap, BoundedUsize::<48>::MAX));
 
         let literals = BoundedSlice::new_from_equal_array(&self.literals);
         let syms = BoundedSlice::new_from_equal_array_mut(&mut self.symbol_or_nbits);
@@ -273,7 +278,7 @@ impl MetablockData {
             BoundedUsize<{ SYMBOL_BUF_SIZE - 16 }>,
         )>::iter(start, num as usize, (16, 16))
         {
-            let lits = _mm256_load(literals, idx);
+            let lits = safe_x86_64::_mm256_load(literals, idx);
             let ctx_lookup_idx = _mm256_and_si256(_mm256_set1_epi8(0xF), lits);
             let ctx0 = _mm256_shuffle_epi8(tbl0, ctx_lookup_idx);
             let ctx1 = _mm256_shuffle_epi8(tbl1, ctx_lookup_idx);
@@ -290,7 +295,7 @@ impl MetablockData {
             let val = _mm256_and_si256(lits, _mm256_set1_epi16(0xFF));
             let off = _mm256_set1_epi16((LIT_BASE + SYMBOL_MASK) as i16);
             let res = _mm256_add_epi16(_mm256_add_epi16(off, val), ctx_shifted);
-            _mm256_store(syms, out_idx, res);
+            safe_x86_64::_mm256_store(syms, out_idx, res);
         }
         self.num_syms = self.num_syms.mod_add(count as usize);
         self.iac_literals += count;
@@ -470,20 +475,23 @@ impl MetablockData {
         bw.write_foreach(
             BoundedUsize::<{ SYMBOL_BUF_SIZE - 16 }>::iter(0, self.num_syms.get() / 16, 16),
             |i| {
-                let sym_or_nbits =
-                    _mm256_load(BoundedSlice::new_from_equal_array(&self.symbol_or_nbits), i);
-                let bits = _mm256_load(BoundedSlice::new_from_equal_array(&self.bits), i);
+                let sym_or_nbits = safe_x86_64::_mm256_load(
+                    BoundedSlice::new_from_equal_array(&self.symbol_or_nbits),
+                    i,
+                );
+                let bits =
+                    safe_x86_64::_mm256_load(BoundedSlice::new_from_equal_array(&self.bits), i);
                 const _: () = assert!(SYMBOL_MASK == 0x8000);
                 let is_symbol = _mm256_srai_epi16::<15>(sym_or_nbits);
                 let sym_or_nbits = _mm256_and_si256(get_sym_mask, sym_or_nbits);
                 let mask_even_lanes = _mm256_set1_epi32(0xFFFF);
                 let even_sym_or_nbits = _mm256_and_si256(sym_or_nbits, mask_even_lanes);
                 let odd_sym_or_nbits = _mm256_srli_epi32::<16>(sym_or_nbits);
-                let huff_even_nbits_bits = _mm256_masked_i32gather::<_, 4, { 1 << 16 }>(
+                let huff_even_nbits_bits = safe_x86_64::_mm256_masked_i32gather::<_, 4, { 1 << 16 }>(
                     BoundedSlice::<_, { 1 << 16 }>::new_from_array(&self.histogram_buf),
                     even_sym_or_nbits,
                 );
-                let huff_odd_nbits_bits = _mm256_masked_i32gather::<_, 4, { 1 << 16 }>(
+                let huff_odd_nbits_bits = safe_x86_64::_mm256_masked_i32gather::<_, 4, { 1 << 16 }>(
                     BoundedSlice::<_, { 1 << 16 }>::new_from_array(&self.histogram_buf),
                     odd_sym_or_nbits,
                 );
@@ -514,12 +522,12 @@ impl MetablockData {
                 let mut bitsa = [0u64; 4];
                 let mut nbitsa = [0u64; 4];
                 const ZERO: BoundedUsize<0> = BoundedUsize::MAX;
-                _mm256_store(
+                safe_x86_64::_mm256_store(
                     BoundedSlice::new_from_equal_array_mut(&mut bitsa),
                     ZERO,
                     bits64,
                 );
-                _mm256_store(
+                safe_x86_64::_mm256_store(
                     BoundedSlice::new_from_equal_array_mut(&mut nbitsa),
                     ZERO,
                     nbits64,

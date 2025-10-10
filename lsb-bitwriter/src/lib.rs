@@ -37,7 +37,7 @@ pub struct BitWriter<'a> {
 }
 
 impl<'a> BitWriter<'a> {
-    pub fn new_uninit(mem: &mut [MaybeUninit<u8>]) -> BitWriter {
+    pub fn new_uninit(mem: &'_ mut [MaybeUninit<u8>]) -> BitWriter<'_> {
         BitWriter {
             buf: mem,
             bit_buffer: 0,
@@ -46,7 +46,7 @@ impl<'a> BitWriter<'a> {
         }
     }
 
-    pub fn new(mem: &mut [u8]) -> BitWriter {
+    pub fn new(mem: &'_ mut [u8]) -> BitWriter<'_> {
         // SAFETY: MaybeUninit<u8> and u8 are guaranteed to have the same ABI, layout and
         // alignment. Moreover, we never write uninit data to the resulting internal buf.
         Self::new_uninit(unsafe {
