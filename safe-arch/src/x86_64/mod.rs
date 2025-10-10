@@ -17,24 +17,8 @@
 //! `wrappers` contains safe wrappers for load/store/gather intrinsics that would not be safe
 //! otherwise.
 #![allow(clippy::too_many_arguments)]
-mod avx;
-mod avx2;
-mod sse;
-mod sse2;
-mod sse3;
-mod sse41;
-mod sse42;
-mod ssse3;
 mod wrappers;
 
-pub use avx::*;
-pub use avx2::*;
-pub use sse::*;
-pub use sse2::*;
-pub use sse3::*;
-pub use sse41::*;
-pub use sse42::*;
-pub use ssse3::*;
 pub use wrappers::*;
 
 pub use std::arch::x86_64::{__m128, __m128d, __m128i, __m256, __m256d, __m256i};

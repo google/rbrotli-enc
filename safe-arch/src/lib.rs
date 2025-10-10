@@ -20,7 +20,6 @@
 //! WARNING: if stable-compat is enabled, the safe-arch-entrypoint macro does not check that
 //! it is used correctly, which could lead to unsoundness. Only enable that feature if you are
 //! also testing that your crate compiles without it and you need compatibility with stable Rust.
-#![cfg_attr(not(feature = "stable-compat"), feature(target_feature_11))]
 #![allow(clippy::let_unit_value)]
 
 pub use safe_arch_macro::*;

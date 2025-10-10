@@ -14,7 +14,9 @@
 
 use crate::constants::*;
 use bounded_utils::{BoundedSlice, BoundedUsize};
-use safe_arch::{safe_arch, x86_64::*};
+use safe_arch::safe_arch;
+use safe_arch::x86_64 as safe_x86_64;
+use std::arch::x86_64::*;
 
 const INS_BASE: [u32; 24] = [
     0, 1, 2, 3, 4, 5, 6, 8, 10, 14, 18, 26, 34, 50, 66, 98, 130, 194, 322, 578, 1090, 2114, 6210,
@@ -197,10 +199,10 @@ pub fn insert_copy_len_to_sym_and_bits_simd<const SLICE_BOUND: usize, const INDE
     const ZERO: BoundedUsize<0> = BoundedUsize::MAX;
     const FOUR: BoundedUsize<4> = BoundedUsize::MAX;
 
-    let insert_len = _mm256_load(insert, index);
+    let insert_len = safe_x86_64::_mm256_load(insert, index);
     let (insert_code, insert_nbits, insert_bits) = insert_len_to_sym_and_bits_simd(insert_len);
-    let copy_len = _mm256_load(copy, index);
-    _mm256_store(
+    let copy_len = safe_x86_64::_mm256_load(copy, index);
+    safe_x86_64::_mm256_store(
         BoundedSlice::new_from_equal_array_mut(distance_ctx_buf),
         ZERO,
         _mm256_abs_epi32(_mm256_cmpgt_epi32(copy_len, _mm256_set1_epi32(4))),
@@ -210,7 +212,7 @@ pub fn insert_copy_len_to_sym_and_bits_simd<const SLICE_BOUND: usize, const INDE
 
     let nbits = _mm256_add_epi32(insert_nbits, copy_nbits);
     let nbits_count = _mm256_srli_epi32::<4>(_mm256_add_epi32(nbits, _mm256_set1_epi32(15)));
-    _mm256_store(
+    safe_x86_64::_mm256_store(
         BoundedSlice::new_from_equal_array_mut(nbits_count_buf),
         ZERO,
         nbits_count,
@@ -233,8 +235,8 @@ pub fn insert_copy_len_to_sym_and_bits_simd<const SLICE_BOUND: usize, const INDE
     );
 
     let bits_buf = BoundedSlice::new_from_equal_array_mut(bits_buf);
-    _mm256_store(bits_buf, ZERO, bits_0);
-    _mm256_store(bits_buf, FOUR, bits_1);
+    safe_x86_64::_mm256_store(bits_buf, ZERO, bits_0);
+    safe_x86_64::_mm256_store(bits_buf, FOUR, bits_1);
 
     let nbits_pat = _mm256_or_si256(_mm256_slli_epi32::<16>(nbits), nbits);
     let nbits_pat = _mm256_or_si256(_mm256_slli_epi32::<8>(nbits_pat), nbits_pat);
@@ -251,8 +253,8 @@ pub fn insert_copy_len_to_sym_and_bits_simd<const SLICE_BOUND: usize, const INDE
     let nbits_pat_1 = _mm256_shuffle_epi8(nbits_pat_1, expand_mask);
 
     let nbits_pat_buf = BoundedSlice::new_from_equal_array_mut(nbits_pat_buf);
-    _mm256_store(nbits_pat_buf, ZERO, nbits_pat_0);
-    _mm256_store(nbits_pat_buf, FOUR, nbits_pat_1);
+    safe_x86_64::_mm256_store(nbits_pat_buf, ZERO, nbits_pat_0);
+    safe_x86_64::_mm256_store(nbits_pat_buf, FOUR, nbits_pat_1);
 
     let mask = _mm256_set1_epi32(0x7);
     let bits64 = _mm256_or_si256(
@@ -286,7 +288,7 @@ pub fn insert_copy_len_to_sym_and_bits_simd<const SLICE_BOUND: usize, const INDE
     let offset = _mm256_or_si256(_mm256_set1_epi32(SYMBOL_MASK as i32), offset);
 
     let sym = _mm256_or_si256(bits64, offset);
-    _mm256_store(BoundedSlice::new_from_equal_array_mut(sym_buf), ZERO, sym);
+    safe_x86_64::_mm256_store(BoundedSlice::new_from_equal_array_mut(sym_buf), ZERO, sym);
 }
 
 /// Returns (symbol, nbits, bits). Assumes NPREFIX = 0 and NDIRECT = 0. Does not support the
@@ -352,9 +354,10 @@ pub fn distance_to_sym_and_bits_simd<
     nbits_pat_buf: &mut [u32; 8],
     nbits_count_buf: &mut [u32; 8],
 ) {
-    let second_last_distance = _mm256_load(distance, pos);
-    let last_distance = _mm256_load(distance, pos.add::<INDEX_BOUND_PLUS_AT_LEAST_2, 1>());
-    let distance = _mm256_load(distance, pos.add::<INDEX_BOUND_PLUS_AT_LEAST_2, 2>());
+    let second_last_distance = safe_x86_64::_mm256_load(distance, pos);
+    let last_distance =
+        safe_x86_64::_mm256_load(distance, pos.add::<INDEX_BOUND_PLUS_AT_LEAST_2, 1>());
+    let distance = safe_x86_64::_mm256_load(distance, pos.add::<INDEX_BOUND_PLUS_AT_LEAST_2, 2>());
     let dist = _mm256_add_epi32(distance, _mm256_set1_epi32(3));
     let float_dist = _mm256_castps_si256(_mm256_cvtepi32_ps(dist));
     let nbits = _mm256_sub_epi32(_mm256_srli_epi32::<23>(float_dist), _mm256_set1_epi32(128));
@@ -399,7 +402,7 @@ pub fn distance_to_sym_and_bits_simd<
 
     const ZERO: BoundedUsize<0> = BoundedUsize::MAX;
 
-    let shifted_ctx = _mm256_slli_epi32::<LOG_MAX_DIST>(_mm256_load(
+    let shifted_ctx = _mm256_slli_epi32::<LOG_MAX_DIST>(safe_x86_64::_mm256_load(
         BoundedSlice::new_from_equal_array(distance_ctx_buf),
         ZERO,
     ));
@@ -418,14 +421,14 @@ pub fn distance_to_sym_and_bits_simd<
         _mm256_subs_epu16(nbits_pat, _mm256_set1_epi32(16 << 16)),
         _mm256_set1_epi16(16),
     );
-    _mm256_store(BoundedSlice::new_from_equal_array_mut(sym_buf), ZERO, code);
-    _mm256_store(BoundedSlice::new_from_equal_array_mut(bits_buf), ZERO, bits);
-    _mm256_store(
+    safe_x86_64::_mm256_store(BoundedSlice::new_from_equal_array_mut(sym_buf), ZERO, code);
+    safe_x86_64::_mm256_store(BoundedSlice::new_from_equal_array_mut(bits_buf), ZERO, bits);
+    safe_x86_64::_mm256_store(
         BoundedSlice::new_from_equal_array_mut(nbits_pat_buf),
         ZERO,
         nbits_pat,
     );
-    _mm256_store(
+    safe_x86_64::_mm256_store(
         BoundedSlice::new_from_equal_array_mut(nbits_count_buf),
         ZERO,
         nbits_count,

@@ -18,7 +18,9 @@ use bounded_utils::{
     bounded_u8_array, BoundedIterable, BoundedSlice, BoundedU32, BoundedU8, BoundedUsize,
 };
 use hugepage_buffer::BoxedHugePageArray;
-use safe_arch::{safe_arch, x86_64::*};
+use safe_arch::safe_arch;
+use safe_arch::x86_64 as safe_x86_64;
+use std::arch::x86_64::*;
 use zerocopy::FromZeroes;
 
 const LOG_TABLE_SIZE: usize = 16;
@@ -83,10 +85,10 @@ fn longest_match(data: &[u8], pos1: u32, pos2: usize) -> usize {
         let slice1 = BoundedSlice::<_, 64>::new(&data[pos1 + i..]).unwrap();
         let slice2 = BoundedSlice::<_, 64>::new(&data[pos2 + i..]).unwrap();
 
-        let data1a = _mm256_load(slice1, BoundedUsize::<0>::MAX);
-        let data2a = _mm256_load(slice2, BoundedUsize::<0>::MAX);
-        let data1b = _mm256_load(slice1, BoundedUsize::<32>::MAX);
-        let data2b = _mm256_load(slice2, BoundedUsize::<32>::MAX);
+        let data1a = safe_x86_64::_mm256_load(slice1, BoundedUsize::<0>::MAX);
+        let data2a = safe_x86_64::_mm256_load(slice2, BoundedUsize::<0>::MAX);
+        let data1b = safe_x86_64::_mm256_load(slice1, BoundedUsize::<32>::MAX);
+        let data2b = safe_x86_64::_mm256_load(slice2, BoundedUsize::<32>::MAX);
 
         let maska = !(_mm256_movemask_epi8(_mm256_cmpeq_epi8(data1a, data2a)) as u32);
         let maskb = !(_mm256_movemask_epi8(_mm256_cmpeq_epi8(data1b, data2b)) as u32);
@@ -235,10 +237,13 @@ fn table_search<
     let mut len12p_mask = 0u64;
 
     for i in BoundedUsize::<ENTRY_SIZE_MINUS_EIGHT>::riter(0, ENTRY_SIZE / 8, 8) {
-        let hpos = _mm256_load(BoundedSlice::new_from_equal_array(&table.pos), i);
-        let hchunk1 = _mm256_load(BoundedSlice::new_from_equal_array(&table.chunk1), i);
-        let hchunk2 = _mm256_load(BoundedSlice::new_from_equal_array(&table.chunk2), i);
-        let hchunk3 = _mm256_load(BoundedSlice::new_from_equal_array(&table.chunk3), i);
+        let hpos = safe_x86_64::_mm256_load(BoundedSlice::new_from_equal_array(&table.pos), i);
+        let hchunk1 =
+            safe_x86_64::_mm256_load(BoundedSlice::new_from_equal_array(&table.chunk1), i);
+        let hchunk2 =
+            safe_x86_64::_mm256_load(BoundedSlice::new_from_equal_array(&table.chunk2), i);
+        let hchunk3 =
+            safe_x86_64::_mm256_load(BoundedSlice::new_from_equal_array(&table.chunk3), i);
 
         let dist = _mm256_sub_epi32(vpos, hpos);
         let valid_mask = _mm256_andnot_si256(
@@ -331,7 +336,7 @@ fn compute_context(
     data_slice: &BoundedSlice<u8, { INTERIOR_MARGIN + CONTEXT_OFFSET }>,
     context: &mut [BoundedU8<63>; PRECOMPUTE_SIZE],
 ) {
-    let ctx_in = _mm_load(data_slice, BoundedUsize::<1>::constant::<0>());
+    let ctx_in = safe_x86_64::_mm_load(data_slice, BoundedUsize::<1>::constant::<0>());
     // low 64 bits: data[-2], high 64 bits: data[-1].
     let ctx_in_128 = _mm_shuffle_epi8(
         ctx_in,
@@ -393,7 +398,7 @@ fn compute_context(
     let ctx0 = _mm_blendv_epi8(ctx0_low, ctx0_hi, ctx_in_128);
     let ctx1 = _mm_blendv_epi8(ctx1_low, ctx1_hi, ctx_in_128);
     let ctx = _mm_or_si128(ctx1, _mm_alignr_epi8::<8>(ctx0, ctx0));
-    _mm_store_masked_u8(
+    safe_x86_64::_mm_store_masked_u8(
         BoundedSlice::new_from_equal_array_mut(context),
         BoundedUsize::<0>::MAX,
         ctx,
@@ -409,7 +414,7 @@ fn compute_hash_at(
 ) {
     const _: () = assert!(PRECOMPUTE_SIZE == 16);
     let hash_mul = _mm256_set1_epi32(0x1E35A7BD);
-    let d08 = _mm256_load(data_slice, BoundedUsize::<0>::MAX);
+    let d08 = safe_x86_64::_mm256_load(data_slice, BoundedUsize::<0>::MAX);
     let d0 = _mm256_permute4x64_epi64::<0b01000100>(d08);
     let d8 = _mm256_permute4x64_epi64::<0b10011001>(d08);
 
@@ -431,8 +436,8 @@ fn compute_hash_at(
 
     {
         let hashes = BoundedSlice::new_from_equal_array_mut(hashes);
-        _mm256_store_masked_u32(hashes, BoundedUsize::<0>::MAX, data0);
-        _mm256_store_masked_u32(hashes, BoundedUsize::<8>::MAX, data1);
+        safe_x86_64::_mm256_store_masked_u32(hashes, BoundedUsize::<0>::MAX, data0);
+        safe_x86_64::_mm256_store_masked_u32(hashes, BoundedUsize::<8>::MAX, data1);
     }
 
     for (i, h) in hashes.iter().enumerate() {
@@ -502,8 +507,8 @@ impl<
     fn prefetch_pos(&self, pos: BoundedUsize<{ TABLE_SIZE - 1 }>) {
         let entry = BoundedSlice::new_from_equal_array(&self.table).get(pos);
         let ridx = BoundedSlice::new_from_equal_array(&self.replacement_idx).get(pos);
-        _mm_safe_prefetch::<_MM_HINT_ET0, _>(entry);
-        _mm_safe_prefetch::<_MM_HINT_ET0, _>(ridx);
+        safe_x86_64::_mm_safe_prefetch::<_MM_HINT_ET0, _>(entry);
+        safe_x86_64::_mm_safe_prefetch::<_MM_HINT_ET0, _>(ridx);
     }
 
     /// Returns the number of bytes that were written to the output. Updates the hash table with
@@ -893,10 +898,8 @@ mod test {
     };
     use crate::constants::*;
     use bounded_utils::{BoundedSlice, BoundedU8};
-    use safe_arch::{
-        safe_arch_entrypoint,
-        x86_64::{_mm256_extract_epi32, _mm256_set1_epi32},
-    };
+    use safe_arch::safe_arch_entrypoint;
+    use std::arch::x86_64::{_mm256_extract_epi32, _mm256_set1_epi32};
 
     #[test]
     #[safe_arch_entrypoint("avx", "avx2")]
