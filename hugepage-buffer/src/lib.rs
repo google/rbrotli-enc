@@ -34,6 +34,7 @@ pub struct BoxedHugePageArray<T: Copy + 'static, const LEN: usize> {
 /// Safety:
 /// - T must not be a ZST
 /// - Layout must be a valid layout for an array of `T`s
+/// - Layout must have a non-zero size.
 unsafe fn allocate<T>(layout: Layout, zeroed: bool) -> *mut T {
     #[cfg(all(target_os = "linux", not(miri)))]
     {
@@ -70,9 +71,17 @@ unsafe fn allocate<T>(layout: Layout, zeroed: bool) -> *mut T {
     #[cfg(any(not(target_os = "linux"), miri))]
     {
         let ptr = if zeroed {
-            unsafe { std::alloc::alloc_zeroed(layout) }
+            /// Safety:
+            /// The caller guarantees that layout is not zero sized
+            unsafe {
+                std::alloc::alloc_zeroed(layout)
+            }
         } else {
-            unsafe { std::alloc::alloc(layout) }
+            /// Safety:
+            /// The caller guarantees that layout is not zero sized
+            unsafe {
+                std::alloc::alloc(layout)
+            }
         };
         assert_ne!(ptr, null_mut());
         ptr as *mut T
