@@ -1,0 +1,4 @@
+[target.'cfg(miri)']
+rustflags = [
+    "-C", "target-feature=+sse2,+ssse3,+sse4.1,+avx,+avx2"
+]

@@ -477,7 +477,10 @@ mod test {
         let mut distance_nbits_pat_buf = [0; 8];
         let mut distance_nbits_count_buf = [0; 8];
         let mut distance_sym_buf = [0; 8];
-        for d in 1..WSIZE {
+
+        let step = if cfg!(miri) { 1_000_000 } else { 1 };
+
+        for d in (1..WSIZE).step_by(step) {
             if d % 5 == 0 {
                 for i in 0..10 {
                     distances[i] = d as u32;
@@ -545,11 +548,14 @@ mod test {
         let mut nbits_pat_buf = [0; 8];
         let mut nbits_count_buf = [0; 8];
         let mut distance_ctx_buf = [0; 8];
-        for i in (0..METABLOCK_SIZE).step_by(8) {
+
+        let step = if cfg!(miri) { 8 * 1000 } else { 8 };
+
+        for i in (0..METABLOCK_SIZE).step_by(step) {
             if i > 22594 && i % 1024 != 0 {
                 continue;
             }
-            for j in (4..MAX_COPY_LEN).step_by(8) {
+            for j in (4..MAX_COPY_LEN).step_by(step) {
                 if j > 2118 && j % 1024 != 0 {
                     continue;
                 }
@@ -588,7 +594,10 @@ mod test {
         let mut sym_buf = [0; 8];
         let mut bits_buf = [0; 8];
         let mut nbits_buf = [0; 8];
-        for i in (0..METABLOCK_SIZE).step_by(8) {
+
+        let step = if cfg!(miri) { 8 * 1000 } else { 8 };
+
+        for i in (0..METABLOCK_SIZE).step_by(step) {
             for x in 0..8 {
                 insert[x] = (i + x) as u32;
             }
@@ -628,7 +637,10 @@ mod test {
         let mut sym_buf = [0; 8];
         let mut bits_buf = [0; 8];
         let mut nbits_buf = [0; 8];
-        for i in (2..METABLOCK_SIZE).step_by(8) {
+
+        let step = if cfg!(miri) { 8 * 1000 } else { 8 };
+
+        for i in (2..METABLOCK_SIZE).step_by(step) {
             for x in 0..8 {
                 copy[x] = (i + x) as u32;
             }

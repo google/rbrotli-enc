@@ -904,7 +904,9 @@ mod test {
     #[test]
     #[safe_arch_entrypoint("avx", "avx2")]
     fn test_ilog2() {
-        for i in 1..WSIZE {
+        let step = if cfg!(miri) { 1_000_000 } else { 1 };
+
+        for i in (1..WSIZE).step_by(step) {
             let simd =
                 _mm256_extract_epi32::<0>(_mm256_ilog2_epi32(_mm256_set1_epi32(i as i32))) as u32;
             assert_eq!(simd, i.ilog2());
@@ -914,8 +916,10 @@ mod test {
     #[test]
     #[safe_arch_entrypoint("avx", "avx2")]
     fn test_gain() {
-        for dist in 1u32..1024 {
-            for len in 4u32..2048 {
+        let step = if cfg!(miri) { 100 } else { 1 };
+
+        for dist in (1u32..1024).step_by(step) {
+            for len in (4u32..2048).step_by(step) {
                 let last_distances = [(dist + len) % 1024, dist.saturating_sub(len) % 1024];
                 let vdist = _mm256_set1_epi32(dist as i32);
                 let vlen = _mm256_set1_epi32(len as i32);
@@ -936,8 +940,11 @@ mod test {
     fn test_compute_context() {
         let mut context = [BoundedU8::constant::<0>(); PRECOMPUTE_SIZE];
         let mut data = [0; 256];
-        for i in 0..=255 {
-            for j in 0..=255 {
+
+        let step = if cfg!(miri) { 10 } else { 1 };
+
+        for i in (0..=255).step_by(step) {
+            for j in (0..=255).step_by(step) {
                 for x in 0..8 {
                     data[2 * x] = i;
                     data[2 * x + 1] = j;

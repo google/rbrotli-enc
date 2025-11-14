@@ -71,17 +71,13 @@ unsafe fn allocate<T>(layout: Layout, zeroed: bool) -> *mut T {
     #[cfg(any(not(target_os = "linux"), miri))]
     {
         let ptr = if zeroed {
-            /// Safety:
-            /// The caller guarantees that layout is not zero sized
-            unsafe {
-                std::alloc::alloc_zeroed(layout)
-            }
+            // Safety:
+            // The caller guarantees that layout is not zero sized
+            unsafe { std::alloc::alloc_zeroed(layout) }
         } else {
-            /// Safety:
-            /// The caller guarantees that layout is not zero sized
-            unsafe {
-                std::alloc::alloc(layout)
-            }
+            // Safety:
+            // The caller guarantees that layout is not zero sized
+            unsafe { std::alloc::alloc(layout) }
         };
         assert_ne!(ptr, null_mut());
         ptr as *mut T
