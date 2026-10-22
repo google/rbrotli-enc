@@ -109,9 +109,13 @@ unsafe fn deallocate<T>(ptr: *mut T, layout: Layout) {
 
 impl<T: Copy, const LEN: usize> BoxedHugePageArray<T, LEN> {
     pub fn new(t: T) -> BoxedHugePageArray<T, LEN> {
+        const {
+            assert!(std::mem::size_of::<T>() != 0);
+            assert!(LEN != 0);
+        }
         let layout = Layout::array::<T>(LEN).unwrap();
-        assert_ne!(std::mem::size_of::<T>(), 0);
-        // SAFETY: `layout` is created above with Layout::array. We assert that T is not of size 0.
+        // SAFETY: `layout` is created above with Layout::array. We assert that T is not of size 0
+        // and LEN is not 0.
         let mem = unsafe { allocate::<T>(layout, false) };
         for i in 0..LEN {
             // SAFETY: `mem` is guaranteed to point to an array of LEN `T`s, so these `write`s are
@@ -129,9 +133,13 @@ impl<T: Copy, const LEN: usize> BoxedHugePageArray<T, LEN> {
 
 impl<T: zerocopy::FromZeroes + Copy, const LEN: usize> BoxedHugePageArray<T, LEN> {
     pub fn new_zeroed() -> BoxedHugePageArray<T, LEN> {
+        const {
+            assert!(std::mem::size_of::<T>() != 0);
+            assert!(LEN != 0);
+        }
         let layout = Layout::array::<T>(LEN).unwrap();
-        assert_ne!(std::mem::size_of::<T>(), 0);
-        // SAFETY: `layout` is created above with Layout::array. We assert that T is not of size 0.
+        // SAFETY: `layout` is created above with Layout::array. We assert that T is not of size 0
+        // and LEN is not 0.
         let mem = unsafe { allocate::<T>(layout, true) };
         BoxedHugePageArray {
             // SAFETY: `mem` was allocated with the correct layout. `T` is guaranteed to live for

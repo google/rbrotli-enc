@@ -35,7 +35,7 @@ impl<T, const N: usize, const M: usize, const SIMD_SIZE: usize>
 struct CheckPow2<const VAL: usize> {}
 impl<const VAL: usize> CheckPow2<VAL> {
     const IS_POW2_MINUS_ONE: () = assert!((VAL as u128 + 1).is_power_of_two());
-    const IS_POW2: () = assert!(VAL.is_power_of_two());
+    const IS_POW2: () = assert!(VAL.is_power_of_two() && VAL <= i32::MAX as usize);
 }
 
 struct CheckPow2Size<T: Sized, const MAX_SIZE: usize>(PhantomData<T>);
@@ -48,7 +48,7 @@ impl<T: Sized, const MAX_SIZE: usize> CheckPow2Size<T, MAX_SIZE> {
 struct CheckSameSize<T: Sized, const SIZE: i32>(PhantomData<T>);
 
 impl<T: Sized, const SIZE: i32> CheckSameSize<T, SIZE> {
-    const SAME_SIZE: () = assert!(std::mem::size_of::<T>() == SIZE as usize);
+    const SAME_SIZE: () = assert!(std::mem::size_of::<T>() == SIZE as usize && SIZE >= 4);
 }
 
 #[inline]
@@ -95,7 +95,7 @@ pub fn _mm256_store_masked_u8<
     value: __m256i,
 ) {
     let _ = CheckLengthsSimd::<u8, SLICE_BOUND, START_BOUND, AVX_VECTOR_SIZE>::CHECK_GE;
-    let _ = CheckPow2::<VALUE_BOUND>::IS_POW2;
+    let _ = CheckPow2::<VALUE_BOUND>::IS_POW2_MINUS_ONE;
     // SAFETY: safety ensured by target_feature_11 + the above length check, which ensures that a
     // full vector can still be read after `start`; the `BoundedU8` invariant is upheld by the
     // `_mm256_and_si256` operation.
@@ -108,7 +108,7 @@ pub fn _mm256_store_masked_u8<
 }
 
 #[inline]
-#[target_feature(enable = "sse2")]
+#[target_feature(enable = "avx2")]
 pub fn _mm256_store_masked_u32<
     const SLICE_BOUND: usize,
     const START_BOUND: usize,
@@ -139,8 +139,8 @@ pub fn _mm256_masked_i32gather<T: AsBytes, const SCALE: i32, const ARRAY_BOUND: 
 ) -> __m256i {
     let _ = CheckPow2::<ARRAY_BOUND>::IS_POW2;
     let _ = CheckSameSize::<T, SCALE>::SAME_SIZE;
-    // SAFETY: safety ensured by target_feature_11 + the _mm256_and_si256 operation that
-    // ensure no OOB read can happen.
+    // SAFETY: safety ensured by target_feature_11 + the _mm256_and_si256 operation and size check
+    // that ensure no OOB read can happen.
     unsafe {
         _mm256_i32gather_epi32::<SCALE>(
             slice.get_slice().as_ptr().cast(),

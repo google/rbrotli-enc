@@ -114,7 +114,7 @@ macro_rules! impl_bounded_iterable {
                         );
                     )*
                     BoundedIterator {
-                        state: ($([< start_ $bound:lower >] + (n - 1) * [< step_ $bound:lower >]),*),
+                        state: ($([< start_ $bound:lower >] + n.saturating_sub(1) * [< step_ $bound:lower >]),*),
                         step: ($(0usize.wrapping_sub([< step_ $bound:lower >])),*),
                         remaining_steps: n,
                     }
