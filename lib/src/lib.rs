@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #![deny(unsafe_code)]
-#![allow(clippy::let_unit_value)]
 
 mod compress;
 mod constants;

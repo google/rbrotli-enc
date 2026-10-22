@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{utils::CheckBound, BoundedUsize};
+use crate::BoundedUsize;
 
 /// A slice guaranteed to have a length of at least `LOWER_BOUND`.
 // Invariant: self.0.len() >= LOWER_BOUND.
@@ -48,7 +48,7 @@ impl<T, const LOWER_BOUND: usize> BoundedSlice<T, LOWER_BOUND> {
     pub fn new_from_array<const ARR_SIZE: usize>(
         arr: &[T; ARR_SIZE],
     ) -> &BoundedSlice<T, LOWER_BOUND> {
-        let _ = CheckBound::<ARR_SIZE, LOWER_BOUND, 0>::CHECK_GE;
+        const { assert!(ARR_SIZE >= LOWER_BOUND) };
         // SAFETY: the above check verifies that the slice has sufficient length.
         unsafe { Self::from_slice_unchecked(arr) }
     }
@@ -56,7 +56,7 @@ impl<T, const LOWER_BOUND: usize> BoundedSlice<T, LOWER_BOUND> {
     pub fn new_from_array_mut<const ARR_SIZE: usize>(
         arr: &mut [T; ARR_SIZE],
     ) -> &mut BoundedSlice<T, LOWER_BOUND> {
-        let _ = CheckBound::<ARR_SIZE, LOWER_BOUND, 0>::CHECK_GE;
+        const { assert!(ARR_SIZE >= LOWER_BOUND) };
         // SAFETY: the above check verifies that the slice has sufficient length.
         unsafe { Self::from_slice_unchecked_mut(arr) }
     }
@@ -94,9 +94,9 @@ impl<T, const LOWER_BOUND: usize> BoundedSlice<T, LOWER_BOUND> {
     pub fn offset<const NEW_LOWER_BOUND: usize, const INCREASE: usize>(
         &self,
     ) -> &BoundedSlice<T, NEW_LOWER_BOUND> {
-        let _ = CheckBound::<LOWER_BOUND, NEW_LOWER_BOUND, INCREASE>::CHECK_GE;
-        // SAFETY: same layout and interpretation of metadata. Bound checks guaranteed by
-        // CheckAddUsize.
+        const { assert!(LOWER_BOUND as u128 >= NEW_LOWER_BOUND as u128 + INCREASE as u128) };
+        // SAFETY: same layout and interpretation of metadata. Bound checks guaranteed by the
+        // above const assert.
         unsafe { &*(self.0.split_at_unchecked(INCREASE).1 as *const [T] as *const _) }
     }
 
@@ -104,9 +104,9 @@ impl<T, const LOWER_BOUND: usize> BoundedSlice<T, LOWER_BOUND> {
         &self,
         offset: BoundedUsize<INCREASE_BOUND>,
     ) -> &BoundedSlice<T, NEW_LOWER_BOUND> {
-        let _ = CheckBound::<LOWER_BOUND, NEW_LOWER_BOUND, INCREASE_BOUND>::CHECK_GE;
-        // SAFETY: same layout and interpretation of metadata. Bound checks guaranteed by
-        // CheckAddUsize.
+        const { assert!(LOWER_BOUND as u128 >= NEW_LOWER_BOUND as u128 + INCREASE_BOUND as u128) };
+        // SAFETY: same layout and interpretation of metadata. Bound checks guaranteed by the
+        // above const assert.
         unsafe { &*(self.0.split_at_unchecked(offset.get()).1 as *const [T] as *const _) }
     }
 
@@ -115,7 +115,7 @@ impl<T, const LOWER_BOUND: usize> BoundedSlice<T, LOWER_BOUND> {
     }
 
     pub fn get<const INDEX_BOUND: usize>(&self, index: BoundedUsize<INDEX_BOUND>) -> &T {
-        let _ = CheckBound::<LOWER_BOUND, INDEX_BOUND, 0>::CHECK_GT;
+        const { assert!(LOWER_BOUND > INDEX_BOUND) };
         // SAFETY: index.0 <= INDEX_BOUND < LOWER_BOUND <= self.0.len().
         unsafe { self.0.get_unchecked(index.get()) }
     }
@@ -124,7 +124,7 @@ impl<T, const LOWER_BOUND: usize> BoundedSlice<T, LOWER_BOUND> {
         &mut self,
         index: BoundedUsize<INDEX_BOUND>,
     ) -> &mut T {
-        let _ = CheckBound::<LOWER_BOUND, INDEX_BOUND, 0>::CHECK_GT;
+        const { assert!(LOWER_BOUND > INDEX_BOUND) };
         // SAFETY: index.0 < INDEX_BOUND <= LOWER_BOUND <= self.0.len().
         unsafe { self.0.get_unchecked_mut(index.get()) }
     }
@@ -133,7 +133,7 @@ impl<T, const LOWER_BOUND: usize> BoundedSlice<T, LOWER_BOUND> {
         &self,
         offset: BoundedUsize<OFFSET_BOUND>,
     ) -> &[T; SIZE] {
-        let _ = CheckBound::<LOWER_BOUND, OFFSET_BOUND, SIZE>::CHECK_GE;
+        const { assert!(LOWER_BOUND as u128 >= OFFSET_BOUND as u128 + SIZE as u128) };
         // SAFETY: offset.0 + SIZE <= OFFSET_BOUND + SIZE <= LOWER_BOUND <= self.0.len().
         unsafe {
             &*(self
@@ -150,7 +150,7 @@ impl<T, const LOWER_BOUND: usize> BoundedSlice<T, LOWER_BOUND> {
         &mut self,
         offset: BoundedUsize<OFFSET_BOUND>,
     ) -> &mut [T; SIZE] {
-        let _ = CheckBound::<LOWER_BOUND, OFFSET_BOUND, SIZE>::CHECK_GE;
+        const { assert!(LOWER_BOUND as u128 >= OFFSET_BOUND as u128 + SIZE as u128) };
         // SAFETY: offset.0 + SIZE <= OFFSET_BOUND + SIZE <= LOWER_BOUND <= self.0.len().
         unsafe {
             &mut *(self

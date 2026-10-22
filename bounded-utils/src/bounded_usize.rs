@@ -12,18 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::utils::CheckBound;
 use std::ops::{BitAnd, BitOr};
 
 use zerocopy::{AsBytes, FromZeroes};
 
 const _: () = assert!(std::mem::size_of::<usize>() < std::mem::size_of::<u128>());
-
-pub struct CheckPow2MinusOne<const VAL: usize> {}
-
-impl<const VAL: usize> CheckPow2MinusOne<VAL> {
-    pub const IS_POW2_MINUS_ONE: () = assert!((VAL as u128 + 1).is_power_of_two());
-}
 
 macro_rules! make_bounded_type {
     ($d:tt, $BoundedType:ident, $array_macro:ident, $ty:ident) => {
@@ -42,16 +35,14 @@ macro_rules! make_bounded_type {
             /// # Safety
             /// `val` must be less than or equal to `MAX`.
             pub const unsafe fn new_unchecked(val: $ty) -> $BoundedType<MAX> {
-                const _CHECK_TYPE_SIZE: () =
-                    assert!(std::mem::size_of::<$ty>() <= std::mem::size_of::<usize>());
+                const { assert!(std::mem::size_of::<$ty>() <= std::mem::size_of::<usize>()) };
                 debug_assert!((val as usize) <= MAX);
                 $BoundedType(val)
             }
 
             pub const fn new(val: $ty) -> Option<$BoundedType<MAX>> {
                 if (val as usize) <= MAX {
-                    const _CHECK_TYPE_SIZE: () =
-                        assert!(std::mem::size_of::<$ty>() <= std::mem::size_of::<usize>());
+                    const { assert!(std::mem::size_of::<$ty>() <= std::mem::size_of::<usize>()) };
                     Some($BoundedType(val))
                 } else {
                     None
@@ -59,13 +50,15 @@ macro_rules! make_bounded_type {
             }
 
             pub const fn new_masked(val: $ty) -> $BoundedType<MAX> {
-                let _ = CheckPow2MinusOne::<MAX>::IS_POW2_MINUS_ONE;
+                const { assert!((MAX as u128 + 1).is_power_of_two()) };
                 $BoundedType(val & (MAX as $ty))
             }
 
             pub const fn constant<const VAL: usize>() -> $BoundedType<MAX> {
-                let _ = CheckBound::<{ $ty::MAX as usize }, VAL, 0>::CHECK_GE;
-                let _ = CheckBound::<MAX, VAL, 0>::CHECK_GE;
+                const {
+                    assert!(VAL <= $ty::MAX as usize);
+                    assert!(VAL <= MAX);
+                }
                 $BoundedType(VAL as $ty)
             }
 
@@ -84,20 +77,22 @@ macro_rules! make_bounded_type {
             pub fn sub<const NEW_BOUND: usize, const SUB: usize>(
                 &self,
             ) -> Option<$BoundedType<NEW_BOUND>> {
-                let _ = CheckBound::<MAX, NEW_BOUND, SUB>::CHECK_GE;
-                let _ = CheckBound::<{ $ty::MAX as usize }, SUB, 0>::CHECK_GE;
+                const {
+                    assert!(MAX as u128 >= NEW_BOUND as u128 + SUB as u128);
+                    assert!(SUB <= $ty::MAX as usize);
+                }
                 self.0.checked_sub(SUB as $ty).map(|x| $BoundedType(x))
             }
 
             pub const fn widen<const NEW_BOUND: usize>(&self) -> $BoundedType<NEW_BOUND> {
-                let _ = CheckBound::<NEW_BOUND, MAX, 0>::CHECK_GE;
+                const { assert!(NEW_BOUND >= MAX) };
                 $BoundedType(self.0)
             }
 
             pub const fn add<const NEW_BOUND: usize, const ADD: usize>(
                 &self,
             ) -> $BoundedType<NEW_BOUND> {
-                let _ = CheckBound::<NEW_BOUND, MAX, ADD>::CHECK_GE;
+                const { assert!(NEW_BOUND as u128 >= MAX as u128 + ADD as u128) };
                 $BoundedType(self.0 + ADD as $ty)
             }
 
@@ -109,7 +104,7 @@ macro_rules! make_bounded_type {
         impl<const MAX: usize> BitOr for $BoundedType<MAX> {
             type Output = $BoundedType<MAX>;
             fn bitor(self, rhs: Self) -> Self::Output {
-                let _ = CheckPow2MinusOne::<MAX>::IS_POW2_MINUS_ONE;
+                const { assert!((MAX as u128 + 1).is_power_of_two()) };
                 $BoundedType(self.0 | rhs.0)
             }
         }

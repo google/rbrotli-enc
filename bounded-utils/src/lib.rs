@@ -15,12 +15,10 @@
 //! This crate contains types to represent slices whose length is guaranteed to be at least as much
 //! as a compile-time defined constant, as well as unsigned integers that are guaranteed to not
 //! exceed a certain compile-time value.
-#![allow(clippy::let_unit_value)]
 
 mod bounded_iterator;
 mod bounded_slice;
 mod bounded_usize;
-mod utils;
 
 pub mod safe_x86_64;
 pub use bounded_iterator::*;

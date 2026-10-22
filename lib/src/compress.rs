@@ -462,22 +462,6 @@ struct EncoderInternal<
     bwbuf: Vec<u8>,
 }
 
-struct CheckEncoderParams<
-    const ENTRY_SIZE: usize,
-    const ENTRY_SIZE_MINUS_ONE: usize,
-    const ENTRY_SIZE_MINUS_EIGHT: usize,
-> {}
-impl<
-        const ENTRY_SIZE: usize,
-        const ENTRY_SIZE_MINUS_ONE: usize,
-        const ENTRY_SIZE_MINUS_EIGHT: usize,
-    > CheckEncoderParams<ENTRY_SIZE, ENTRY_SIZE_MINUS_ONE, ENTRY_SIZE_MINUS_EIGHT>
-{
-    const CHECK_ENTRY_SIZE: () = assert!(ENTRY_SIZE <= 64);
-    const CHECK_ENTRY_SIZE_MINUS_ONE: () = assert!(ENTRY_SIZE - 1 == ENTRY_SIZE_MINUS_ONE);
-    const CHECK_ENTRY_SIZE_MINUS_EIGHT: () = assert!(ENTRY_SIZE - 8 == ENTRY_SIZE_MINUS_EIGHT);
-}
-
 #[safe_arch_entrypoint("sse", "sse2", "sse3", "ssse3", "sse4.1", "sse4.2", "avx", "avx2")]
 fn compress_one_metablock<
     const ENTRY_SIZE: usize,
@@ -590,9 +574,11 @@ impl<
         data: &[u8],
         out_buf: Option<&'a mut [MaybeUninit<u8>]>,
     ) -> Option<&'a [u8]> {
-        let _ = CheckEncoderParams::<ENTRY_SIZE, ENTRY_SIZE_MINUS_ONE, ENTRY_SIZE_MINUS_EIGHT>::CHECK_ENTRY_SIZE;
-        let _ = CheckEncoderParams::<ENTRY_SIZE, ENTRY_SIZE_MINUS_ONE, ENTRY_SIZE_MINUS_EIGHT>::CHECK_ENTRY_SIZE_MINUS_ONE;
-        let _ = CheckEncoderParams::<ENTRY_SIZE, ENTRY_SIZE_MINUS_ONE, ENTRY_SIZE_MINUS_EIGHT>::CHECK_ENTRY_SIZE_MINUS_EIGHT;
+        const {
+            assert!(ENTRY_SIZE <= 64);
+            assert!(ENTRY_SIZE - 1 == ENTRY_SIZE_MINUS_ONE);
+            assert!(ENTRY_SIZE - 8 == ENTRY_SIZE_MINUS_EIGHT);
+        }
         if !is_cpu_supported() {
             return None;
         }
