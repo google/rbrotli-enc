@@ -12,99 +12,47 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A crate to (best-effort) allocate arrays in hugepages.
-//! Currently only implemented on Linux, will fall back to the alloc crate on other systems (or
-//! under miri).
-//! WARNING: `BoxedHugePageArray` will not drop elements when it is dropped.
+//! Portable allocator for cache-line-aligned (`>= 64 B`) fixed-size heap arrays without stack
+//! temporaries. Retains the `BoxedHugePageArray` name for crate compatibility.
 
 use std::{
     alloc::Layout,
     ops::{Deref, DerefMut},
-    ptr::null_mut,
+    ptr::NonNull,
 };
 
 pub struct BoxedHugePageArray<T: Copy + 'static, const LEN: usize> {
-    // `data` is guaranteed to live from when `new()` is called to when the BoxedHugePageArray is dropped.
-    data: &'static mut [T; LEN],
+    data: NonNull<[T; LEN]>,
 }
 
-/// Allocates memory with the given layout, returning a pointer to an allocation with correct size
-/// and alignment. Aborts if the allocation does not succeed.
-///
-/// Safety:
-/// - T must not be a ZST
-/// - Layout must be a valid layout for an array of `T`s
-/// - Layout must have a non-zero size.
-unsafe fn allocate<T>(layout: Layout, zeroed: bool) -> *mut T {
-    #[cfg(all(target_os = "linux", not(miri)))]
-    {
-        let _ = zeroed;
-        use libc::{
-            sysconf, _SC_PAGE_SIZE, MADV_HUGEPAGE, MAP_ANONYMOUS, MAP_FAILED, MAP_PRIVATE,
-            PROT_READ, PROT_WRITE,
-        };
-        // SAFETY: `sysconf` is always safe.
-        let page_size = unsafe { sysconf(_SC_PAGE_SIZE) };
-        assert!(page_size >= 0);
-        let page_size = page_size as u64;
-        const _: () = assert!(std::mem::size_of::<u64>() >= std::mem::size_of::<usize>());
-        assert_eq!(page_size as u64 % layout.align() as u64, 0);
-        // SAFETY: creating anonymous mappings is always safe.
-        let mem = unsafe {
-            libc::mmap(
-                null_mut(),
-                layout.size(),
-                PROT_READ | PROT_WRITE,
-                MAP_PRIVATE | MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(mem, MAP_FAILED);
-        // SAFETY: `madvise(MADV_HUGEPAGE)` is always safe.
-        unsafe { libc::madvise(mem, layout.size(), MADV_HUGEPAGE) };
-        // Safety note: mmap guarantees that the returned pointer is aligned to a page size and points
-        // to an allocated region at least as long as its `len` argument. We check that the
-        // required alignment is compatible with the page size before calling mmap.
-        mem as *mut T
-    }
-    #[cfg(any(not(target_os = "linux"), miri))]
-    {
-        let ptr = if zeroed {
-            // Safety:
-            // The caller guarantees that layout is not zero sized
-            unsafe { std::alloc::alloc_zeroed(layout) }
-        } else {
-            // Safety:
-            // The caller guarantees that layout is not zero sized
-            unsafe { std::alloc::alloc(layout) }
-        };
-        assert_ne!(ptr, null_mut());
-        ptr as *mut T
-    }
+// SAFETY: `BoxedHugePageArray` exclusively owns its heap-allocated `[T; LEN]`, so sending it across
+// threads is sound whenever `T: Send`.
+unsafe impl<T: Copy + Send + 'static, const LEN: usize> Send for BoxedHugePageArray<T, LEN> {}
+
+// SAFETY: Shared references `&BoxedHugePageArray<T, LEN>` only hand out `&[T; LEN]`, so sharing
+// across threads is sound whenever `T: Sync`.
+unsafe impl<T: Copy + Sync + 'static, const LEN: usize> Sync for BoxedHugePageArray<T, LEN> {}
+
+#[inline]
+fn aligned_layout<T>(len: usize) -> Layout {
+    let base = Layout::array::<T>(len).unwrap();
+    Layout::from_size_align(base.size(), base.align().max(64)).unwrap()
 }
 
-/// Deallocates memory allocated with `allocate`.
+/// Allocates memory with the given layout, returning a non-null pointer to an allocation with
+/// `layout`'s size and alignment. Aborts if the allocation does not succeed.
 ///
-/// Safety:
-/// - `ptr` must have been allocated with `allocate`, with the same `layout` passed to this
-///   function, and not have been deallocated yet.
-/// - The memory pointed by `ptr` must still be valid.
-unsafe fn deallocate<T>(ptr: *mut T, layout: Layout) {
-    #[cfg(all(target_os = "linux", not(miri)))]
-    {
-        use libc::c_void;
-        // SAFETY: `ptr` comes from a call to `mmap` with the same size as passed to this call to
-        // `munmap`, and the memory was not unmapped before.
-        unsafe {
-            libc::munmap(ptr as *mut c_void, layout.size());
-        }
-    }
-    #[cfg(any(not(target_os = "linux"), miri))]
-    // SAFETY: the memory was allocated with `std::alloc::alloc` and not deallocated yet.
-    unsafe {
-        std::alloc::dealloc(ptr as *mut u8, layout)
-    }
+/// # Safety
+/// - `layout` must have a non-zero size.
+unsafe fn allocate(layout: Layout, zeroed: bool) -> NonNull<u8> {
+    let ptr = if zeroed {
+        // SAFETY: The caller guarantees that `layout` has non-zero size.
+        unsafe { std::alloc::alloc_zeroed(layout) }
+    } else {
+        // SAFETY: The caller guarantees that `layout` has non-zero size.
+        unsafe { std::alloc::alloc(layout) }
+    };
+    NonNull::new(ptr).unwrap_or_else(|| std::alloc::handle_alloc_error(layout))
 }
 
 impl<T: Copy, const LEN: usize> BoxedHugePageArray<T, LEN> {
@@ -113,20 +61,16 @@ impl<T: Copy, const LEN: usize> BoxedHugePageArray<T, LEN> {
             assert!(std::mem::size_of::<T>() != 0);
             assert!(LEN != 0);
         }
-        let layout = Layout::array::<T>(LEN).unwrap();
-        // SAFETY: `layout` is created above with Layout::array. We assert that T is not of size 0
-        // and LEN is not 0.
-        let mem = unsafe { allocate::<T>(layout, false) };
+        let layout = aligned_layout::<T>(LEN);
+        // SAFETY: `layout` is created above from `Layout::array::<T>(LEN)` with non-zero size.
+        let mem = unsafe { allocate(layout, false) };
+        let elem_ptr = mem.as_ptr().cast::<T>();
         for i in 0..LEN {
-            // SAFETY: `mem` is guaranteed to point to an array of LEN `T`s, so these `write`s are
-            // safe.
-            unsafe { mem.add(i).write(t) };
+            // SAFETY: `elem_ptr` points to a freshly allocated buffer of `LEN` `T` elements.
+            unsafe { elem_ptr.add(i).write(t) };
         }
         BoxedHugePageArray {
-            // SAFETY: `mem` was allocated with the correct layout. `T` is guaranteed to live for
-            // 'static. The allocation is guaranteed to live until `drop` is called, after which
-            // the slice will not be accessible anymore.
-            data: unsafe { (mem as *mut [T; LEN]).as_mut().unwrap_unchecked() },
+            data: mem.cast::<[T; LEN]>(),
         }
     }
 }
@@ -137,38 +81,55 @@ impl<T: zerocopy::FromZeroes + Copy, const LEN: usize> BoxedHugePageArray<T, LEN
             assert!(std::mem::size_of::<T>() != 0);
             assert!(LEN != 0);
         }
-        let layout = Layout::array::<T>(LEN).unwrap();
-        // SAFETY: `layout` is created above with Layout::array. We assert that T is not of size 0
-        // and LEN is not 0.
-        let mem = unsafe { allocate::<T>(layout, true) };
+        let layout = aligned_layout::<T>(LEN);
+        // SAFETY: `layout` is created above from `Layout::array::<T>(LEN)` with non-zero size, and
+        // `T: FromZeroes` guarantees all-zero bytes are a valid initialized `[T; LEN]`.
+        let mem = unsafe { allocate(layout, true) };
         BoxedHugePageArray {
-            // SAFETY: `mem` was allocated with the correct layout. `T` is guaranteed to live for
-            // 'static. The allocation is guaranteed to live until `drop` is called, after which
-            // the slice will not be accessible anymore.
-            data: unsafe { (mem as *mut [T; LEN]).as_mut().unwrap_unchecked() },
+            data: mem.cast::<[T; LEN]>(),
         }
     }
 }
 
 impl<T: Copy, const LEN: usize> Drop for BoxedHugePageArray<T, LEN> {
     fn drop(&mut self) {
-        let layout = Layout::array::<T>(LEN).unwrap();
-        // SAFETY: `layout` is created in the same way as in `new`, and `self.data` was obtained by
-        // `allocate` with the same `layout` as an argument. `drop` can only be called once and is
-        // the only safe method that can deallocate the memory.
-        unsafe { deallocate(self.data, layout) }
+        let layout = aligned_layout::<T>(LEN);
+        // SAFETY: `self.data` was allocated via `allocate` with the exact same `layout`, `T: Copy`
+        // requires no element drop glue, and no live references to `self.data` exist during `drop`.
+        unsafe { std::alloc::dealloc(self.data.as_ptr().cast::<u8>(), layout) }
     }
 }
 
 impl<T: Copy, const LEN: usize> Deref for BoxedHugePageArray<T, LEN> {
     type Target = [T; LEN];
     fn deref(&self) -> &Self::Target {
-        self.data
+        // SAFETY: `self.data` is valid and initialized for the lifetime of `self`.
+        unsafe { self.data.as_ref() }
     }
 }
 
 impl<T: Copy, const LEN: usize> DerefMut for BoxedHugePageArray<T, LEN> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.data
+        // SAFETY: `self.data` is uniquely owned and initialized for the lifetime of `self`.
+        unsafe { self.data.as_mut() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_alignment_and_values() {
+        let mut z = BoxedHugePageArray::<u32, 257>::new_zeroed();
+        assert_eq!(z.as_ptr() as usize % 64, 0);
+        assert!(z.iter().all(|&x| x == 0));
+        z[0] = 7;
+        z[256] = 99;
+        assert_eq!((z[0], z[256]), (7, 99));
+
+        let filled = BoxedHugePageArray::<u64, 19>::new(0xDEAD_BEEF_CAFE_BABE);
+        assert_eq!(filled.as_ptr() as usize % 64, 0);
+        assert!(filled.iter().all(|&x| x == 0xDEAD_BEEF_CAFE_BABE));
     }
 }
