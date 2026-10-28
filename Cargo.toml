@@ -4,7 +4,6 @@ members = [
   "bounded-utils",
   "hugepage-buffer",
   "lsb-bitwriter",
-  "safe-arch-macro",
   # brotli-specific
   "lib",
   "bin",

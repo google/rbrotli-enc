@@ -166,7 +166,7 @@ impl<'a> BitWriter<'a> {
         );
         for t in iter {
             let (count, bits) = f(t);
-            for (c, b) in count.into_iter().zip(bits.into_iter()) {
+            for (c, b) in count.into_iter().zip(bits) {
                 // SAFETY: Bounds are checked in the above assert. Internal invariants are
                 // checked/restored at the end of the loop by the drop guard.
                 unsafe {

@@ -25,16 +25,15 @@ use bounded_utils::safe_x86_64;
 use bounded_utils::{BoundedIterable, BoundedSlice, BoundedUsize};
 use hugepage_buffer::BoxedHugePageArray;
 use lsb_bitwriter::BitWriter;
-use safe_arch_macro::safe_arch_entrypoint;
+use safe_unaligned_simd::x86_64::{_mm256_loadu_si256, _mm256_storeu_si256, _mm_loadu_si128};
+use simd_tokens::{simd_entry, Avx2Token, SimdToken};
 use std::arch::x86_64::*;
 use std::mem::MaybeUninit;
-use zerocopy::{transmute, transmute_mut, AsBytes, FromZeroes};
+use zerocopy::{transmute, transmute_mut};
 
 use crate::constants::*;
 
-#[derive(Debug, Clone, Copy, AsBytes, FromZeroes)]
-#[repr(transparent)]
-pub struct Literal(u8);
+pub type Literal = u8;
 
 #[derive(Clone, Copy, Debug)]
 struct LiteralHistogram {
@@ -97,7 +96,7 @@ impl MetablockData {
 
     #[inline]
     pub fn add_literal(&mut self, value: u8, do_add: bool) {
-        self.literals[self.total_literals as usize] = Literal(value);
+        self.literals[self.total_literals as usize] = value;
         self.total_literals += if do_add { 1 } else { 0 };
     }
 
@@ -126,7 +125,7 @@ impl MetablockData {
         let syms = BoundedSlice::new_from_equal_array_mut(&mut self.symbol_or_nbits);
 
         const SIZE_OF_LITERAL: usize = std::mem::size_of::<Literal>();
-        let num = (count + 15) / 16;
+        let num = count.div_ceil(16);
         let start = (self.iac_literals as usize, self.num_syms.get());
         // TODO(veluca): the checked_ operations in `::iter` cause a small but measurable slowdown
         // (~0.7% overall). The compiler could, in principle, figure out that they are not needed.
@@ -135,11 +134,16 @@ impl MetablockData {
             BoundedUsize<{ SYMBOL_BUF_SIZE - 32 / SIZE_OF_LITERAL }>,
         )>::iter(start, num as usize, (16, 16))
         {
-            let lits = safe_x86_64::_mm_load(literals, idx);
+            let lits = _mm_loadu_si128(
+                literals.get_array::<16, { LITERAL_BUF_SIZE - 32 / SIZE_OF_LITERAL }>(idx),
+            );
             let val = _mm256_cvtepu8_epi16(lits);
             let off = _mm256_set1_epi16((LIT_BASE + SYMBOL_MASK) as i16);
             let res = _mm256_add_epi16(off, val);
-            safe_x86_64::_mm256_store(syms, out_idx, res);
+            _mm256_storeu_si256(
+                syms.get_array_mut::<16, { SYMBOL_BUF_SIZE - 32 / SIZE_OF_LITERAL }>(out_idx),
+                res,
+            );
         }
         self.num_syms = self.num_syms.mod_add(count as usize);
         self.iac_literals += count;
@@ -228,7 +232,7 @@ impl MetablockData {
         let total_icd = self.total_icd as usize;
         const ICD_BUF_LIMIT: usize = ICD_BUF_SIZE - 17;
         debug_assert!(ICD_BUF_LIMIT >= total_icd);
-        for i in BoundedUsize::iter(0, (total_icd + 7) / 8, 8) {
+        for i in BoundedUsize::iter(0, total_icd.div_ceil(8), 8) {
             insert_copy_len_to_sym_and_bits_simd(
                 BoundedSlice::new_from_equal_array(&self.insert_len),
                 BoundedSlice::new_from_equal_array(&self.copy_len),
@@ -309,12 +313,14 @@ impl MetablockData {
         bw.write_foreach(
             BoundedUsize::<{ SYMBOL_BUF_SIZE - 16 }>::iter(0, self.num_syms.get() / 16, 16),
             |i| {
-                let sym_or_nbits = safe_x86_64::_mm256_load(
-                    BoundedSlice::new_from_equal_array(&self.symbol_or_nbits),
-                    i,
+                let sym_or_nbits = _mm256_loadu_si256(
+                    BoundedSlice::new_from_equal_array(&self.symbol_or_nbits)
+                        .get_array::<16, { SYMBOL_BUF_SIZE - 16 }>(i),
                 );
-                let bits =
-                    safe_x86_64::_mm256_load(BoundedSlice::new_from_equal_array(&self.bits), i);
+                let bits = _mm256_loadu_si256(
+                    BoundedSlice::new_from_equal_array(&self.bits)
+                        .get_array::<16, { SYMBOL_BUF_SIZE - 16 }>(i),
+                );
                 const _: () = assert!(SYMBOL_MASK == 0x8000);
                 let is_symbol = _mm256_srai_epi16::<15>(sym_or_nbits);
                 let sym_or_nbits = _mm256_and_si256(get_sym_mask, sym_or_nbits);
@@ -355,17 +361,8 @@ impl MetablockData {
 
                 let mut bitsa = [0u64; 4];
                 let mut nbitsa = [0u64; 4];
-                const ZERO: BoundedUsize<0> = BoundedUsize::MAX;
-                safe_x86_64::_mm256_store(
-                    BoundedSlice::new_from_equal_array_mut(&mut bitsa),
-                    ZERO,
-                    bits64,
-                );
-                safe_x86_64::_mm256_store(
-                    BoundedSlice::new_from_equal_array_mut(&mut nbitsa),
-                    ZERO,
-                    nbits64,
-                );
+                _mm256_storeu_si256(&mut bitsa, bits64);
+                _mm256_storeu_si256(&mut nbitsa, nbits64);
                 (nbitsa, bitsa)
             },
         );
@@ -413,7 +410,7 @@ impl MetablockData {
 
         for lit in &self.literals[..self.total_literals as usize] {
             let histo = BoundedSlice::new_from_equal_array_mut(&mut lit_hist.data);
-            *histo.get_mut(BoundedUsize::from_u8(lit.0)) += 1;
+            *histo.get_mut(BoundedUsize::from_u8(*lit)) += 1;
         }
         lit_hist.total = lit_hist.data.iter().copied().sum::<u32>();
 
@@ -462,7 +459,8 @@ struct EncoderInternal<
     bwbuf: Vec<u8>,
 }
 
-#[safe_arch_entrypoint("sse", "sse2", "sse3", "ssse3", "sse4.1", "sse4.2", "avx", "avx2")]
+#[simd_entry]
+#[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2")]
 fn compress_one_metablock<
     const ENTRY_SIZE: usize,
     const ENTRY_SIZE_MINUS_ONE: usize,
@@ -471,6 +469,7 @@ fn compress_one_metablock<
     const MIN_GAIN_FOR_GREEDY: i32,
     const USE_LAST_DISTANCES: bool,
 >(
+    _token: impl SimdToken,
     data: &[u8],
     pos: usize,
     bw: &mut BitWriter,
@@ -522,14 +521,7 @@ impl<
 }
 
 fn is_cpu_supported() -> bool {
-    is_x86_feature_detected!("avx2")
-        && is_x86_feature_detected!("avx")
-        && is_x86_feature_detected!("sse")
-        && is_x86_feature_detected!("sse2")
-        && is_x86_feature_detected!("sse3")
-        && is_x86_feature_detected!("ssse3")
-        && is_x86_feature_detected!("sse4.1")
-        && is_x86_feature_detected!("sse4.2")
+    Avx2Token::try_new().is_some()
 }
 
 trait EncoderImpl {
@@ -579,9 +571,7 @@ impl<
             assert!(ENTRY_SIZE - 1 == ENTRY_SIZE_MINUS_ONE);
             assert!(ENTRY_SIZE - 8 == ENTRY_SIZE_MINUS_EIGHT);
         }
-        if !is_cpu_supported() {
-            return None;
-        }
+        let token = Avx2Token::try_new()?;
 
         let mut bw = if let Some(buf) = out_buf {
             if buf.len() < self.max_required_size(data.len()) {
@@ -624,6 +614,7 @@ impl<
                 MIN_GAIN_FOR_GREEDY,
                 USE_LAST_DISTANCES,
             >(
+                token,
                 &data[virtual_start..],
                 pos - virtual_start,
                 &mut bw,

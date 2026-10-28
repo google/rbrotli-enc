@@ -10,7 +10,10 @@ hugepage-buffer = { path = "../hugepage-buffer" }
 lsb-bitwriter = { path = "../lsb-bitwriter", features = ["bounded-utils"] }
 zerocopy = { version = "0.7.32", features = ["derive"] }
 bounded-utils = { path = "../bounded-utils" }
-safe-arch-macro = { path = "../safe-arch-macro" }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+simd_tokens = "0.2.0"
+safe_unaligned_simd = "0.2.5"
 
 [dev-dependencies]
 criterion = "0.5.1"

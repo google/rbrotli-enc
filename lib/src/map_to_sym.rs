@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::constants::*;
-use bounded_utils::safe_x86_64;
 use bounded_utils::{BoundedSlice, BoundedUsize};
+use safe_unaligned_simd::x86_64::{_mm256_loadu_si256, _mm256_storeu_si256};
 use std::arch::x86_64::*;
 
 const INS_BASE: [u32; 24] = [
@@ -182,7 +182,10 @@ fn insert_len_to_sym_and_bits_simd(len: __m256i) -> (__m256i, __m256i, __m256i) 
 #[allow(clippy::too_many_arguments)]
 #[inline]
 #[target_feature(enable = "sse2,avx,avx2")]
-pub fn insert_copy_len_to_sym_and_bits_simd<const SLICE_BOUND: usize, const INDEX_BOUND: usize>(
+pub(crate) fn insert_copy_len_to_sym_and_bits_simd<
+    const SLICE_BOUND: usize,
+    const INDEX_BOUND: usize,
+>(
     insert: &BoundedSlice<u32, SLICE_BOUND>,
     copy: &BoundedSlice<u32, SLICE_BOUND>,
     index: BoundedUsize<INDEX_BOUND>,
@@ -194,19 +197,15 @@ pub fn insert_copy_len_to_sym_and_bits_simd<const SLICE_BOUND: usize, const INDE
     const ZERO: BoundedUsize<0> = BoundedUsize::MAX;
     const FOUR: BoundedUsize<4> = BoundedUsize::MAX;
 
-    let insert_len = safe_x86_64::_mm256_load(insert, index);
+    let insert_len = _mm256_loadu_si256(insert.get_array::<8, INDEX_BOUND>(index));
     let (insert_code, insert_nbits, insert_bits) = insert_len_to_sym_and_bits_simd(insert_len);
-    let copy_len = safe_x86_64::_mm256_load(copy, index);
+    let copy_len = _mm256_loadu_si256(copy.get_array::<8, INDEX_BOUND>(index));
 
     let (copy_code, copy_nbits, copy_bits) = copy_len_to_sym_and_bits_simd(copy_len);
 
     let nbits = _mm256_add_epi32(insert_nbits, copy_nbits);
     let nbits_count = _mm256_srli_epi32::<4>(_mm256_add_epi32(nbits, _mm256_set1_epi32(15)));
-    safe_x86_64::_mm256_store(
-        BoundedSlice::new_from_equal_array_mut(nbits_count_buf),
-        ZERO,
-        nbits_count,
-    );
+    _mm256_storeu_si256(nbits_count_buf, nbits_count);
     let insert_nbits_64_0 = _mm256_cvtepu32_epi64(_mm256_extractf128_si256::<0>(insert_nbits));
     let insert_nbits_64_1 = _mm256_cvtepu32_epi64(_mm256_extractf128_si256::<1>(insert_nbits));
     let insert_bits_64_0 = _mm256_cvtepu32_epi64(_mm256_extractf128_si256::<0>(insert_bits));
@@ -225,8 +224,8 @@ pub fn insert_copy_len_to_sym_and_bits_simd<const SLICE_BOUND: usize, const INDE
     );
 
     let bits_buf = BoundedSlice::new_from_equal_array_mut(bits_buf);
-    safe_x86_64::_mm256_store(bits_buf, ZERO, bits_0);
-    safe_x86_64::_mm256_store(bits_buf, FOUR, bits_1);
+    _mm256_storeu_si256(bits_buf.get_array_mut::<4, 0>(ZERO), bits_0);
+    _mm256_storeu_si256(bits_buf.get_array_mut::<4, 4>(FOUR), bits_1);
 
     let nbits_pat = _mm256_or_si256(_mm256_slli_epi32::<16>(nbits), nbits);
     let nbits_pat = _mm256_or_si256(_mm256_slli_epi32::<8>(nbits_pat), nbits_pat);
@@ -243,8 +242,8 @@ pub fn insert_copy_len_to_sym_and_bits_simd<const SLICE_BOUND: usize, const INDE
     let nbits_pat_1 = _mm256_shuffle_epi8(nbits_pat_1, expand_mask);
 
     let nbits_pat_buf = BoundedSlice::new_from_equal_array_mut(nbits_pat_buf);
-    safe_x86_64::_mm256_store(nbits_pat_buf, ZERO, nbits_pat_0);
-    safe_x86_64::_mm256_store(nbits_pat_buf, FOUR, nbits_pat_1);
+    _mm256_storeu_si256(nbits_pat_buf.get_array_mut::<4, 0>(ZERO), nbits_pat_0);
+    _mm256_storeu_si256(nbits_pat_buf.get_array_mut::<4, 4>(FOUR), nbits_pat_1);
 
     let mask = _mm256_set1_epi32(0x7);
     let bits64 = _mm256_or_si256(
@@ -278,7 +277,7 @@ pub fn insert_copy_len_to_sym_and_bits_simd<const SLICE_BOUND: usize, const INDE
     let offset = _mm256_or_si256(_mm256_set1_epi32(SYMBOL_MASK as i32), offset);
 
     let sym = _mm256_or_si256(bits64, offset);
-    safe_x86_64::_mm256_store(BoundedSlice::new_from_equal_array_mut(sym_buf), ZERO, sym);
+    _mm256_storeu_si256(sym_buf, sym);
 }
 
 /// Returns (symbol, nbits, bits). Assumes NPREFIX = 0 and NDIRECT = 0. Does not support the
@@ -330,7 +329,7 @@ fn distance_to_sym_and_bits_with_cache(
 
 #[inline]
 #[target_feature(enable = "sse2,avx,avx2")]
-pub fn distance_to_sym_and_bits_simd<
+pub(crate) fn distance_to_sym_and_bits_simd<
     const SLICE_BOUND: usize,
     const INDEX_BOUND: usize,
     const INDEX_BOUND_PLUS_AT_LEAST_2: usize,
@@ -342,10 +341,15 @@ pub fn distance_to_sym_and_bits_simd<
     nbits_pat_buf: &mut [u32; 8],
     nbits_count_buf: &mut [u32; 8],
 ) {
-    let second_last_distance = safe_x86_64::_mm256_load(distance, pos);
+    let second_last_distance = _mm256_loadu_si256(distance.get_array::<8, INDEX_BOUND>(pos));
     let last_distance =
-        safe_x86_64::_mm256_load(distance, pos.add::<INDEX_BOUND_PLUS_AT_LEAST_2, 1>());
-    let distance = safe_x86_64::_mm256_load(distance, pos.add::<INDEX_BOUND_PLUS_AT_LEAST_2, 2>());
+        _mm256_loadu_si256(distance.get_array::<8, INDEX_BOUND_PLUS_AT_LEAST_2>(
+            pos.add::<INDEX_BOUND_PLUS_AT_LEAST_2, 1>(),
+        ));
+    let distance =
+        _mm256_loadu_si256(distance.get_array::<8, INDEX_BOUND_PLUS_AT_LEAST_2>(
+            pos.add::<INDEX_BOUND_PLUS_AT_LEAST_2, 2>(),
+        ));
     let dist = _mm256_add_epi32(distance, _mm256_set1_epi32(3));
     let float_dist = _mm256_castps_si256(_mm256_cvtepi32_ps(dist));
     let nbits = _mm256_sub_epi32(_mm256_srli_epi32::<23>(float_dist), _mm256_set1_epi32(128));
@@ -388,8 +392,6 @@ pub fn distance_to_sym_and_bits_simd<
         _mm256_castsi256_ps(last_matches),
     ));
 
-    const ZERO: BoundedUsize<0> = BoundedUsize::MAX;
-
     let code = _mm256_add_epi32(_mm256_set1_epi32((SYMBOL_MASK + DIST_BASE) as i32), code);
 
     let last_mask = _mm256_or_si256(last_matches, second_last_matches);
@@ -401,18 +403,10 @@ pub fn distance_to_sym_and_bits_simd<
         _mm256_subs_epu16(nbits_pat, _mm256_set1_epi32(16 << 16)),
         _mm256_set1_epi16(16),
     );
-    safe_x86_64::_mm256_store(BoundedSlice::new_from_equal_array_mut(sym_buf), ZERO, code);
-    safe_x86_64::_mm256_store(BoundedSlice::new_from_equal_array_mut(bits_buf), ZERO, bits);
-    safe_x86_64::_mm256_store(
-        BoundedSlice::new_from_equal_array_mut(nbits_pat_buf),
-        ZERO,
-        nbits_pat,
-    );
-    safe_x86_64::_mm256_store(
-        BoundedSlice::new_from_equal_array_mut(nbits_count_buf),
-        ZERO,
-        nbits_count,
-    );
+    _mm256_storeu_si256(sym_buf, code);
+    _mm256_storeu_si256(bits_buf, bits);
+    _mm256_storeu_si256(nbits_pat_buf, nbits_pat);
+    _mm256_storeu_si256(nbits_count_buf, nbits_count);
 }
 
 #[cfg(test)]
@@ -425,9 +419,9 @@ mod test {
         insert_len_to_sym_and_bits_simd,
     };
     use crate::constants::*;
-    use bounded_utils::{safe_x86_64, BoundedSlice, BoundedUsize};
-    use safe_arch_macro::safe_arch_entrypoint;
-    use safe_x86_64::{_mm256_load, _mm256_store};
+    use bounded_utils::{BoundedSlice, BoundedUsize};
+    use safe_unaligned_simd::x86_64::{_mm256_loadu_si256, _mm256_storeu_si256};
+    use simd_tokens::{simd_entry, Avx2Token, SimdToken};
 
     fn get_nbits(mut nbits_pat: u64, mut nbits_count: u32) -> u64 {
         let mut nbits = 0;
@@ -446,9 +440,9 @@ mod test {
         nbits
     }
 
-    #[test]
-    #[safe_arch_entrypoint("sse2", "avx", "avx2")]
-    fn test_distance_simd() {
+    #[simd_entry]
+    #[target_feature(enable = "avx2")]
+    fn run_test_distance_simd(_token: impl SimdToken) {
         let mut distances = [0u32; 1024];
         let mut distance_bits_buf = [0; 8];
         let mut distance_nbits_pat_buf = [0; 8];
@@ -513,8 +507,15 @@ mod test {
     }
 
     #[test]
-    #[safe_arch_entrypoint("sse2", "avx", "avx2")]
-    fn test_insert_and_copy_simd() {
+    fn test_distance_simd() {
+        if let Some(token) = Avx2Token::try_new() {
+            run_test_distance_simd(token);
+        }
+    }
+
+    #[simd_entry]
+    #[target_feature(enable = "avx2")]
+    fn run_test_insert_and_copy_simd(_token: impl SimdToken) {
         let mut insert = [0; 8];
         let mut copy = [0; 8];
         let mut sym_buf = [0; 8];
@@ -559,8 +560,15 @@ mod test {
     }
 
     #[test]
-    #[safe_arch_entrypoint("sse2", "avx", "avx2")]
-    fn test_insert_simd() {
+    fn test_insert_and_copy_simd() {
+        if let Some(token) = Avx2Token::try_new() {
+            run_test_insert_and_copy_simd(token);
+        }
+    }
+
+    #[simd_entry]
+    #[target_feature(enable = "avx2")]
+    fn run_test_insert_simd(_token: impl SimdToken) {
         let mut insert = [0; 8];
         let mut sym_buf = [0; 8];
         let mut bits_buf = [0; 8];
@@ -572,26 +580,10 @@ mod test {
             for x in 0..8 {
                 insert[x] = (i + x) as u32;
             }
-            const ZERO: BoundedUsize<0> = BoundedUsize::MAX;
-            let (sym, nbits, bits) = insert_len_to_sym_and_bits_simd(_mm256_load(
-                BoundedSlice::new_from_equal_array(&insert),
-                ZERO,
-            ));
-            _mm256_store(
-                BoundedSlice::new_from_equal_array_mut(&mut sym_buf),
-                ZERO,
-                sym,
-            );
-            _mm256_store(
-                BoundedSlice::new_from_equal_array_mut(&mut bits_buf),
-                ZERO,
-                bits,
-            );
-            _mm256_store(
-                BoundedSlice::new_from_equal_array_mut(&mut nbits_buf),
-                ZERO,
-                nbits,
-            );
+            let (sym, nbits, bits) = insert_len_to_sym_and_bits_simd(_mm256_loadu_si256(&insert));
+            _mm256_storeu_si256(&mut sym_buf, sym);
+            _mm256_storeu_si256(&mut bits_buf, bits);
+            _mm256_storeu_si256(&mut nbits_buf, nbits);
             for x in 0..8 {
                 let (sym, nbits, bits) = insert_len_to_sym_and_bits(i as u32 + x);
                 assert_eq!(sym, sym_buf[x as usize]);
@@ -602,8 +594,15 @@ mod test {
     }
 
     #[test]
-    #[safe_arch_entrypoint("avx", "avx2")]
-    fn test_copy_simd() {
+    fn test_insert_simd() {
+        if let Some(token) = Avx2Token::try_new() {
+            run_test_insert_simd(token);
+        }
+    }
+
+    #[simd_entry]
+    #[target_feature(enable = "avx2")]
+    fn run_test_copy_simd(_token: impl SimdToken) {
         let mut copy = [0; 8];
         let mut sym_buf = [0; 8];
         let mut bits_buf = [0; 8];
@@ -615,32 +614,23 @@ mod test {
             for x in 0..8 {
                 copy[x] = (i + x) as u32;
             }
-            const ZERO: BoundedUsize<0> = BoundedUsize::MAX;
-            let (sym, nbits, bits) = copy_len_to_sym_and_bits_simd(_mm256_load(
-                BoundedSlice::new_from_equal_array(&copy),
-                ZERO,
-            ));
-            _mm256_store(
-                BoundedSlice::new_from_equal_array_mut(&mut sym_buf),
-                ZERO,
-                sym,
-            );
-            _mm256_store(
-                BoundedSlice::new_from_equal_array_mut(&mut bits_buf),
-                ZERO,
-                bits,
-            );
-            _mm256_store(
-                BoundedSlice::new_from_equal_array_mut(&mut nbits_buf),
-                ZERO,
-                nbits,
-            );
+            let (sym, nbits, bits) = copy_len_to_sym_and_bits_simd(_mm256_loadu_si256(&copy));
+            _mm256_storeu_si256(&mut sym_buf, sym);
+            _mm256_storeu_si256(&mut bits_buf, bits);
+            _mm256_storeu_si256(&mut nbits_buf, nbits);
             for x in 0..8 {
                 let (sym, nbits, bits) = copy_len_to_sym_and_bits(i as u32 + x);
                 assert_eq!(sym, sym_buf[x as usize]);
                 assert_eq!(nbits, nbits_buf[x as usize]);
                 assert_eq!(bits, bits_buf[x as usize]);
             }
+        }
+    }
+
+    #[test]
+    fn test_copy_simd() {
+        if let Some(token) = Avx2Token::try_new() {
+            run_test_copy_simd(token);
         }
     }
 }

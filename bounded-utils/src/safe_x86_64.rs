@@ -13,115 +13,16 @@
 // limitations under the License.
 
 use std::arch::x86_64::*;
-use zerocopy::{AsBytes, FromBytes};
+use zerocopy::AsBytes;
 
-use crate::{BoundedSlice, BoundedU32, BoundedU8, BoundedUsize};
+use crate::BoundedSlice;
 
-const AVX_VECTOR_SIZE: usize = 32;
-
-// Safety note: we assume in a few places that addition of a small number of
-// `usize`s will not overflow a `u128`.
-const _: () = assert!(std::mem::size_of::<usize>() < std::mem::size_of::<u128>());
-
-#[inline]
-#[target_feature(enable = "avx")]
-pub fn _mm256_load<T: AsBytes, const SLICE_BOUND: usize, const START_BOUND: usize>(
-    data: &BoundedSlice<T, SLICE_BOUND>,
-    start: BoundedUsize<START_BOUND>,
-) -> __m256i {
-    const {
-        assert!(std::mem::size_of::<T>().is_power_of_two());
-        assert!(std::mem::size_of::<T>() <= AVX_VECTOR_SIZE);
-        assert!(
-            SLICE_BOUND as u128
-                >= START_BOUND as u128 + (AVX_VECTOR_SIZE / std::mem::size_of::<T>()) as u128
-        );
-    }
-    // SAFETY: safety ensured by target_feature_11 + the above length check, which ensures that a
-    // full vector can still be read after `start`.
-    unsafe { _mm256_loadu_si256(data.get_slice().as_ptr().add(start.get()) as *const _) }
-}
-
-#[inline]
-#[target_feature(enable = "avx")]
-pub fn _mm256_store<T: FromBytes, const SLICE_BOUND: usize, const START_BOUND: usize>(
-    data: &mut BoundedSlice<T, SLICE_BOUND>,
-    start: BoundedUsize<START_BOUND>,
-    value: __m256i,
-) {
-    const {
-        assert!(std::mem::size_of::<T>().is_power_of_two());
-        assert!(std::mem::size_of::<T>() <= AVX_VECTOR_SIZE);
-        assert!(
-            SLICE_BOUND as u128
-                >= START_BOUND as u128 + (AVX_VECTOR_SIZE / std::mem::size_of::<T>()) as u128
-        );
-    }
-    // SAFETY: safety ensured by target_feature_11 + the above length check, which ensures that a
-    // full vector can still be read after `start`.
-    unsafe {
-        _mm256_storeu_si256(
-            data.get_slice_mut().as_mut_ptr().add(start.get()) as *mut _,
-            value,
-        );
-    }
-}
-
-#[inline]
-#[target_feature(enable = "avx2")]
-pub fn _mm256_store_masked_u8<
-    const SLICE_BOUND: usize,
-    const START_BOUND: usize,
-    const VALUE_BOUND: usize,
->(
-    data: &mut BoundedSlice<BoundedU8<VALUE_BOUND>, SLICE_BOUND>,
-    start: BoundedUsize<START_BOUND>,
-    value: __m256i,
-) {
-    const {
-        assert!(SLICE_BOUND as u128 >= START_BOUND as u128 + AVX_VECTOR_SIZE as u128);
-        assert!((VALUE_BOUND as u128 + 1).is_power_of_two());
-    }
-    // SAFETY: safety ensured by target_feature_11 + the above length check, which ensures that a
-    // full vector can still be read after `start`; the `BoundedU8` invariant is upheld by the
-    // `_mm256_and_si256` operation.
-    unsafe {
-        _mm256_storeu_si256(
-            data.get_slice_mut().as_mut_ptr().add(start.get()) as *mut _,
-            _mm256_and_si256(_mm256_set1_epi8(VALUE_BOUND as i8), value),
-        );
-    }
-}
-
-#[inline]
-#[target_feature(enable = "avx2")]
-pub fn _mm256_store_masked_u32<
-    const SLICE_BOUND: usize,
-    const START_BOUND: usize,
-    const VALUE_BOUND: usize,
->(
-    data: &mut BoundedSlice<BoundedU32<VALUE_BOUND>, SLICE_BOUND>,
-    start: BoundedUsize<START_BOUND>,
-    value: __m256i,
-) {
-    const {
-        assert!(
-            SLICE_BOUND as u128
-                >= START_BOUND as u128 + (AVX_VECTOR_SIZE / std::mem::size_of::<u32>()) as u128
-        );
-        assert!((VALUE_BOUND as u128 + 1).is_power_of_two());
-    }
-    // SAFETY: safety ensured by target_feature_11 + the above length check, which ensures that a
-    // full vector can still be read after `start`; the `BoundedU32` invariant is upheld by the
-    // `_mm256_and_si256` operation.
-    unsafe {
-        _mm256_storeu_si256(
-            data.get_slice_mut().as_mut_ptr().add(start.get()) as *mut _,
-            _mm256_and_si256(_mm256_set1_epi32(VALUE_BOUND as i32), value),
-        );
-    }
-}
-
+/// Performs an AVX2 32-bit gather from `slice`, masking `offsets` to `0..ARRAY_BOUND` so all reads
+/// remain within bounds.
+///
+/// # Safety
+/// The caller must ensure the `avx2` target feature is enabled (enforced via `target_feature_11`
+/// when called from another `#[target_feature(enable = "avx2")]` function).
 #[inline]
 #[target_feature(enable = "avx2")]
 pub fn _mm256_masked_i32gather<T: AsBytes, const SCALE: i32, const ARRAY_BOUND: usize>(
@@ -142,107 +43,11 @@ pub fn _mm256_masked_i32gather<T: AsBytes, const SCALE: i32, const ARRAY_BOUND: 
     }
 }
 
-const SSE_VECTOR_SIZE: usize = 16;
-
-#[inline]
-#[target_feature(enable = "sse2")]
-pub fn _mm_load<T: AsBytes, const SLICE_BOUND: usize, const START_BOUND: usize>(
-    data: &BoundedSlice<T, SLICE_BOUND>,
-    start: BoundedUsize<START_BOUND>,
-) -> __m128i {
-    const {
-        assert!(std::mem::size_of::<T>().is_power_of_two());
-        assert!(std::mem::size_of::<T>() <= SSE_VECTOR_SIZE);
-        assert!(
-            SLICE_BOUND as u128
-                >= START_BOUND as u128 + (SSE_VECTOR_SIZE / std::mem::size_of::<T>()) as u128
-        );
-    }
-    // SAFETY: safety ensured by target_feature_11 + the above length check, which ensures that a
-    // full vector can still be read after `start`.
-    unsafe { _mm_loadu_si128(data.get_slice().as_ptr().add(start.get()) as *const _) }
-}
-
-#[inline]
-#[target_feature(enable = "sse2")]
-pub fn _mm_store<T: FromBytes, const SLICE_BOUND: usize, const START_BOUND: usize>(
-    data: &mut BoundedSlice<T, SLICE_BOUND>,
-    start: BoundedUsize<START_BOUND>,
-    value: __m128i,
-) {
-    const {
-        assert!(std::mem::size_of::<T>().is_power_of_two());
-        assert!(std::mem::size_of::<T>() <= SSE_VECTOR_SIZE);
-        assert!(
-            SLICE_BOUND as u128
-                >= START_BOUND as u128 + (SSE_VECTOR_SIZE / std::mem::size_of::<T>()) as u128
-        );
-    }
-    // SAFETY: safety ensured by target_feature_11 + the above length check, which ensures that a
-    // full vector can still be read after `start`.
-    unsafe {
-        _mm_storeu_si128(
-            data.get_slice_mut().as_mut_ptr().add(start.get()) as *mut _,
-            value,
-        );
-    }
-}
-
-#[inline]
-#[target_feature(enable = "sse2")]
-pub fn _mm_store_masked_u8<
-    const SLICE_BOUND: usize,
-    const START_BOUND: usize,
-    const VALUE_BOUND: usize,
->(
-    data: &mut BoundedSlice<BoundedU8<VALUE_BOUND>, SLICE_BOUND>,
-    start: BoundedUsize<START_BOUND>,
-    value: __m128i,
-) {
-    const {
-        assert!(SLICE_BOUND as u128 >= START_BOUND as u128 + SSE_VECTOR_SIZE as u128);
-        assert!((VALUE_BOUND as u128 + 1).is_power_of_two());
-    }
-    // SAFETY: safety ensured by target_feature_11 + the above length check, which ensures that a
-    // full vector can still be read after `start`; the `BoundedU8` invariant is upheld by the
-    // `_mm_and_si128` operation.
-    unsafe {
-        _mm_storeu_si128(
-            data.get_slice_mut().as_mut_ptr().add(start.get()) as *mut _,
-            _mm_and_si128(_mm_set1_epi8(VALUE_BOUND as i8), value),
-        );
-    }
-}
-
-#[inline]
-#[target_feature(enable = "sse2")]
-pub fn _mm_store_masked_u32<
-    const SLICE_BOUND: usize,
-    const START_BOUND: usize,
-    const VALUE_BOUND: usize,
->(
-    data: &mut BoundedSlice<BoundedU32<VALUE_BOUND>, SLICE_BOUND>,
-    start: BoundedUsize<START_BOUND>,
-    value: __m128i,
-) {
-    const {
-        assert!(
-            SLICE_BOUND as u128
-                >= START_BOUND as u128 + (SSE_VECTOR_SIZE / std::mem::size_of::<u32>()) as u128
-        );
-        assert!((VALUE_BOUND as u128 + 1).is_power_of_two());
-    }
-    // SAFETY: safety ensured by target_feature_11 + the above length check, which ensures that a
-    // full vector can still be read after `start`; the `BoundedU32` invariant is upheld by the
-    // `_mm_and_si128` operation.
-    unsafe {
-        _mm_storeu_si128(
-            data.get_slice_mut().as_mut_ptr().add(start.get()) as *mut _,
-            _mm_and_si128(_mm_set1_epi32(VALUE_BOUND as i32), value),
-        );
-    }
-}
-
+/// Prefetches all 64-byte cache lines covered by `r`.
+///
+/// # Safety
+/// The caller must ensure the `sse` target feature is enabled (enforced via `target_feature_11`
+/// when called from another `#[target_feature(enable = "sse")]` function).
 #[inline]
 #[target_feature(enable = "sse")]
 pub fn _mm_safe_prefetch<const STRATEGY: i32, T>(r: &T) {

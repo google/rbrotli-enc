@@ -698,7 +698,8 @@ dependencies = [
  "criterion",
  "hugepage-buffer",
  "lsb-bitwriter",
- "safe-arch-macro",
+ "safe_unaligned_simd",
+ "simd_tokens",
  "zerocopy",
 ]
 
@@ -757,13 +758,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e86697c916019a8588c99b5fac3cead74ec0b4b819707a682fd4d23fa0ce1ba1"
 
 [[package]]
-name = "safe-arch-macro"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.60",
-]
+name = "safe_unaligned_simd"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9c874fb993656d484725d58fbfddb39dfcf98ebcadc1a1d09568aa6b39bafba"
 
 [[package]]
 name = "same-file"
@@ -812,6 +810,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
 dependencies = [
  "lazy_static",
+]
+
+[[package]]
+name = "simd_tokens"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f1497db8a62e9fc994fd7c8a19a54106c9485e3d0beb3b1353de26ba8ae4b32"
+dependencies = [
+ "simd_tokens_macros",
+]
+
+[[package]]
+name = "simd_tokens_macros"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb0506b507b98fae460060259b4c72b71592d686699c03bc44916afac87cae47"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.60",
 ]
 
 [[package]]
