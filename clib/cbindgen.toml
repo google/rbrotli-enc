@@ -1,6 +1,30 @@
 language = "C"
 include_guard = "RBROTLI_ENC_RBROTLI_ENC_H"
 cpp_compat = true
+usize_is_size_t = true
 after_includes = """
 
-typedef struct RBrotliEncoder RBrotliEncoder;"""
+typedef struct RBrotliEncoder RBrotliEncoder;
+typedef struct RBrotliDictionary RBrotliDictionary;
+typedef struct RBrotliStreamingEncoder RBrotliStreamingEncoder;
+
+/**
+ * Operation code for [`RBrotliEncCompressStream`].
+ */
+typedef enum RBrotliEncStreamOp {
+  /**
+   * Ingest input and emit compressed bytes opportunistically as internal chunks fill.
+   */
+  RBROTLI_ENC_STREAM_PROCESS = 0,
+  /**
+   * Flush buffered input and emit a byte-aligned sync-flush block for immediate prefix recovery.
+   */
+  RBROTLI_ENC_STREAM_FLUSH = 1,
+  /**
+   * Emit all remaining input and close the Brotli stream (`ISLAST = 1`).
+   */
+  RBROTLI_ENC_STREAM_FINISH = 2,
+} RBrotliEncStreamOp;"""
+
+[export]
+exclude = ["RBrotliEncStreamOp"]

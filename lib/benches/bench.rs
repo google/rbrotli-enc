@@ -12,12 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    fs,
-    mem::MaybeUninit,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{fs, mem::MaybeUninit, time::Duration};
 
 use criterion::{
     criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, Criterion, Throughput,
@@ -28,14 +23,10 @@ fn bench_impl(c: &mut BenchmarkGroup<WallTime>, files: &[&str], quality: u32) {
     let mut encoder = Encoder::new(quality);
     for file in files {
         let f = fs::read(format!("data/{}", file)).unwrap();
-        let outbuf = Arc::new(Mutex::new(vec![
-            MaybeUninit::uninit();
-            encoder.max_required_size(f.len())
-        ]));
+        let mut outbuf = vec![MaybeUninit::uninit(); encoder.max_required_size(f.len())];
         c.throughput(Throughput::Bytes(f.len() as u64));
         c.bench_with_input(file.to_owned(), &f, |b, f| {
             b.iter(|| {
-                let mut outbuf = outbuf.lock().unwrap();
                 encoder.compress(f, Some(&mut outbuf)).unwrap();
             })
         });

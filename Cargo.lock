@@ -710,6 +710,7 @@ dependencies = [
 name = "rbrotli-enc-clib"
 version = "0.1.0"
 dependencies = [
+ "brotli-decompressor",
  "cbindgen",
  "rbrotli-enc-lib",
 ]

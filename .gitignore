@@ -1,5 +1,6 @@
 /target
 *.br
 *.gz
+/*.png
 perf.data*
 .*.swp
