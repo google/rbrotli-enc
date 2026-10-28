@@ -13,10 +13,11 @@
 // limitations under the License.
 #![deny(unsafe_code)]
 
+mod block_split;
 mod compress;
 mod constants;
-#[allow(dead_code)]
 mod context;
+mod emit;
 mod hashtable;
 mod huffman;
 mod map_to_sym;
