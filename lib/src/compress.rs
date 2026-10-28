@@ -13,13 +13,14 @@
 // limitations under the License.
 
 use crate::{
+    constants::*,
     hashtable::HashTable,
     huffman::{ContextMap, HuffmanCode, HuffmanCodeEntry},
     map_to_sym::{
         distance_to_sym_and_bits_simd, insert_copy_len_to_sym_and_bits,
-        insert_copy_len_to_sym_and_bits_simd,
+        insert_copy_len_to_sym_and_bits_simd, push_last_distance, IcdBatchBufs,
     },
-    metablock::{self, ContextMode},
+    metablock::{self, write_empty_last_metablock, write_window_bits, ContextMode},
 };
 use bounded_utils::safe_x86_64;
 use bounded_utils::{BoundedIterable, BoundedSlice, BoundedUsize};
@@ -29,11 +30,7 @@ use safe_unaligned_simd::x86_64::{_mm256_loadu_si256, _mm256_storeu_si256, _mm_l
 use simd_tokens::{simd_entry, Avx2Token, SimdToken};
 use std::arch::x86_64::*;
 use std::mem::MaybeUninit;
-use zerocopy::{transmute, transmute_mut};
-
-use crate::constants::*;
-
-pub type Literal = u8;
+use zerocopy::transmute;
 
 #[derive(Clone, Copy, Debug)]
 struct LiteralHistogram {
@@ -43,7 +40,7 @@ struct LiteralHistogram {
 
 struct HistogramBuffers {
     iac_hist: BoxedHugePageArray<u32, IAC_HIST_BUF_SIZE>,
-    dist_hist: [u32; MAX_DIST],
+    dist_hist: [u32; STD_DIST_ALPHABET_SIZE],
     lit_hist: LiteralHistogram,
 }
 
@@ -53,6 +50,7 @@ pub struct MetablockData {
     copy_len: BoxedHugePageArray<u32, ICD_BUF_SIZE>,
     insert_len: BoxedHugePageArray<u32, ICD_BUF_SIZE>,
     distance: BoxedHugePageArray<u32, ICD_BUF_SIZE>,
+    dist_ring: [u32; 4],
     symbol_or_nbits: BoxedHugePageArray<u16, SYMBOL_BUF_SIZE>,
     bits: BoxedHugePageArray<u16, SYMBOL_BUF_SIZE>,
     histogram_buf: BoxedHugePageArray<HuffmanCodeEntry, HISTOGRAM_BUF_SIZE>,
@@ -70,6 +68,7 @@ impl MetablockData {
             insert_len: BoxedHugePageArray::new_zeroed(),
             copy_len: BoxedHugePageArray::new_zeroed(),
             distance: BoxedHugePageArray::new_zeroed(),
+            dist_ring: INITIAL_LAST_DISTANCES,
             symbol_or_nbits: BoxedHugePageArray::new_zeroed(),
             bits: BoxedHugePageArray::new_zeroed(),
             histogram_buf: BoxedHugePageArray::new_zeroed(),
@@ -82,11 +81,7 @@ impl MetablockData {
 
     fn reset(&mut self, context_mode: ContextMode, start: bool) {
         if start {
-            self.distance[0] = 11;
-            self.distance[1] = 4;
-        } else {
-            self.distance[0] = self.distance[self.total_icd as usize];
-            self.distance[1] = self.distance[self.total_icd as usize + 1];
+            self.dist_ring = INITIAL_LAST_DISTANCES;
         }
         self.total_icd = 0;
         self.total_literals = 0;
@@ -112,7 +107,7 @@ impl MetablockData {
         self.total_icd += if do_add { 1 } else { 0 };
         self.insert_len[pos] = num_lits;
         self.copy_len[pos] = copy_len;
-        self.distance[pos + 2] = distance;
+        self.distance[pos] = distance;
     }
 
     #[inline]
@@ -127,8 +122,6 @@ impl MetablockData {
         const SIZE_OF_LITERAL: usize = std::mem::size_of::<Literal>();
         let num = count.div_ceil(16);
         let start = (self.iac_literals as usize, self.num_syms.get());
-        // TODO(veluca): the checked_ operations in `::iter` cause a small but measurable slowdown
-        // (~0.7% overall). The compiler could, in principle, figure out that they are not needed.
         for (idx, out_idx) in <(
             BoundedUsize<{ LITERAL_BUF_SIZE - 32 / SIZE_OF_LITERAL }>,
             BoundedUsize<{ SYMBOL_BUF_SIZE - 32 / SIZE_OF_LITERAL }>,
@@ -175,7 +168,7 @@ impl MetablockData {
         distance_nbits_count_buf: &[u32; 8],
         distance_sym_buf: &[u32; 8],
         iac_hist_flat: &mut [u32; IAC_HIST_BUF_SIZE],
-        dist_hist_flat: &mut [u32; MAX_DIST],
+        dist_hist_flat: &mut [u32; STD_DIST_ALPHABET_SIZE],
     ) {
         let iac_sym_off = insert_and_copy_sym_buf[ii] as u16;
         *BoundedSlice::new_from_equal_array_mut(&mut self.symbol_or_nbits).get_mut(self.num_syms) =
@@ -205,27 +198,20 @@ impl MetablockData {
             iac_sym_off as usize - SYMBOL_MASK as usize,
         )) += 1;
         *BoundedSlice::new_from_equal_array_mut(dist_hist_flat).get_mut(BoundedUsize::<
-            { MAX_DIST - 1 },
+            { STD_DIST_ALPHABET_SIZE - 1 },
         >::new_masked(
             dist_sym_off as usize - (SYMBOL_MASK + DIST_BASE) as usize,
         )) += 1;
     }
 
     #[inline(never)]
-    #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2")]
+    #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2,bmi1,bmi2,lzcnt")]
     fn compute_symbols_and_icd_histograms(
         &mut self,
         iac_hist: &mut [u32; IAC_HIST_BUF_SIZE],
-        dist_hist: &mut [u32; MAX_DIST],
+        dist_hist: &mut [u32; STD_DIST_ALPHABET_SIZE],
     ) {
-        let mut insert_and_copy_bits_buf = [0; 8];
-        let mut insert_and_copy_nbits_pat_buf = [0; 8];
-        let mut insert_and_copy_nbits_count_buf = [0; 8];
-        let mut insert_and_copy_sym_buf = [0; 8];
-        let mut distance_bits_buf = [0; 8];
-        let mut distance_nbits_pat_buf = [0; 8];
-        let mut distance_nbits_count_buf = [0; 8];
-        let mut distance_sym_buf = [0; 8];
+        let mut bufs = IcdBatchBufs::default();
 
         self.num_syms = BoundedUsize::constant::<0>();
         self.iac_literals = 0;
@@ -233,58 +219,55 @@ impl MetablockData {
         const ICD_BUF_LIMIT: usize = ICD_BUF_SIZE - 17;
         debug_assert!(ICD_BUF_LIMIT >= total_icd);
         for i in BoundedUsize::iter(0, total_icd.div_ceil(8), 8) {
-            insert_copy_len_to_sym_and_bits_simd(
+            let n_lanes = (total_icd - i.get()).min(8);
+            let mut d0_arr = [1u32; 8];
+            let mut d1_arr = [1u32; 8];
+            let mut d2_arr = [1u32; 8];
+            let mut d3_arr = [1u32; 8];
+            let mut cur_arr = [1u32; 8];
+            for lane in 0..n_lanes {
+                let raw = self.distance[i.get() + lane];
+                d0_arr[lane] = self.dist_ring[0];
+                d1_arr[lane] = self.dist_ring[1];
+                d2_arr[lane] = self.dist_ring[2];
+                d3_arr[lane] = self.dist_ring[3];
+                cur_arr[lane] = raw;
+                push_last_distance(&mut self.dist_ring, raw);
+            }
+            insert_copy_len_to_sym_and_bits_simd::<false, ICD_BUF_SIZE, ICD_BUF_LIMIT>(
                 BoundedSlice::new_from_equal_array(&self.insert_len),
                 BoundedSlice::new_from_equal_array(&self.copy_len),
                 i,
-                &mut insert_and_copy_sym_buf,
-                &mut insert_and_copy_bits_buf,
-                &mut insert_and_copy_nbits_pat_buf,
-                &mut insert_and_copy_nbits_count_buf,
+                &mut bufs,
             );
-            distance_to_sym_and_bits_simd::<ICD_BUF_SIZE, ICD_BUF_LIMIT, { ICD_BUF_LIMIT + 2 }>(
-                BoundedSlice::new_from_equal_array(&self.distance),
-                i,
-                &mut distance_sym_buf,
-                &mut distance_bits_buf,
-                &mut distance_nbits_pat_buf,
-                &mut distance_nbits_count_buf,
+            distance_to_sym_and_bits_simd::<false>(
+                [
+                    _mm256_loadu_si256(&d0_arr),
+                    _mm256_loadu_si256(&d1_arr),
+                    _mm256_loadu_si256(&d2_arr),
+                    _mm256_loadu_si256(&d3_arr),
+                ],
+                _mm256_loadu_si256(&cur_arr),
+                0,
+                0,
+                &mut bufs,
             );
 
-            if i.get() + 8 <= total_icd {
-                for ii in 0..8 {
-                    self.add_iac(
-                        i.get(),
-                        ii,
-                        &insert_and_copy_bits_buf,
-                        &insert_and_copy_nbits_pat_buf,
-                        &insert_and_copy_nbits_count_buf,
-                        &insert_and_copy_sym_buf,
-                        &distance_bits_buf,
-                        &distance_nbits_pat_buf,
-                        &distance_nbits_count_buf,
-                        &distance_sym_buf,
-                        iac_hist,
-                        transmute_mut!(dist_hist),
-                    );
-                }
-            } else {
-                for ii in 0..(total_icd - i.get()) {
-                    self.add_iac(
-                        i.get(),
-                        ii,
-                        &insert_and_copy_bits_buf,
-                        &insert_and_copy_nbits_pat_buf,
-                        &insert_and_copy_nbits_count_buf,
-                        &insert_and_copy_sym_buf,
-                        &distance_bits_buf,
-                        &distance_nbits_pat_buf,
-                        &distance_nbits_count_buf,
-                        &distance_sym_buf,
-                        iac_hist,
-                        transmute_mut!(dist_hist),
-                    );
-                }
+            for ii in 0..n_lanes {
+                self.add_iac(
+                    i.get(),
+                    ii,
+                    &bufs.iac_bits,
+                    &bufs.iac_nbits_pat,
+                    &bufs.iac_nbits_count,
+                    &bufs.iac_sym,
+                    &bufs.dist_bits,
+                    &bufs.dist_nbits_pat,
+                    &bufs.dist_nbits_count,
+                    &bufs.dist_sym,
+                    iac_hist,
+                    dist_hist,
+                );
             }
         }
         let remaining = self.total_literals - self.iac_literals;
@@ -302,7 +285,7 @@ impl MetablockData {
                 self.num_syms = self.num_syms.mod_add(1);
             }
             self.add_literals(remaining);
-        };
+        }
     }
 
     #[inline]
@@ -314,27 +297,31 @@ impl MetablockData {
             BoundedUsize::<{ SYMBOL_BUF_SIZE - 16 }>::iter(0, self.num_syms.get() / 16, 16),
             |i| {
                 let sym_or_nbits = _mm256_loadu_si256(
-                    BoundedSlice::new_from_equal_array(&self.symbol_or_nbits)
-                        .get_array::<16, { SYMBOL_BUF_SIZE - 16 }>(i),
+                    BoundedSlice::new_from_equal_array(&self.symbol_or_nbits).get_array::<16, {
+                        SYMBOL_BUF_SIZE - 16
+                    }>(
+                        i
+                    ),
                 );
                 let bits = _mm256_loadu_si256(
                     BoundedSlice::new_from_equal_array(&self.bits)
                         .get_array::<16, { SYMBOL_BUF_SIZE - 16 }>(i),
                 );
-                const _: () = assert!(SYMBOL_MASK == 0x8000);
                 let is_symbol = _mm256_srai_epi16::<15>(sym_or_nbits);
                 let sym_or_nbits = _mm256_and_si256(get_sym_mask, sym_or_nbits);
                 let mask_even_lanes = _mm256_set1_epi32(0xFFFF);
                 let even_sym_or_nbits = _mm256_and_si256(sym_or_nbits, mask_even_lanes);
                 let odd_sym_or_nbits = _mm256_srli_epi32::<16>(sym_or_nbits);
-                let huff_even_nbits_bits = safe_x86_64::_mm256_masked_i32gather::<_, 4, { 1 << 16 }>(
-                    BoundedSlice::<_, { 1 << 16 }>::new_from_array(&self.histogram_buf),
-                    even_sym_or_nbits,
-                );
-                let huff_odd_nbits_bits = safe_x86_64::_mm256_masked_i32gather::<_, 4, { 1 << 16 }>(
-                    BoundedSlice::<_, { 1 << 16 }>::new_from_array(&self.histogram_buf),
-                    odd_sym_or_nbits,
-                );
+                let huff_even_nbits_bits =
+                    safe_x86_64::_mm256_masked_i32gather::<_, 4, HISTOGRAM_BUF_SIZE>(
+                        BoundedSlice::<_, HISTOGRAM_BUF_SIZE>::new_from_array(&self.histogram_buf),
+                        even_sym_or_nbits,
+                    );
+                let huff_odd_nbits_bits =
+                    safe_x86_64::_mm256_masked_i32gather::<_, 4, HISTOGRAM_BUF_SIZE>(
+                        BoundedSlice::<_, HISTOGRAM_BUF_SIZE>::new_from_array(&self.histogram_buf),
+                        odd_sym_or_nbits,
+                    );
                 let huff_nbits = _mm256_or_si256(
                     _mm256_slli_epi32::<16>(huff_odd_nbits_bits),
                     _mm256_and_si256(mask_even_lanes, huff_even_nbits_bits),
@@ -366,8 +353,6 @@ impl MetablockData {
                 (nbitsa, bitsa)
             },
         );
-        // The rest of the code here is not performance-critical (it only runs at most 16
-        // iterations per 4mb of input).
 
         for i in self.num_syms.get() / 16 * 16..self.num_syms.get() {
             let sym_or_nbits = *self.symbol_or_nbits.get(i).unwrap();
@@ -391,15 +376,8 @@ impl MetablockData {
     }
 
     #[inline]
-    #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2")]
+    #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2,bmi1,bmi2,lzcnt")]
     fn write(&mut self, bw: &mut BitWriter, histo_buf: &mut HistogramBuffers, count: usize) {
-        let mut header = metablock::Header {
-            len: count,
-            ndirect: 0,
-            context_mode: vec![self.context_mode],
-            ..Default::default()
-        };
-
         histo_buf.iac_hist.fill(0);
         histo_buf.dist_hist.fill(0);
         histo_buf.lit_hist.data.fill(0);
@@ -414,7 +392,6 @@ impl MetablockData {
         }
         lit_hist.total = lit_hist.data.iter().copied().sum::<u32>();
 
-        // If we have no literal we still need a dummy huffman tree in the header to comply with the spec
         if lit_hist.total == 0 {
             lit_hist.data[0] += 1;
         }
@@ -427,18 +404,26 @@ impl MetablockData {
             dist_hist[0] = 1;
         }
 
-        let mut buf = &mut self.histogram_buf[..];
-        let mut code;
-        (buf, code) = HuffmanCode::from_counts(&iac_hist[..MAX_IAC], 15, buf);
-        header.insert_and_copy_codes.push(code);
+        let buf = &mut self.histogram_buf[..];
+        let (buf, iac_code) = HuffmanCode::from_counts(&iac_hist[..MAX_IAC], 15, buf);
+        let (buf, dist_code) = HuffmanCode::from_counts(dist_hist, 15, buf);
+        let (_, lit_code) = HuffmanCode::from_counts(&lit_hist.data, 15, buf);
 
-        header.distance_cmap = ContextMap::new(&[0, 0, 0, 0]);
-        (buf, code) = HuffmanCode::from_counts(dist_hist, 15, buf);
-        header.distance_codes.push(code);
-
-        header.literals_cmap = ContextMap::new(&[0; 64]);
-        (_, code) = HuffmanCode::from_counts(&lit_hist.data, 15, buf);
-        header.literals_codes.push(code);
+        let ctx_modes = [self.context_mode];
+        let iac_codes = [iac_code];
+        let dist_codes = [dist_code];
+        let lit_codes = [lit_code];
+        let header = metablock::Header {
+            len: count,
+            ndirect: 0,
+            context_mode: &ctx_modes,
+            insert_and_copy_codes: &iac_codes,
+            distance_cmap: ContextMap::new(&[0, 0, 0, 0]),
+            distance_codes: &dist_codes,
+            literals_cmap: ContextMap::new(&[0; 64]),
+            literals_codes: &lit_codes,
+            ..Default::default()
+        };
         header.write(bw);
 
         self.write_bits(bw);
@@ -460,7 +445,7 @@ struct EncoderInternal<
 }
 
 #[simd_entry]
-#[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2")]
+#[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2,bmi1,bmi2,lzcnt")]
 fn compress_one_metablock<
     const ENTRY_SIZE: usize,
     const ENTRY_SIZE_MINUS_ONE: usize,
@@ -513,7 +498,7 @@ impl<
                     total: 0,
                 },
                 iac_hist: BoxedHugePageArray::new_zeroed(),
-                dist_hist: [0; MAX_DIST],
+                dist_hist: [0; STD_DIST_ALPHABET_SIZE],
             },
             bwbuf: vec![],
         }
@@ -551,13 +536,6 @@ impl<
     >
 {
     fn max_required_size(&self, input_len: usize) -> usize {
-        // A byte can either be represented by a literal (15 bits max) or by a
-        // insert+copy+distance. A combination of i+c+d takes at most 30 bits for the symbol + 24*3
-        // bits for extra bits, and because of the format definition such a copy must cover at
-        // least 2 bytes. Thus, at most 6.375 bytes are needed per input byte (this is actually a
-        // huge overestimate in practice). 1024 bytes are sufficient to cover the headers of a
-        // one-metablock file, and files with more metablocks are large enough that the
-        // headers of other metablocks certainly fit in [1<<22]*0.625 bytes.
         input_len * 7 + 1024 + 8
     }
 
@@ -583,24 +561,7 @@ impl<
             BitWriter::new(&mut self.bwbuf[..])
         };
         self.ht.clear();
-        match WBITS {
-            10 => bw.write(7, 0b0100001),
-            11 => bw.write(7, 0b0110001),
-            12 => bw.write(7, 0b1000001),
-            13 => bw.write(7, 0b1010001),
-            14 => bw.write(7, 0b1100001),
-            15 => bw.write(7, 0b1110001),
-            16 => bw.write(1, 0b0),
-            17 => bw.write(7, 0b0000001),
-            18 => bw.write(4, 0b0011),
-            19 => bw.write(4, 0b0101),
-            20 => bw.write(4, 0b0111),
-            21 => bw.write(4, 0b1001),
-            22 => bw.write(4, 0b1011),
-            23 => bw.write(4, 0b1101),
-            24 => bw.write(4, 0b1111),
-            _ => panic!("invalid wbits: {}", WBITS),
-        };
+        write_window_bits(WBITS, false, &mut bw);
         const SHIFT_INTERVAL: usize = 1 << 28;
         let mut virtual_start = 0;
         let mut pos = 0;
@@ -627,12 +588,7 @@ impl<
                 virtual_start += SHIFT_INTERVAL;
             }
         }
-        let header = metablock::Header {
-            islast: true,
-            islastempty: true,
-            ..Default::default()
-        };
-        header.write(&mut bw);
+        write_empty_last_metablock(&mut bw);
         Some(bw.finalize())
     }
 }

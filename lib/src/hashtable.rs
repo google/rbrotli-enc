@@ -49,7 +49,7 @@ fn fill_entry_inner<const ENTRY_SIZE: usize, const ENTRY_SIZE_MINUS_ONE: usize>(
         idx
     } else {
         for i in 0..ENTRY_SIZE {
-            table.pos[i] = (pos as u32).wrapping_sub(WSIZE as u32);
+            table.pos[i] = (pos as u32).wrapping_sub(window_size(WBITS) as u32);
         }
         BoundedU8::constant::<0>()
     };
@@ -248,7 +248,7 @@ fn table_search<
 
         let dist = _mm256_sub_epi32(vpos, hpos);
         let valid_mask = _mm256_andnot_si256(
-            _mm256_cmpgt_epi32(dist, _mm256_set1_epi32(WSIZE as i32)),
+            _mm256_cmpgt_epi32(dist, _mm256_set1_epi32(window_size(WBITS) as i32)),
             _mm256_cmpeq_epi32(vchunk1, hchunk1),
         );
 
@@ -760,7 +760,7 @@ mod test {
     fn run_test_ilog2(_token: impl SimdToken) {
         let step = if cfg!(miri) { 1_000_000 } else { 1 };
 
-        for i in (1..WSIZE).step_by(step) {
+        for i in (1..window_size(WBITS)).step_by(step) {
             let simd =
                 _mm256_extract_epi32::<0>(_mm256_ilog2_epi32(_mm256_set1_epi32(i as i32))) as u32;
             assert_eq!(simd, i.ilog2());
