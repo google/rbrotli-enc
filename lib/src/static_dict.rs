@@ -11,7 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-#![allow(dead_code)]
 
 //! Unified RFC 7932 built-in static dictionary (`kBrotliDictionary` + all 121 transforms).
 

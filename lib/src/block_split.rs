@@ -11,7 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-#![allow(dead_code)]
 
 //! 3-stage MDL block splitter and joint context clustering for `Q8..=Q12`:
 //! 1. Micro-block JSD min-heap neighbor merge (`<= 384` macro-segments).

@@ -36,6 +36,7 @@ use crate::{
         self, write_empty_last_metablock, write_uncompressed_metablock, write_window_bits,
         ContextMode, OptimalCommand, DIST_MODE_IMPLICIT_D0, DIST_MODE_RAW, DIST_MODE_STATIC_DICT,
     },
+    q11::Q11Encoder,
 };
 #[cfg(target_arch = "x86_64")]
 use bounded_utils::{BoundedIterable, BoundedSlice, BoundedUsize};
@@ -1797,6 +1798,12 @@ impl<const P: usize, const LW: bool, const L: usize, const S: usize, const M: us
     }
 }
 
+impl EncoderImpl for Q11Encoder {
+    fn compress_into(&mut self, data: &[u8], dict: OptDict<'_>, bw: &mut BitWriter<'_>) {
+        Q11Encoder::compress_into(self, data, dict, bw);
+    }
+}
+
 type TierMaker = fn(usize) -> Box<dyn EncoderImpl>;
 
 /// Lazy stream-size-tiered encoder (`<= 32 KiB`, `<= 256 KiB`, `> 256 KiB`, plus
@@ -1949,8 +1956,11 @@ impl Encoder {
     /// Creates an encoder configured for `(quality, lgwin, num_threads)`.
     pub fn with_threads(quality: u32, lgwin: u32, num_threads: usize) -> Encoder {
         let wbits = (lgwin as usize).clamp(MIN_WBITS, LARGE_MAX_WBITS);
-        let _ = num_threads;
-        let inner: Box<dyn EncoderImpl> = dispatch_q0_to_q9!(make_q_tier; quality, wbits);
+        let inner: Box<dyn EncoderImpl> = if quality >= 10 {
+            Box::new(Q11Encoder::new(quality, wbits, num_threads))
+        } else {
+            dispatch_q0_to_q9!(make_q_tier; quality, wbits)
+        };
         Encoder {
             inner,
             bwbuf: Vec::new(),
