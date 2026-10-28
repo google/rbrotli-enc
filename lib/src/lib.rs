@@ -23,6 +23,7 @@ mod hashtable;
 mod huffman;
 mod map_to_sym;
 mod metablock;
+mod q11;
 mod static_dict;
 
 pub use compress::Encoder;
