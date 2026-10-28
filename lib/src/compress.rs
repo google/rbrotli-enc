@@ -22,6 +22,7 @@ use crate::{
     constants::*,
     context::{self, xlog2x_fp16, LiteralHistogram},
     emit::write_compressed_metablock,
+    fast_onepass::{onepass_checked_max_output_size, onepass_max_output_size, OnePassEncoder},
     hashtable::{
         CommandSink, HashTable, MatchConfig, PreparedDictionary, QualityParams, SliceCostModel,
         SliceParseState, STATIC_LIT_MULT,
@@ -1788,6 +1789,14 @@ impl_encoder_internal!(EncoderImpl for {
     }
 });
 
+impl<const P: usize, const LW: bool, const L: usize, const S: usize, const M: usize> EncoderImpl
+    for OnePassEncoder<P, LW, L, S, M>
+{
+    fn compress_into(&mut self, data: &[u8], dict: OptDict<'_>, bw: &mut BitWriter<'_>) {
+        OnePassEncoder::compress_into(self, data, dict, bw);
+    }
+}
+
 type TierMaker = fn(usize) -> Box<dyn EncoderImpl>;
 
 /// Lazy stream-size-tiered encoder (`<= 32 KiB`, `<= 256 KiB`, `> 256 KiB`, plus
@@ -1857,6 +1866,12 @@ macro_rules! two_pass_tier {
     };
 }
 
+macro_rules! op_tier {
+    ($head:ident, $lw:tt, $b_lw:tt, $log:literal) => {
+        $head<{ if $b_lw { 31 } else { 25 } }, $lw, $log, { 1 << $log }, { (1 << $log) - 1 }>
+    };
+}
+
 macro_rules! tier_makers {
     ($($ty:ty),+ $(,)?) => {
         [$((|w| Box::new(<$ty>::new(w)) as Box<dyn EncoderImpl>) as TierMaker),+]
@@ -1864,6 +1879,18 @@ macro_rules! tier_makers {
 }
 
 macro_rules! make_q_tier {
+    ($w:expr, $lw:tt; ONEPASS $ls:literal, $lm:literal, $ll:literal) => {
+        TieredEncoder::boxed(
+            $w,
+            $lw,
+            tier_makers![
+                op_tier!(OnePassEncoder, $lw, false, $ls),
+                op_tier!(OnePassEncoder, $lw, false, $lm),
+                op_tier!(OnePassEncoder, $lw, false, $ll),
+                op_tier!(OnePassEncoder, $lw, $lw, $ll),
+            ],
+        )
+    };
     ($w:expr, $lw:tt; $cfg:ty, $ns:tt, $ls:literal, $nm:tt, $lm:literal, $mbm:tt, $nl:tt, $ll:literal, $mbl:tt) => {
         TieredEncoder::boxed(
             $w,
@@ -1881,7 +1908,8 @@ macro_rules! make_q_tier {
 macro_rules! dispatch_q0_to_q9 {
     (@lw $cb:ident; $quality:expr, $w:expr, $lw:tt) => {
         match $quality {
-            0 | 1 => $cb!($w, $lw; Q1Config, 1, 13, 1, 15, (128, 18), 1, 16, (128, 18)),
+            0 => $cb!($w, $lw; ONEPASS 12, 14, 15),
+            1 => $cb!($w, $lw; Q1Config, 1, 13, 1, 15, (128, 18), 1, 16, (128, 18)),
             2 => $cb!($w, $lw; Q2Config, 4, 11, 4, 14, (128, 18), 4, 15, (128, 18)),
             3 => $cb!($w, $lw; Q3Config, 4, 12, 8, 14, (256, 19), 8, 16, (256, 19)),
             4 => $cb!($w, $lw; Q4Config, 8, 12, 8, 14, (256, 19), 8, 16, (256, 19)),
@@ -1938,14 +1966,16 @@ impl Encoder {
     /// arbitrarily large streams (especially on 32-bit targets).
     pub fn max_required_size(&self, input_len: usize) -> usize {
         match self.quality {
-            0..=9 => max_two_pass_output_size(input_len),
+            0 => onepass_max_output_size(input_len),
+            1..=9 => max_two_pass_output_size(input_len),
             _ => input_len.saturating_mul(2).saturating_add(1024 + 64),
         }
     }
 
     fn checked_max_required_size(&self, input_len: usize) -> Option<usize> {
         let n = match self.quality {
-            0..=9 => input_len.checked_mul(7)?.checked_add(1024 + 8)?,
+            0 => onepass_checked_max_output_size(input_len)?,
+            1..=9 => input_len.checked_mul(7)?.checked_add(1024 + 8)?,
             _ => input_len.checked_mul(2)?.checked_add(1024 + 64)?,
         };
         (n <= isize::MAX as usize).then_some(n)

@@ -18,6 +18,7 @@ mod compress;
 mod constants;
 mod context;
 mod emit;
+mod fast_onepass;
 mod hashtable;
 mod huffman;
 mod map_to_sym;
