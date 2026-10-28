@@ -28,6 +28,7 @@ use crate::map_to_sym::{distance_to_sym_and_bits, insert_copy_len_to_sym_and_bit
 use crate::metablock::{
     write_empty_last_metablock, write_uncompressed_metablock, write_window_bits,
 };
+use crate::stream::{StreamEngine, StreamOp};
 #[cfg(target_arch = "x86_64")]
 use crate::{
     hashtable::{compute_hash_idx, longest_match_from_16_avx2, PREFETCH_OFFSET},
@@ -917,11 +918,119 @@ impl<
     }
 }
 
+pub(crate) struct OnePassStreamBackend<
+    const POS_BITS: usize,
+    const LW: bool,
+    const LOG: usize,
+    const SZ: usize,
+    const MSK: usize,
+> {
+    enc: OnePassEncoder<POS_BITS, LW, LOG, SZ, MSK>,
+    dict: Option<PreparedDictionary>,
+    ring: [u32; 2],
+    unemitted_pos: usize,
+    initialized: bool,
+}
+
+impl<
+        const POS_BITS: usize,
+        const LW: bool,
+        const LOG: usize,
+        const SZ: usize,
+        const MSK: usize,
+    > OnePassStreamBackend<POS_BITS, LW, LOG, SZ, MSK>
+{
+    pub(crate) fn new(wbits: usize) -> Self {
+        Self {
+            enc: OnePassEncoder::new(wbits),
+            dict: None,
+            ring: [4, 11],
+            unemitted_pos: 0,
+            initialized: false,
+        }
+    }
+}
+
+impl<
+        const POS_BITS: usize,
+        const LW: bool,
+        const LOG: usize,
+        const SZ: usize,
+        const MSK: usize,
+    > StreamEngine for OnePassStreamBackend<POS_BITS, LW, LOG, SZ, MSK>
+{
+    fn step_ingest_cap(&self) -> usize {
+        ONEPASS_CHUNK_SIZE * 2
+    }
+
+    fn reset_stream(&mut self) {
+        (self.dict, self.ring, self.unemitted_pos, self.initialized) = (None, [4, 11], 0, false);
+    }
+
+    fn attach_dictionary(&mut self, dict: &PreparedDictionary) {
+        self.dict = Some(dict.clone());
+    }
+
+    fn unemitted_start(&self) -> usize {
+        self.unemitted_pos
+    }
+
+    fn on_compact(&mut self, drop_len: usize) {
+        self.unemitted_pos -= drop_len;
+    }
+
+    fn step_max_bytes(&self, op: StreamOp, in_len: usize) -> Option<usize> {
+        let avail = in_len - self.unemitted_pos;
+        match op {
+            StreamOp::Process if avail <= ONEPASS_CHUNK_SIZE => None,
+            StreamOp::Process => Some(onepass_max_output_size(
+                ((avail - 1) / ONEPASS_CHUNK_SIZE) * ONEPASS_CHUNK_SIZE,
+            )),
+            StreamOp::Flush if avail == 0 => None,
+            StreamOp::Flush | StreamOp::Finish => Some(onepass_max_output_size(avail)),
+        }
+    }
+
+    fn emit_step(&mut self, op: StreamOp, in_buf: &[u8], bw: &mut BitWriter<'_>) -> bool {
+        let end = match op {
+            StreamOp::Process => {
+                let avail = in_buf.len() - self.unemitted_pos;
+                self.unemitted_pos + ((avail - 1) / ONEPASS_CHUNK_SIZE) * ONEPASS_CHUNK_SIZE
+            }
+            StreamOp::Flush | StreamOp::Finish => in_buf.len(),
+        };
+        if self.unemitted_pos >= end {
+            return false;
+        }
+        let prep_len = (!self.initialized).then(|| {
+            (self.ring, self.initialized) = ([4, 11], true);
+            window_size(self.enc.wbits)
+        });
+        let (pos, eof, d) = (
+            self.unemitted_pos,
+            op == StreamOp::Finish,
+            self.dict.as_ref(),
+        );
+        self.enc.run_chunks(
+            (prep_len, eof),
+            in_buf,
+            pos..end,
+            d,
+            &mut self.ring,
+            bw,
+            try_avx2(true),
+        );
+        self.unemitted_pos = end;
+        eof
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::metablock::test_helpers::{decompress_brotli, decompress_brotli_with_dict};
     use crate::metablock::{self, ContextMode};
+    use std::io::Write;
 
     type E<const P: usize, const LW: bool> = OnePassEncoder<P, LW, 14, 16384, 16383>;
 
@@ -1072,5 +1181,16 @@ mod tests {
             assert!(check_eq::<25, false>(inp, None, 22, tok).len() <= inp.len() + 16);
             check_eq::<31, true>(inp, Some((&prep, dict_raw)), 28, tok);
         }
+
+        let mut sw = crate::StreamingWriter::with_threads(Vec::new(), 0, 28, 1);
+        sw.set_dictionary(&prep).unwrap();
+        prose.chunks(19_997).for_each(|c| sw.write_all(c).unwrap());
+        sw.flush().unwrap();
+        sw.write_all(&rand_blob[..20_000]).unwrap();
+        let out = sw.finish().unwrap();
+        assert_eq!(
+            decompress_brotli_with_dict(&out, dict_raw),
+            [prose.as_slice(), &rand_blob[..20_000]].concat()
+        );
     }
 }

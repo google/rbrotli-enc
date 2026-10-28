@@ -22,7 +22,10 @@ use crate::{
     constants::*,
     context::{self, xlog2x_fp16, LiteralHistogram},
     emit::write_compressed_metablock,
-    fast_onepass::{onepass_checked_max_output_size, onepass_max_output_size, OnePassEncoder},
+    fast_onepass::{
+        onepass_checked_max_output_size, onepass_max_output_size, OnePassEncoder,
+        OnePassStreamBackend,
+    },
     hashtable::{
         CommandSink, HashTable, MatchConfig, PreparedDictionary, QualityParams, SliceCostModel,
         SliceParseState, STATIC_LIT_MULT,
@@ -36,7 +39,8 @@ use crate::{
         self, write_empty_last_metablock, write_uncompressed_metablock, write_window_bits,
         ContextMode, OptimalCommand, DIST_MODE_IMPLICIT_D0, DIST_MODE_RAW, DIST_MODE_STATIC_DICT,
     },
-    q11::Q11Encoder,
+    q11::{Q11Encoder, Q11StreamBackend},
+    stream::{StreamEngine, StreamOp},
 };
 #[cfg(target_arch = "x86_64")]
 use bounded_utils::{BoundedIterable, BoundedSlice, BoundedUsize};
@@ -1355,6 +1359,12 @@ macro_rules! impl_encoder_internal {
             MAX_MB, LIT_BUF, ICD_BUF, ICD_LIMIT, SYM_LIMIT, SYM_BUF,
         >) { $($body)* });
     };
+    (stream StreamEngine for { $($body:tt)* }) => {
+        impl_encoder_internal!(@impl (StreamEngine for EncoderStreamBackend<EncoderInternal<
+            POS_BITS, WAYS, C, LARGE_WINDOW, LOG_TABLE_SIZE, TABLE_SIZE, TABLE_MASK,
+            MAX_MB, LIT_BUF, ICD_BUF, ICD_LIMIT, SYM_LIMIT, SYM_BUF,
+        >>) { $($body)* });
+    };
 }
 
 struct EncoderSliceState {
@@ -1581,16 +1591,20 @@ impl_encoder_internal!({
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finish_parsed_slice(
         &mut self,
         st: &mut EncoderSliceState,
         snap: SliceSnapshot,
         data: &[u8],
         eff_wsize: usize,
+        mode: StreamOp,
         bw: &mut BitWriter,
         use_avx2: bool,
     ) {
-        if MAX_MB <= SLICE_SIZE || (!st.mb_has_slice && st.parse.pos >= data.len()) {
+        if MAX_MB <= SLICE_SIZE
+            || (mode == StreamOp::Finish && !st.mb_has_slice && st.parse.pos >= data.len())
+        {
             let end = st.parse.pos;
             self.flush_open_mb(st, data, end, false, bw, use_avx2);
             return;
@@ -1601,7 +1615,7 @@ impl_encoder_internal!({
         let (s_len, slice_cmds) = (s_end - s_start, new_icd - snap.saved_icd);
         self.md
             .slice_lit_hist(data, snap, s_end, st.parse.anchor, &mut self.slice_lit_hist);
-        let at_eof = s_end >= data.len();
+        let at_eof = mode == StreamOp::Finish && s_end >= data.len();
         let slice_uncomp = s_len >= 1024
             && should_emit_uncompressed(
                 s_len,
@@ -1720,6 +1734,7 @@ impl_encoder_internal!({
         st: &mut EncoderSliceState,
         in_buf: &[u8],
         dict: Option<&PreparedDictionary>,
+        mode: StreamOp,
         bw: &mut BitWriter,
         use_avx2: bool,
     ) {
@@ -1732,7 +1747,11 @@ impl_encoder_internal!({
             .max(16);
 
         with_const_bool!(dict.is_some(), |HD| {
-            while st.parse.pos < in_buf.len() {
+            while if mode == StreamOp::Process {
+                in_buf.len() >= st.parse.pos + SLICE_SIZE + 1024
+            } else {
+                st.parse.pos < in_buf.len()
+            } {
                 let snap = self.prepare_next_slice(st, in_buf, bw, use_avx2);
                 let target_end = if MAX_MB <= SLICE_SIZE {
                     in_buf.len()
@@ -1747,11 +1766,18 @@ impl_encoder_internal!({
                     &self.cost_model,
                     use_avx2,
                 );
-                self.finish_parsed_slice(st, snap, in_buf, eff_wsize, bw, use_avx2);
+                self.finish_parsed_slice(st, snap, in_buf, eff_wsize, mode, bw, use_avx2);
             }
         });
-        if st.mb_has_slice && st.mb_start < in_buf.len() {
-            self.flush_open_mb(st, in_buf, in_buf.len(), true, bw, use_avx2);
+        if st.mb_has_slice {
+            let end = if mode != StreamOp::Process {
+                (st.mb_start < in_buf.len()).then_some(in_buf.len())
+            } else {
+                (st.parse.pos - st.mb_start > MAX_MB - SLICE_SIZE).then_some(st.parse.pos)
+            };
+            if let Some(flush_end) = end {
+                self.flush_open_mb(st, in_buf, flush_end, true, bw, use_avx2);
+            }
         }
     }
 
@@ -1767,7 +1793,7 @@ impl_encoder_internal!({
             let dict = dict.filter(|d| !d.is_empty());
             self.seed_stream_state(data, data.len(), dict);
             let mut st = EncoderSliceState::new();
-            self.advance_slices(&mut st, data, dict, bw, use_avx2);
+            self.advance_slices(&mut st, data, dict, StreamOp::Finish, bw, use_avx2);
         }
         write_empty_last_metablock(bw);
     }
@@ -1861,6 +1887,74 @@ def_q_configs! {
     Q9Config = (false, 4, 1, 4, 4, 99, 512, 512,  { i32::MAX }, true, 3, true,  { 16 * STATIC_DICT_MAX_POS }, true, 16, true);
 }
 
+struct EncoderStreamBackend<E> {
+    enc: E,
+    dict: Option<PreparedDictionary>,
+    state: EncoderSliceState,
+    initialized: bool,
+}
+
+impl<E> EncoderStreamBackend<E> {
+    fn boxed(enc: E) -> Box<Self> {
+        Box::new(Self {
+            enc,
+            dict: None,
+            state: EncoderSliceState::new(),
+            initialized: false,
+        })
+    }
+}
+
+impl_encoder_internal!(stream StreamEngine for {
+    fn step_ingest_cap(&self) -> usize {
+        const { assert!(MAX_MB >= 2 * SLICE_SIZE) };
+        MAX_MB + SLICE_SIZE * 2
+    }
+
+    fn reset_stream(&mut self) {
+        self.dict = None;
+        self.state = EncoderSliceState::new();
+        self.initialized = false;
+    }
+
+    fn attach_dictionary(&mut self, dict: &PreparedDictionary) {
+        self.dict = Some(dict.clone());
+    }
+
+    fn unemitted_start(&self) -> usize {
+        self.state.mb_start
+    }
+
+    fn on_compact(&mut self, drop_len: usize) {
+        self.state.mb_start -= drop_len;
+        self.state.parse.pos -= drop_len;
+        self.state.parse.anchor -= drop_len;
+        self.state.parse.stream_base = self.state.parse.stream_base.saturating_add(drop_len);
+    }
+
+    fn step_max_bytes(&self, op: StreamOp, in_len: usize) -> Option<usize> {
+        match op {
+            StreamOp::Process if in_len < self.state.parse.pos + SLICE_SIZE + 1024 => None,
+            StreamOp::Flush if self.state.mb_start >= in_len => None,
+            StreamOp::Finish if self.state.mb_start >= in_len => Some(64),
+            _ => Some(max_two_pass_output_size(in_len - self.state.mb_start)),
+        }
+    }
+
+    fn emit_step(&mut self, op: StreamOp, in_buf: &[u8], bw: &mut BitWriter<'_>) -> bool {
+        if self.state.mb_start < in_buf.len() {
+            if !self.initialized {
+                let dict = self.dict.as_ref().filter(|d| !d.is_empty());
+                self.enc.seed_stream_state(in_buf, window_size(self.enc.wbits), dict);
+                self.state = EncoderSliceState::new();
+                self.initialized = true;
+            }
+            self.enc.advance_slices(&mut self.state, in_buf, self.dict.as_ref(), op, bw, true);
+        }
+        false
+    }
+});
+
 macro_rules! two_pass_tier {
     ($b_lw:tt, $n:tt, $cfg:ty, $lw:tt, $log:literal, ($mb_kib:literal, $slog:literal)) => {
         EncoderInternal<
@@ -1912,6 +2006,15 @@ macro_rules! make_q_tier {
     };
 }
 
+macro_rules! make_q_stream {
+    ($w:expr, $lw:tt; ONEPASS $ls:literal, $lm:literal, $ll:literal) => {
+        Box::new(<op_tier!(OnePassStreamBackend, $lw, $lw, $ll)>::new($w))
+    };
+    ($w:expr, $lw:tt; $cfg:ty, $ns:tt, $ls:literal, $nm:tt, $lm:literal, $mbm:tt, $nl:tt, $ll:literal, $mbl:tt) => {
+        EncoderStreamBackend::boxed(<two_pass_tier!($lw, $nl, $cfg, $lw, $ll, $mbl)>::new($w))
+    };
+}
+
 macro_rules! dispatch_q0_to_q9 {
     (@lw $cb:ident; $quality:expr, $w:expr, $lw:tt) => {
         match $quality {
@@ -1934,6 +2037,18 @@ macro_rules! dispatch_q0_to_q9 {
             dispatch_q0_to_q9!(@lw $cb; $quality, $w, true)
         }
     };
+}
+
+pub(crate) fn build_stream_engine(
+    quality: u32,
+    wbits: usize,
+    num_threads: usize,
+) -> Box<dyn StreamEngine> {
+    if quality >= 10 {
+        Box::new(Q11StreamBackend::new(quality, wbits, num_threads))
+    } else {
+        dispatch_q0_to_q9!(make_q_stream; quality, wbits)
+    }
 }
 
 type OptOut<'a> = Option<&'a mut [MaybeUninit<u8>]>;
@@ -1972,7 +2087,7 @@ impl Encoder {
     /// compression of `input_len` bytes (saturating to `usize::MAX` on overflow).
     ///
     /// One-shot [`Self::compress`] and [`Self::compress_with_dict`] return `None` when
-    /// `max_required_size(data.len()) > isize::MAX as usize`; use `StreamingEncoder` for
+    /// `max_required_size(data.len()) > isize::MAX as usize`; use [`crate::StreamingEncoder`] for
     /// arbitrarily large streams (especially on 32-bit targets).
     pub fn max_required_size(&self, input_len: usize) -> usize {
         match self.quality {

@@ -25,6 +25,10 @@ mod map_to_sym;
 mod metablock;
 mod q11;
 mod static_dict;
+mod stream;
 
 pub use compress::Encoder;
 pub use hashtable::PreparedDictionary;
+pub use stream::{
+    StreamError, StreamOp, StreamResult, StreamStatus, StreamingEncoder, StreamingWriter,
+};

@@ -68,6 +68,14 @@ pub(crate) fn write_empty_last_metablock(bw: &mut BitWriter) {
     bw.zero_pad_to_byte();
 }
 
+/// Writes an RFC 7932 §9.2 empty metadata metablock (`ISLAST = 0, MNIBBLES = 11, reserved = 0,
+/// MSKIPBYTES = 00`) and zero-pads to a byte boundary for `SyncFlush`.
+#[inline]
+pub(crate) fn write_empty_metadata_metablock(bw: &mut BitWriter) {
+    bw.write(6, 0b000110);
+    bw.zero_pad_to_byte();
+}
+
 /// Writes an `ISUNCOMPRESSED = 1` metablock (`islast = false`) directly to `bw` at the current
 /// stream bit alignment.
 pub(crate) fn write_uncompressed_metablock(raw_slice: &[u8], bw: &mut BitWriter) {

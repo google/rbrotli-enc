@@ -340,6 +340,15 @@ impl SparseLdmTable {
         }
     }
 
+    pub(super) fn on_compact(&mut self, drop_len: usize) {
+        if self.bucket_mask == 0 || drop_len == 0 {
+            return;
+        }
+        let via_base = drop_len.min(self.base);
+        self.base -= via_base;
+        self.shift_down(drop_len - via_base);
+    }
+
     pub(super) fn extract_chunk_matches(
         &mut self,
         env: ChunkEnv<'_>,

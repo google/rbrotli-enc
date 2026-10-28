@@ -33,6 +33,7 @@ use crate::metablock::{
     write_empty_last_metablock, write_uncompressed_metablock, write_window_bits, OptimalCommand,
     DIST_MODE_IMPLICIT_D0, DIST_MODE_RAW, DIST_MODE_STATIC_DICT,
 };
+use crate::stream::{StreamEngine, StreamOp};
 
 use match_gen::{
     build_chunk_matches, ChunkLdmMatches, ChunkMatches, DictChain, MatchGenCfg, MatchGenScratch,
@@ -150,6 +151,11 @@ impl Q11Encoder {
             dp_scratch: Default::default(),
             pools: ParallelPools::default(),
         }
+    }
+
+    #[inline]
+    pub(crate) fn max_output_size(&self, input_len: usize) -> usize {
+        input_len.saturating_mul(2).saturating_add(1024 + 64)
     }
 
     #[inline]
@@ -1116,6 +1122,114 @@ impl Q11Encoder {
             || !self.encode_range_with_dict(data, rng, dict, None, false, true, &mut st, bw)
         {
             write_empty_last_metablock(bw);
+        }
+    }
+}
+
+const STREAM_Q11_WAVE_BYTES: usize = 8 * DP_CHUNK_SIZE;
+
+pub(crate) struct Q11StreamBackend {
+    enc: Q11Encoder,
+    dict: Option<(PreparedDictionary, Option<DictChain>)>,
+    wave_state: Q11WaveState,
+    unemitted_pos: usize,
+}
+
+impl Q11StreamBackend {
+    pub(crate) fn new(quality: u32, wbits: usize, num_threads: usize) -> Self {
+        Self {
+            enc: Q11Encoder::new(quality, wbits, num_threads),
+            dict: None,
+            wave_state: Q11WaveState::default(),
+            unemitted_pos: 0,
+        }
+    }
+
+    fn emit_range(
+        &mut self,
+        in_buf: &[u8],
+        r_end: usize,
+        is_eof: bool,
+        bw: &mut BitWriter<'_>,
+    ) -> bool {
+        let r_start = std::mem::replace(&mut self.unemitted_pos, r_end);
+        let (dict_opt, dc_opt) = match self.dict.as_ref() {
+            Some((d, dc)) => (Some(d), dc.as_ref()),
+            None => (None, None),
+        };
+        r_start < r_end
+            && self.enc.encode_range_with_dict(
+                in_buf,
+                (r_start, r_end),
+                dict_opt,
+                dc_opt,
+                true,
+                is_eof,
+                &mut self.wave_state,
+                bw,
+            )
+    }
+}
+
+impl StreamEngine for Q11StreamBackend {
+    fn step_ingest_cap(&self) -> usize {
+        STREAM_Q11_WAVE_BYTES + DP_CHUNK_SIZE
+    }
+
+    fn reset_stream(&mut self) {
+        self.enc.mg_scratch.reset_stream();
+        self.dict = None;
+        self.wave_state = Q11WaveState::default();
+        self.unemitted_pos = 0;
+    }
+
+    fn attach_dictionary(&mut self, dict: &PreparedDictionary) {
+        let dc = DictChain::new(dict.active_slice(window_size(self.enc.wbits)));
+        self.dict = Some((dict.clone(), dc));
+    }
+
+    fn unemitted_start(&self) -> usize {
+        self.unemitted_pos
+    }
+
+    fn on_compact(&mut self, drop_len: usize) {
+        self.unemitted_pos -= drop_len;
+        self.enc.mg_scratch.ldm.on_compact(drop_len);
+    }
+
+    fn step_max_bytes(&self, op: StreamOp, in_len: usize) -> Option<usize> {
+        let avail = in_len - self.unemitted_pos;
+        match op {
+            StreamOp::Process if avail < STREAM_Q11_WAVE_BYTES + DP_TAIL_MERGE => None,
+            StreamOp::Process => {
+                let waves = (avail - DP_TAIL_MERGE) / STREAM_Q11_WAVE_BYTES;
+                Some(self.enc.max_output_size(waves * STREAM_Q11_WAVE_BYTES))
+            }
+            StreamOp::Flush if avail == 0 => None,
+            StreamOp::Flush | StreamOp::Finish => Some(self.enc.max_output_size(avail)),
+        }
+    }
+
+    fn emit_step(&mut self, op: StreamOp, in_buf: &[u8], bw: &mut BitWriter<'_>) -> bool {
+        match op {
+            StreamOp::Process => {
+                while in_buf.len() - self.unemitted_pos >= STREAM_Q11_WAVE_BYTES + DP_TAIL_MERGE {
+                    self.emit_range(
+                        in_buf,
+                        self.unemitted_pos + STREAM_Q11_WAVE_BYTES,
+                        false,
+                        bw,
+                    );
+                }
+                false
+            }
+            StreamOp::Flush => {
+                if self.unemitted_pos < in_buf.len() {
+                    self.emit_range(in_buf, in_buf.len(), false, bw);
+                }
+                false
+            }
+            StreamOp::Finish => self.emit_range(in_buf, in_buf.len(), true, bw),
         }
     }
 }
