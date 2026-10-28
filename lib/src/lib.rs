@@ -21,5 +21,6 @@ mod hashtable;
 mod huffman;
 mod map_to_sym;
 mod metablock;
+mod static_dict;
 
 pub use compress::Encoder;
