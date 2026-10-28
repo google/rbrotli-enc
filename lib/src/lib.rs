@@ -15,6 +15,8 @@
 
 mod compress;
 mod constants;
+#[allow(dead_code)]
+mod context;
 mod hashtable;
 mod huffman;
 mod map_to_sym;

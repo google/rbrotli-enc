@@ -123,7 +123,7 @@ impl<'a> BlockTypeInfo<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(unused)]
 pub enum ContextMode {
     LSB6,
