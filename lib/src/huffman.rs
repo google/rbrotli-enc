@@ -202,26 +202,37 @@ impl<'a> HuffmanCode<'a> {
         (usize::BITS - (self.code.len() - 1).leading_zeros()) as usize
     }
 
-    fn write_simple_to_sink<S: BitSink>(&self, nonzero_syms: &mut [u16], sink: &mut S) {
+    fn write_simple_to_sink(&self, nonzero_syms: &mut [u16], mut put: impl FnMut(usize, u64)) {
         debug_assert!((2..=4).contains(&nonzero_syms.len()));
-        sink.put(2, 0b01);
-        sink.put(2, nonzero_syms.len() as u64 - 1);
+        put(4, 0b01 | (((nonzero_syms.len() as u64) - 1) << 2));
         nonzero_syms.sort_unstable_by_key(|x| (self.code[*x as usize].len, *x));
 
+        let bw = self.bit_width();
         for &sym in nonzero_syms.iter() {
-            sink.put(self.bit_width(), sym as u64);
+            put(bw, sym as u64);
         }
         if nonzero_syms.len() == 4 {
-            sink.put(1, u64::from(self.code[nonzero_syms[0] as usize].len == 1));
+            put(1, u64::from(self.code[nonzero_syms[0] as usize].len == 1));
         }
     }
 
     fn write_to_sink<S: BitSink>(&self, sink: &mut S) {
         if let Some(s) = self.singleton {
-            sink.put(4, 0b0001);
-            sink.put(self.bit_width(), s as u64);
+            sink.put(4 + self.bit_width(), 0b0001 | ((s as u64) << 4));
             return;
         }
+
+        let (mut acc_n, mut acc_b) = (0usize, 0u64);
+        let mut put = |n: usize, b: u64| {
+            debug_assert!(n <= 56 && (b >> n) == 0);
+            if acc_n + n > 56 {
+                sink.put(acc_n, acc_b);
+                (acc_n, acc_b) = (n, b);
+            } else {
+                acc_b |= b << acc_n;
+                acc_n += n;
+            }
+        };
 
         let mut nonzero_syms = [0u16; 4];
         let mut nz_count = 0usize;
@@ -237,7 +248,10 @@ impl<'a> HuffmanCode<'a> {
         }
         debug_assert_ne!(nz_count, 0);
         if nz_count <= 4 {
-            self.write_simple_to_sink(&mut nonzero_syms[..nz_count], sink);
+            self.write_simple_to_sink(&mut nonzero_syms[..nz_count], &mut put);
+            if acc_n > 0 {
+                sink.put(acc_n, acc_b);
+            }
             return;
         }
 
@@ -312,10 +326,10 @@ impl<'a> HuffmanCode<'a> {
         let code_length_length_bits = [0, 7, 3, 2, 1, 15];
 
         if let Some(s) = code_length_code.singleton {
-            sink.put(2, 0b00);
+            put(2, 0b00);
             for cl in &code_length_order {
                 let sym = if s == *cl as u16 { 3 } else { 0 };
-                sink.put(code_length_length_nbits[sym], code_length_length_bits[sym]);
+                put(code_length_length_nbits[sym], code_length_length_bits[sym]);
             }
         } else {
             let hskip = if code_length_code.code[1].len == 0 && code_length_code.code[2].len == 0 {
@@ -327,25 +341,32 @@ impl<'a> HuffmanCode<'a> {
             } else {
                 0usize
             };
-            sink.put(2, hskip as u64);
+            put(2, hskip as u64);
             let mut num_code_length = 18;
             while code_length_code.code[code_length_order[num_code_length - 1]].len == 0 {
                 num_code_length -= 1;
             }
             for &ord in &code_length_order[hskip..num_code_length] {
                 let sym = code_length_code.code[ord].len as usize;
-                sink.put(code_length_length_nbits[sym], code_length_length_bits[sym]);
+                put(code_length_length_nbits[sym], code_length_length_bits[sym]);
             }
         }
 
         for (&sym, &extra) in rle_syms[..rle_len].iter().zip(&rle_extra[..rle_len]) {
             let e = code_length_code.code[sym as usize];
-            sink.put(e.len as usize, e.bits as u64);
             if sym >= 16 {
-                sink.put((sym - 14) as usize, extra as u64);
+                let eb_len = (sym - 14) as usize;
+                put(
+                    e.len as usize + eb_len,
+                    (e.bits as u64) | ((extra as u64) << e.len),
+                );
             } else {
                 debug_assert_eq!(extra, 0);
+                put(e.len as usize, e.bits as u64);
             }
+        }
+        if acc_n > 0 {
+            sink.put(acc_n, acc_b);
         }
     }
 

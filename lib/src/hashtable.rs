@@ -51,7 +51,8 @@ const STATIC_MIN_DICT_GAIN: i32 = 48;
 
 pub(crate) const INTERIOR_MARGIN: usize = 16;
 
-const HASH_MUL64: u64 = 0x1FE3_5A7B_D357_9BD3;
+const HASH_MUL64: u64 = 0x9E37_79B9_1E35_A7BD;
+const _: () = assert!(HASH_MUL64 as u32 == HASH_MUL32);
 const SEC_HASH_MUL32: u32 = 0x85EB_CA6B;
 
 macro_rules! def_match_config {
@@ -117,6 +118,33 @@ fn load_word64_padded(slice: &[u8]) -> u64 {
 }
 
 #[inline(always)]
+pub(crate) fn hash8_pair(word64: u64) -> (u32, u32) {
+    let p64 = word64.wrapping_mul(HASH_MUL64);
+    ((p64 >> 32) as u32, (p64 >> 15) as u32)
+}
+
+#[inline(always)]
+pub(crate) fn compute_hashes_8b_p32<const LOG: usize, const MASK: usize>(
+    word64: u64,
+) -> (BoundedUsize<MASK>, u32, u32) {
+    debug_assert!(LOG <= 17);
+    let p64 = word64.wrapping_mul(HASH_MUL64);
+    (
+        BoundedUsize::new_masked((p64 >> (64 - LOG)) as usize),
+        (p64 >> 15) as u32,
+        p64 as u32,
+    )
+}
+
+#[inline(always)]
+pub(crate) fn compute_hashes_8b<const LOG: usize, const MASK: usize>(
+    word64: u64,
+) -> (BoundedUsize<MASK>, u32) {
+    let (idx, sec, _) = compute_hashes_8b_p32::<LOG, MASK>(word64);
+    (idx, sec)
+}
+
+#[inline(always)]
 pub(crate) fn compute_hash_idx<const LOG: usize, const MASK: usize, C: MatchConfig>(
     word64: u64,
 ) -> BoundedUsize<MASK> {
@@ -124,15 +152,30 @@ pub(crate) fn compute_hash_idx<const LOG: usize, const MASK: usize, C: MatchConf
     BoundedUsize::new_masked((primary_hash32(word64, C::PRIMARY_HASH_LEN) >> (32 - LOG)) as usize)
 }
 
+#[inline(always)]
+fn ht4_near_slot<const POS_BITS: usize>(
+    t4: &mut [Buckets<POS_BITS, 1>; HT4_NEAR_SIZE],
+    p32: u32,
+) -> &mut Buckets<POS_BITS, 1> {
+    BoundedSlice::new_from_equal_array_mut(t4).get_mut(
+        BoundedUsize::<{ HT4_NEAR_SIZE - 1 }>::new_masked((p32 >> (32 - HT4_NEAR_LOG)) as usize),
+    )
+}
+
 /// Computes `(bucket_index, msb_aligned_sec_hash)` from an 8-byte little-endian load at `pos`.
 #[inline(always)]
 pub(crate) fn compute_hashes_for<const LOG: usize, const MASK: usize, C: MatchConfig>(
     word64: u64,
 ) -> (BoundedUsize<MASK>, u32) {
-    (
-        compute_hash_idx::<LOG, MASK, C>(word64),
-        secondary_hash32(word64, C::SEC_HASH_OFFSET),
-    )
+    const { assert!(C::PRIMARY_HASH_LEN != 8 || LOG <= 17) };
+    if const { C::PRIMARY_HASH_LEN == 8 } {
+        compute_hashes_8b::<LOG, MASK>(word64)
+    } else {
+        (
+            compute_hash_idx::<LOG, MASK, C>(word64),
+            secondary_hash32(word64, C::SEC_HASH_OFFSET),
+        )
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -178,8 +221,8 @@ impl PreparedDictionary {
         let bytes: std::sync::Arc<[u8]> = dict[raw_len - raw_len.min(window_size(wbits))..].into();
         let q = quality.min(9) as usize;
         let (primary_hash_len, lt) = (
-            if q == 0 { 5 } else { 4 },
-            [15, 16, 15, 16, 16, 16, 16, 17, 16, 17][q],
+            if q <= 3 { 8 } else { 4 },
+            [13, 15, 15, 15, 16, 16, 16, 17, 16, 17][q],
         );
         let (cap, n_offs) = (
             [1u8, 1, 4, 8, 8, 8, 16, 16, 32, 32][q],
@@ -190,11 +233,18 @@ impl PreparedDictionary {
             let mut counts = vec![0u8; 1usize << lt];
             for off in (0..n_offs).rev() {
                 let w64 = load_word64_padded(&bytes[off..]);
-                let hash32 = primary_hash32(w64, primary_hash_len);
+                let (hash32, sec_h) = if primary_hash_len == 8 {
+                    hash8_pair(w64)
+                } else {
+                    (
+                        primary_hash32(w64, primary_hash_len),
+                        secondary_hash32(w64, 1),
+                    )
+                };
                 let cnt = &mut counts[(hash32 >> (32 - lt)) as usize];
                 if *cnt < cap {
                     *cnt += 1;
-                    entries_rev.push(DictEntry(hash32, secondary_hash32(w64, 1), off as u32));
+                    entries_rev.push(DictEntry(hash32, sec_h, off as u32));
                 }
             }
             entries_rev.reverse();
@@ -500,7 +550,7 @@ fn sub_array_mut<T, const M: usize>(slice: &mut [T], offset: usize) -> &mut [T; 
     (&mut slice[offset..offset + M]).try_into().unwrap()
 }
 
-/// Per-way 16-bit secondary hash tags used alongside `Buckets<31, WAYS>` when `WAYS > 1`.
+/// Per-way 16-bit secondary hash tags used alongside `Buckets<31, WAYS>`.
 #[derive(Clone, Copy, FromZeroes)]
 #[cfg_attr(test, derive(PartialEq, Eq, Debug))]
 #[repr(transparent)]
@@ -665,7 +715,7 @@ impl<const POS_BITS: usize, const WAYS: usize> Buckets<POS_BITS, WAYS> {
             let wsize = _mm_cvtsi128_si32(_mm256_castsi256_si128(vwsize)) as u32;
             let d = self.search_and_insert_one(vpos, sec_hash, wsize);
             dists[0] = d;
-            return u32::from(d != 0);
+            return u32::from(d != 0) & tag_mask;
         }
         let vt = _mm256_set1_epi32(Self::encode(vpos, sec_hash) as i32);
         let prev = self.shift_insert_avx2(vt);
@@ -874,9 +924,34 @@ const HT3_SIZE: usize = 4096;
 const HT3_MASK: usize = HT3_SIZE - 1;
 const HT3_MAX_DIST: u32 = 4096;
 
+const HT4_NEAR_LOG: usize = 14;
+const HT4_NEAR_SIZE: usize = 1 << HT4_NEAR_LOG;
+const HT4_DICT_WINDOW: usize = 32_768;
+
 const HT6_LOG_BUCKETS: usize = 17;
 const HT6_SIZE: usize = 1 << HT6_LOG_BUCKETS;
 const HT6_MIN_DIST: u32 = 16_384;
+
+#[inline(always)]
+fn accept_fast_short_match<const LARGE_WINDOW: bool>(
+    len: usize,
+    dist: u32,
+    max_d4: u32,
+    d0: u32,
+    d1: u32,
+) -> bool {
+    if dist.wrapping_sub(d0).wrapping_add(2) <= 4 || dist.wrapping_sub(d1).wrapping_add(2) <= 4 {
+        return len >= 4;
+    }
+    match len {
+        8.. => true,
+        7 => !LARGE_WINDOW || dist < (1 << 26),
+        6 => dist < (1 << 21),
+        5 => dist < (1 << 18),
+        4 => dist <= max_d4,
+        _ => false,
+    }
+}
 
 #[inline(always)]
 fn compute_hash3(word64: u64) -> usize {
@@ -1238,25 +1313,6 @@ fn probe_periodic_2b_stride<C: MatchConfig>(ctx: &ProbeCtx<'_>, best: &mut BestM
 }
 
 #[inline(always)]
-pub(crate) fn accept_onepass_match<C: MatchConfig, const LARGE_WINDOW: bool>(
-    best_len: usize,
-    dist: u32,
-    d0: u32,
-    d1: u32,
-) -> bool {
-    let near_rep = C::USE_LAST_DISTANCES
-        && (dist.wrapping_sub(d0).wrapping_add(2) <= 4
-            || dist.wrapping_sub(d1).wrapping_add(2) <= 4);
-    match best_len {
-        8.. => true,
-        7 => !LARGE_WINDOW || dist < (1 << 26),
-        6 => dist < (1 << 21),
-        5 => dist < (1 << 16) || near_rep,
-        _ => dist < 1024 || near_rep,
-    }
-}
-
-#[inline(always)]
 fn unmatched_step<C: MatchConfig>(unm: usize) -> usize {
     let base = if C::FAST_MATCHING && C::MAX_INSERT_LEN == 0 {
         2
@@ -1279,11 +1335,20 @@ fn unmatched_step<C: MatchConfig>(unm: usize) -> usize {
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
-#[target_feature(enable = "sse")]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
 fn prefetch_ht6(t6: &[[u32; 4]; HT6_SIZE], h6: usize) {
     if let Some(entry) = t6.get(h6) {
         safe_x86_64::_mm_safe_prefetch::<_MM_HINT_T0, _>(entry);
     }
+}
+
+#[inline(always)]
+fn load_u64_inbounds(buf: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes(
+        *BoundedSlice::<u8, 8>::new_at_offset(buf, off)
+            .unwrap()
+            .get_array::<8, 0>(BoundedUsize::<0>::MAX),
+    )
 }
 
 macro_rules! emit_match_inline {
@@ -1348,58 +1413,485 @@ macro_rules! impl_parse_slice_interior {
                 };
             }
 
-            if const {
-                WAYS == 1
-                    && C::FAST_MATCHING
-                    && C::COST_MODEL_LEVEL == 0
-                    && !HAS_DICT
-                    && !USE_SD
-                    && !C::USE_LAST_DISTANCES
-            } {
+            if const { C::FAST_MATCHING } {
+                const {
+                    assert!(
+                        !C::FAST_MATCHING || (C::PRIMARY_HASH_LEN == 8 && C::MIN_MATCH_LEN == 4)
+                    )
+                };
+                let sd_pos_limit = if USE_SD {
+                    C::STATIC_DICT_LIMIT.saturating_sub(stream_base)
+                } else {
+                    0
+                };
+                let fast_sd = (slice_start < sd_pos_limit).then(static_dict::fast_dict);
+                let (eff_w32, max_d4) = (eff_wsize as u32, model.max_d4.min(eff_wsize as u32));
+                let sd_max_raw = if LARGE_WINDOW {
+                    MAX_ALLOWED_DISTANCE as u32
+                } else {
+                    STD_MAX_RAW_STATIC_DIST
+                };
+
+                if const { WAYS == 1 && !HAS_DICT } {
+                    let trawl_data = &data[..end + INTERIOR_MARGIN - 1];
+                    let max_d4_q1 = max_d4.min(4096);
+                    let mut ht4_box = $self.ht4_near.take().unwrap();
+                    let t4 = &mut *ht4_box;
+                    let mut pos = slice_start;
+                    let mut pending_d0: Option<(usize, u64)> = None;
+                    'outer1: while pos < end {
+                        let (hit_pos, dist, diff0) = if let Some((p, d)) = pending_d0.take() {
+                            (p, last_distances[0], d)
+                        } else {
+                            let (d0, d1) = (last_distances[0], last_distances[1]);
+                            let mut skip = 36usize + ((pos - anchor) >> 1);
+                            loop {
+                                let Some(ds) = BoundedSlice::<u8, INTERIOR_MARGIN>::new_at_offset(
+                                    trawl_data, pos,
+                                ) else {
+                                    break 'outer1;
+                                };
+                                let cur_w = u64::from_le_bytes(
+                                    *ds.get_array::<8, 0>(BoundedUsize::<0>::MAX),
+                                );
+                                let (cur_h, cur_s, p32) = compute_hashes_8b_p32::<LOG, TM>(cur_w);
+                                let vpos = vpos_base.wrapping_add(pos) as u32;
+                                let d8 = $self.search_and_insert_one(cur_h, vpos, cur_s, eff_w32);
+                                if d8 != 0 {
+                                    if let Some(cs) = BoundedSlice::<u8, 8>::new_at_offset(
+                                        trawl_data,
+                                        pos.wrapping_sub(d8 as usize),
+                                    ) {
+                                        if u64::from_le_bytes(
+                                            *cs.get_array::<8, 0>(BoundedUsize::<0>::MAX),
+                                        ) == cur_w
+                                        {
+                                            break (pos, d8, 0u64);
+                                        }
+                                    }
+                                }
+                                if skip < 122 {
+                                    let d4 = ht4_near_slot(t4, p32).search_and_insert_one(
+                                        vpos,
+                                        p32 << HT4_NEAR_LOG,
+                                        eff_w32,
+                                    );
+                                    if d4 != 0 && d4 != d8 {
+                                        if let Some(cs) = BoundedSlice::<u8, 8>::new_at_offset(
+                                            trawl_data,
+                                            pos.wrapping_sub(d4 as usize),
+                                        ) {
+                                            let diff = u64::from_le_bytes(
+                                                *cs.get_array::<8, 0>(BoundedUsize::<0>::MAX),
+                                            ) ^ cur_w;
+                                            if (diff & 0xFFFF_FFFF) == 0 {
+                                                let l0 = if diff == 0 {
+                                                    8
+                                                } else {
+                                                    (diff.trailing_zeros() >> 3) as usize
+                                                };
+                                                if accept_fast_short_match::<LARGE_WINDOW>(
+                                                    l0, d4, max_d4_q1, d0, d1,
+                                                ) {
+                                                    break (pos, d4, diff);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if skip < 64 && pos < sd_pos_limit {
+                                        if let Some(sd_tbl) = fast_sd {
+                                            if let Some(sm) = static_dict::lookup_fast(
+                                                sd_tbl,
+                                                cur_w,
+                                                p32,
+                                                || {
+                                                    u32::from_le_bytes(
+                                                        *ds.get_array::<4, 8>(
+                                                            BoundedUsize::<8>::MAX,
+                                                        ),
+                                                    )
+                                                },
+                                                || {
+                                                    let abs_pos = pos.saturating_add(stream_base);
+                                                    Some((
+                                                        (abs_pos.min(wsize) as u64) + 1,
+                                                        sd_max_raw,
+                                                    ))
+                                                },
+                                                (
+                                                    model.lit_mult,
+                                                    model.explicit_cmd_off,
+                                                    STATIC_MIN_DICT_GAIN,
+                                                ),
+                                            ) {
+                                                break (
+                                                    pos,
+                                                    sm.raw_dist | STATIC_DICT_DIST_FLAG,
+                                                    ((sm.base_len as u64) << 32)
+                                                        | (sm.out_len as u64),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                pos += skip >> 5;
+                                skip += if skip < 108 { 5 } else { 8 };
+                            }
+                        };
+                        let is_sd = USE_SD && (dist & STATIC_DICT_DIST_FLAG) != 0;
+                        let match_end = if is_sd {
+                            let (base_len, out_len) = ((diff0 >> 32) as u32, diff0 as u32);
+                            $md.emit_command::<C>(data, anchor, hit_pos, (base_len, out_len), dist);
+                            hit_pos + out_len as usize
+                        } else {
+                            let cand = hit_pos - (dist as usize);
+                            let mut blen = if diff0 != 0 {
+                                (diff0.trailing_zeros() >> 3) as usize
+                            } else {
+                                let diff8 = load_u64_inbounds(data, cand + 8)
+                                    ^ load_u64_inbounds(data, hit_pos + 8);
+                                if diff8 != 0 {
+                                    8 + (diff8.trailing_zeros() >> 3) as usize
+                                } else {
+                                    $match16_fn(data, cand, hit_pos)
+                                }
+                            };
+                            let mp = extend_match_backward::<false>(
+                                data,
+                                &[],
+                                hit_pos,
+                                dist as usize,
+                                anchor.max(slice_start),
+                                &mut blen,
+                            );
+                            $md.emit_command::<C>(
+                                data,
+                                anchor,
+                                mp,
+                                (blen as u32, blen as u32),
+                                dist,
+                            );
+                            if C::USE_LAST_DISTANCES {
+                                push_last_distance(&mut last_distances, dist);
+                            }
+                            mp + blen
+                        };
+                        let out_span = match_end - hit_pos;
+                        anchor = match_end;
+                        pos = match_end;
+                        if C::MAX_INSERT_LEN > 0 && out_span >= 5 && match_end - 2 > hit_pos {
+                            if let Some(ts) =
+                                BoundedSlice::<u8, 8>::new_at_offset(trawl_data, match_end - 2)
+                            {
+                                let tw = u64::from_le_bytes(
+                                    *ts.get_array::<8, 0>(BoundedUsize::<0>::MAX),
+                                );
+                                let vp2 = vpos_base.wrapping_add(match_end - 2) as u32;
+                                let (th, tsec, tp32) = compute_hashes_8b_p32::<LOG, TM>(tw);
+                                if out_span >= 8 {
+                                    $self.insert_one(th, vp2, tsec);
+                                }
+                                ht4_near_slot(t4, tp32)
+                                    .insert_portable(vp2, tp32 << HT4_NEAR_LOG);
+                            }
+                        }
+                        if C::USE_LAST_DISTANCES && !is_sd && pos + 4 < end {
+                            let d0 = last_distances[0];
+                            if d0 != 0 && d0 <= eff_w32 && (d0 as usize) <= pos {
+                                let x = load_u64_inbounds(trawl_data, pos + 1)
+                                    ^ load_u64_inbounds(trawl_data, pos + 1 - d0 as usize);
+                                let d0_off = if (x & 0xFFFF_FFFF) == 0 {
+                                    1
+                                } else if ((x >> 8) & 0xFFFF_FFFF) == 0 {
+                                    2
+                                } else if ((x >> 16) & 0xFFFF_FFFF) == 0 {
+                                    3
+                                } else if ((x >> 24) & 0xFFFF_FFFF) == 0 {
+                                    4
+                                } else {
+                                    0
+                                };
+                                if d0_off != 0 {
+                                    let w0 = load_u64_inbounds(trawl_data, pos);
+                                    let vp0 = vpos_base.wrapping_add(pos) as u32;
+                                    let (mh, ms, mp32) = compute_hashes_8b_p32::<LOG, TM>(w0);
+                                    $self.insert_one(mh, vp0, ms);
+                                    ht4_near_slot(t4, mp32)
+                                        .insert_portable(vp0, mp32 << HT4_NEAR_LOG);
+                                    let p = pos + d0_off;
+                                    let d = load_u64_inbounds(trawl_data, p - d0 as usize)
+                                        ^ load_u64_inbounds(trawl_data, p);
+                                    pending_d0 = Some((p, d));
+                                }
+                            }
+                        }
+                    }
+                    $self.ht4_near = Some(ht4_box);
+                    ($state.anchor, $state.last_distances) = (anchor, last_distances);
+                    return;
+                }
+
+                let $eff_w0 = eff_wsize;
+                let $vwsize = $setup_vwsize;
+                let mut dists = [0u32; 32];
+                let d_len = if HAS_DICT { active_dict.len() } else { 0 };
                 let mut pos = slice_start;
                 while pos < end {
-                    let Some(ds) = BoundedSlice::<_, INTERIOR_MARGIN>::new_at_offset(data, pos) else {
+                    let Some(ds) = BoundedSlice::<_, INTERIOR_MARGIN>::new_at_offset(data, pos)
+                    else {
                         break;
                     };
                     let word64 = u64::from_le_bytes(*ds.get_array::<8, 0>(BoundedUsize::<0>::MAX));
-                    let (hash_idx, sec_hash) = compute_hashes_for::<LOG, TM, C>(word64);
+                    let pos_8_16 =
+                        u64::from_le_bytes(*ds.get_array::<8, 8>(BoundedUsize::<8>::MAX));
+                    let (hash_idx, sec_hash, p32) = compute_hashes_8b_p32::<LOG, TM>(word64);
                     {
                         let $ds_pf = ds;
                         $prefetch_block
                     }
                     let vpos = vpos_base.wrapping_add(pos) as u32;
-                    let dist = $self.bucket_mut(hash_idx).search_and_insert_one(vpos, sec_hash, eff_wsize as u32);
-                    if dist != 0 {
-                        let cand = pos.wrapping_sub(dist as usize);
-                        if let Some(c16) = data.get(cand..).and_then(|s| s.first_chunk::<16>()) {
-                            let diff0 = u64::from_le_bytes(*c16.first_chunk::<8>().unwrap()) ^ word64;
-                            let mut blen = if diff0 != 0 {
-                                (diff0.trailing_zeros() >> 3) as usize
-                            } else {
-                                let p8 = u64::from_le_bytes(*ds.get_array::<8, 8>(BoundedUsize::<8>::MAX));
-                                let diff8 = u64::from_le_bytes(*c16.last_chunk::<8>().unwrap()) ^ p8;
-                                if diff8 != 0 {
-                                    8 + (diff8.trailing_zeros() >> 3) as usize
-                                } else {
-                                    $match16_fn(data, cand, pos)
+                    let mut mask = {
+                        let ($hi_s, $vp_s, $sh_s, $d_s) = (hash_idx, vpos, sec_hash, &mut dists);
+                        $search_expr
+                    };
+                    let d4 = $self.search_and_insert_ht4_near_p32(p32, vpos, eff_w32);
+                    let pctx = ProbeCtx {
+                        env: $env,
+                        anchor,
+                        pos,
+                        word64,
+                        last_distances,
+                    };
+                    let (
+                        mut best_dist,
+                        mut best_len,
+                        mut best_copy_len,
+                        mut best_gain,
+                        mut best_is_rep,
+                    ) = (0u32, 0u32, 0u32, 0i32, false);
+
+                    if C::USE_LAST_DISTANCES && pos.saturating_sub(anchor) < 14 {
+                        let max_valid_dist = (pos + d_len).min(wsize);
+                        macro_rules! fast_rep {
+                            ($k:literal) => {{
+                                let rep_dist = last_distances[$k];
+                                if !($k == 0 && pos == anchor)
+                                    && rep_dist != 0
+                                    && (rep_dist as usize) <= max_valid_dist
+                                {
+                                    let mlen = if !HAS_DICT || (rep_dist as usize) <= pos {
+                                        let cand = pos - rep_dist as usize;
+                                        if u32::from_le_bytes(*sub_array::<u8, 4>(data, cand))
+                                            == (word64 as u32)
+                                        {
+                                            match in_win_len(
+                                                data, cand, pos, word64, pos_8_16, best_len,
+                                            ) {
+                                                Some(n) => n,
+                                                None => $match16_fn(data, cand, pos) as u32,
+                                            }
+                                        } else {
+                                            0
+                                        }
+                                    } else {
+                                        pctx.cross_len::<true>(
+                                            rep_dist as usize,
+                                            best_len,
+                                            MAX_COPY_LEN,
+                                        )
+                                    };
+                                    if mlen >= 4 && mlen > best_len {
+                                        let g = if C::COST_MODEL_LEVEL >= 1 {
+                                            pctx.score::<C>(mlen, rep_dist)
+                                        } else {
+                                            1
+                                        };
+                                        if g > best_gain {
+                                            (
+                                                best_dist,
+                                                best_len,
+                                                best_copy_len,
+                                                best_gain,
+                                                best_is_rep,
+                                            ) = (rep_dist, mlen, mlen, g, true);
+                                            if mlen as usize >= C::NICE_LEN {
+                                                mask = 0;
+                                            }
+                                        }
+                                    }
                                 }
-                            };
-                            if blen >= C::MIN_MATCH_LEN && accept_onepass_match::<C, LARGE_WINDOW>(blen, dist, 0, 0) {
-                                let mp = extend_match_backward::<false>(
-                                    data, &[], pos, dist as usize, anchor.max(slice_start), &mut blen,
-                                );
-                                pos = emit!(mp, blen, blen as u32, dist, pos + 1);
+                            }};
+                        }
+                        fast_rep!(0);
+                        if (best_len as usize) < C::NICE_LEN {
+                            fast_rep!(1);
+                        }
+                    }
+
+                    while mask != 0 {
+                        let dist = dists[(mask.trailing_zeros() as usize) & 31];
+                        mask &= mask - 1;
+                        if dist == 0 {
+                            continue;
+                        }
+                        let du = dist as usize;
+                        let len = if !HAS_DICT || du <= pos {
+                            if !HAS_DICT && du > pos {
                                 continue;
+                            }
+                            let cand = pos - du;
+                            let Some(c16) = data.get(cand..).and_then(|s| s.first_chunk::<16>())
+                            else {
+                                continue;
+                            };
+                            if u64::from_le_bytes(*c16.first_chunk::<8>().unwrap()) != word64 {
+                                continue;
+                            }
+                            let diff8 =
+                                u64::from_le_bytes(*c16.last_chunk::<8>().unwrap()) ^ pos_8_16;
+                            if diff8 != 0 {
+                                8 + (diff8.trailing_zeros() >> 3)
+                            } else if best_len >= 16
+                                && !eq_chunk4(
+                                    data,
+                                    cand + best_len as usize - 3,
+                                    data,
+                                    pos + best_len as usize - 3,
+                                )
+                            {
+                                0
+                            } else {
+                                $match16_fn(data, cand, pos) as u32
+                            }
+                        } else {
+                            let l = pctx.cross_len::<true>(du, best_len.max(7), MAX_COPY_LEN);
+                            if l < 8 {
+                                continue;
+                            }
+                            l
+                        };
+                        if len > best_len {
+                            if C::COST_MODEL_LEVEL >= 1 {
+                                let g = pctx.score::<C>(len, dist);
+                                if g > best_gain {
+                                    (best_dist, best_len, best_copy_len, best_gain, best_is_rep) =
+                                        (dist, len, len, g, false);
+                                    if len as usize >= C::NICE_LEN {
+                                        break;
+                                    }
+                                }
+                            } else {
+                                let take = if best_len == 0 {
+                                    true
+                                } else if best_is_rep {
+                                    len >= best_len + 2 || (dist >> 4) <= best_dist
+                                } else {
+                                    len >= best_len + 2 || (dist >> 5) <= best_dist
+                                };
+                                if take {
+                                    (best_dist, best_len, best_copy_len, best_is_rep) =
+                                        (dist, len, len, false);
+                                    if len as usize >= C::NICE_LEN {
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
-                    pos += unmatched_step::<C>(pos - anchor);
-                }
-                $state.anchor = anchor;
-                return;
-            }
 
-            let $eff_w0 = eff_wsize;
+                    if best_len < 8 && d4 != 0 && d4 != best_dist {
+                        let du = d4 as usize;
+                        let len4 = if !HAS_DICT || du <= pos {
+                            if !HAS_DICT && du > pos {
+                                0
+                            } else {
+                                let cand = pos - du;
+                                match in_win_len(data, cand, pos, word64, pos_8_16, best_len) {
+                                    Some(n) => n,
+                                    None => $match16_fn(data, cand, pos) as u32,
+                                }
+                            }
+                        } else {
+                            pctx.cross_len::<true>(du, best_len, MAX_COPY_LEN)
+                        };
+                        if len4 >= 4
+                            && len4 > best_len
+                            && accept_fast_short_match::<LARGE_WINDOW>(
+                                len4 as usize,
+                                d4,
+                                max_d4,
+                                last_distances[0],
+                                last_distances[1],
+                            )
+                        {
+                            if C::COST_MODEL_LEVEL >= 1 {
+                                let g = pctx.score::<C>(len4, d4);
+                                if g > best_gain {
+                                    (best_dist, best_len, best_copy_len, best_gain, best_is_rep) =
+                                        (d4, len4, len4, g, false);
+                                }
+                            } else if best_len == 0 || !best_is_rep || len4 >= best_len + 2 {
+                                (best_dist, best_len, best_copy_len, best_is_rep) =
+                                    (d4, len4, len4, false);
+                            }
+                        }
+                    }
+
+                    if best_len <= 4 && pos < sd_pos_limit && pos - anchor < 4096 {
+                        if let Some(sd_tbl) = fast_sd {
+                            if let Some(sm) = static_dict::lookup_fast(
+                                sd_tbl,
+                                word64,
+                                p32,
+                                || pos_8_16 as u32,
+                                || {
+                                    let abs_pos = pos.saturating_add(stream_base);
+                                    let bd = (abs_pos.min(wsize) as u64)
+                                        + if HAS_DICT { $env.win.2 as u64 } else { 0 }
+                                        + 1;
+                                    Some((bd, sd_max_raw))
+                                },
+                                (model.lit_mult, model.explicit_cmd_off, STATIC_MIN_DICT_GAIN),
+                            ) {
+                                let take = if best_len == 0 {
+                                    true
+                                } else if C::COST_MODEL_LEVEL >= 1 {
+                                    sm.gain > best_gain
+                                } else {
+                                    !best_is_rep && sm.out_len >= 7
+                                };
+                                if take {
+                                    (best_dist, best_len, best_copy_len) = (
+                                        sm.raw_dist | STATIC_DICT_DIST_FLAG,
+                                        sm.out_len,
+                                        sm.base_len,
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    if best_dist != 0 {
+                        let (mut mp, mut elen, mut clen) = (pos, best_len as usize, best_copy_len);
+                        if !USE_SD || (best_dist & STATIC_DICT_DIST_FLAG) == 0 {
+                            mp = extend_match_backward::<HAS_DICT>(
+                                data,
+                                active_dict,
+                                pos,
+                                best_dist as usize,
+                                anchor.max(slice_start),
+                                &mut elen,
+                            );
+                            clen = elen as u32;
+                        }
+                        pos = emit!(mp, elen, clen, best_dist, pos + 1);
+                    } else {
+                        pos += unmatched_step::<C>(pos - anchor);
+                    }
+                }
+                ($state.anchor, $state.last_distances) = (anchor, last_distances);
+            } else {
+                let $eff_w0 = eff_wsize;
             let $vwsize = $setup_vwsize;
             let (mut lazy_pos, mut lazy, mut has_lazy) = (0usize, BestMatch::new::<C>(), false);
             let mut dists = [0u32; 32];
@@ -1459,7 +1951,9 @@ macro_rules! impl_parse_slice_interior {
                 }
                 let mut best = BestMatch::new::<C>();
 
-                if C::USE_LAST_DISTANCES {
+                if C::USE_LAST_DISTANCES
+                    && (!C::FAST_MATCHING || pos.saturating_sub(anchor) < 16)
+                {
                     let allow_sub4 = !C::FAST_MATCHING && !has_lazy && (1..10).contains(&pos.saturating_sub(anchor));
                     let max_valid_dist = (pos + d_len).min(wsize);
                     'rep: {
@@ -1615,6 +2109,7 @@ macro_rules! impl_parse_slice_interior {
                 let _ = emit!(lazy_pos, lazy.len as usize, lazy.copy_len, lazy.dist, pos);
             }
             ($state.anchor, $state.last_distances) = (anchor, last_distances);
+            }
         }
     };
 }
@@ -1636,12 +2131,21 @@ macro_rules! def_insert_positions {
                 if p == head_end {
                     p = p.max(ins_end.saturating_sub(tail));
                 }
-                if let Some(s) = data.get(p..).and_then(|s| s.first_chunk::<8>()) {
-                    let (w64, vp) = (u64::from_le_bytes(*s), vpos_base.wrapping_add(p) as u32);
-                    let (h_idx, sec_h) = compute_hashes_for::<LOG, TM, C>(w64);
-                    self.$ins(h_idx, vp, sec_h);
-                    if C::USE_6B_TABLE && (p < h6_end || p + tail >= ins_end) {
-                        let _ = self.step_ht6(w64, vp);
+                if let Some(bs) = BoundedSlice::<u8, 8>::new_at_offset(data, p) {
+                    let w64 = u64::from_le_bytes(*bs.get_array::<8, 0>(BoundedUsize::<0>::MAX));
+                    let vp = vpos_base.wrapping_add(p) as u32;
+                    if const { C::FAST_MATCHING } {
+                        let (h_idx, sec_h, p32) = compute_hashes_8b_p32::<LOG, TM>(w64);
+                        self.$ins(h_idx, vp, sec_h);
+                        if let Some(t4) = self.ht4_near.as_deref_mut() {
+                            ht4_near_slot(t4, p32).insert_portable(vp, p32 << HT4_NEAR_LOG);
+                        }
+                    } else {
+                        let (h_idx, sec_h) = compute_hashes_for::<LOG, TM, C>(w64);
+                        self.$ins(h_idx, vp, sec_h);
+                        if const { C::USE_6B_TABLE } && (p < h6_end || p + tail >= ins_end) {
+                            let _ = self.step_ht6(w64, vp);
+                        }
                     }
                 }
                 p += 1;
@@ -1659,6 +2163,7 @@ pub(crate) struct HashTable<
 > {
     pub(crate) table: BoxedHugePageArray<Buckets<POS_BITS, WAYS>, TS>,
     pub(crate) tags: Option<BoxedHugePageArray<TagWays<WAYS>, TS>>,
+    pub(crate) ht4_near: Option<Box<[Buckets<POS_BITS, 1>; HT4_NEAR_SIZE]>>,
     pub(crate) ht3: Option<Box<[u32; HT3_SIZE]>>,
     pub(crate) ht6: Option<BoxedHugePageArray<[u32; 4], HT6_SIZE>>,
     pub(crate) next_vpos: usize,
@@ -1674,13 +2179,14 @@ impl<
         const TM: usize,
     > HashTable<POS_BITS, WAYS, LOG, TS, TM>
 {
-    const USE_TAGS: bool = POS_BITS == 31 && WAYS > 1;
+    const USE_TAGS: bool = POS_BITS == 31;
 
     pub(crate) fn new() -> Self {
         const { assert!(LOG >= 10 && LOG <= 20 && TS == 1usize << LOG && TM == TS - 1) };
         HashTable {
             table: BoxedHugePageArray::new_zeroed(),
             tags: Self::USE_TAGS.then(BoxedHugePageArray::new_zeroed),
+            ht4_near: None,
             ht3: None,
             ht6: None,
             next_vpos: 0,
@@ -1705,6 +2211,32 @@ impl<
             .then_some(self.tags.as_mut())
             .flatten()
             .map(|t| BoundedSlice::new_from_equal_array_mut(t).get_mut(idx))
+    }
+
+    #[inline(always)]
+    pub(crate) fn insert_one(&mut self, idx: BoundedUsize<TM>, vpos: u32, sec_hash: u32) {
+        self.insert_at_portable(idx, vpos, sec_hash);
+    }
+
+    #[inline(always)]
+    pub(crate) fn search_and_insert_one(
+        &mut self,
+        idx: BoundedUsize<TM>,
+        vpos: u32,
+        sec_hash: u32,
+        eff_wsize: u32,
+    ) -> u32 {
+        let tag_ok = self
+            .tag_mut(idx)
+            .is_none_or(|t| t.search_and_insert_portable(sec_hash) != 0);
+        let d = self
+            .bucket_mut(idx)
+            .search_and_insert_one(vpos, sec_hash, eff_wsize);
+        if tag_ok {
+            d
+        } else {
+            0
+        }
     }
 
     #[inline(always)]
@@ -1761,6 +2293,35 @@ impl<
     }
 
     #[inline(always)]
+    pub(crate) fn ensure_ht4_near(&mut self) {
+        let _ = self
+            .ht4_near
+            .get_or_insert_with(|| Box::new([Buckets::new_zeroed(); HT4_NEAR_SIZE]));
+    }
+
+    #[inline(always)]
+    pub(crate) fn insert_ht4_near(&mut self, w4: u32, vpos: u32) {
+        if let Some(t4) = self.ht4_near.as_deref_mut() {
+            let p32 = w4.wrapping_mul(HASH_MUL32);
+            ht4_near_slot(t4, p32).insert_portable(vpos, p32 << HT4_NEAR_LOG);
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn search_and_insert_ht4_near_p32(
+        &mut self,
+        p32: u32,
+        vpos: u32,
+        eff_wsize: u32,
+    ) -> u32 {
+        ht4_near_slot(self.ht4_near.as_deref_mut().unwrap(), p32).search_and_insert_one(
+            vpos,
+            p32 << HT4_NEAR_LOG,
+            eff_wsize,
+        )
+    }
+
+    #[inline(always)]
     fn step_ht3(&mut self, word64: u64, vpos: u32) -> u32 {
         std::mem::replace(
             &mut self.ht3.as_deref_mut().unwrap()[compute_hash3(word64)],
@@ -1784,8 +2345,9 @@ impl<
         dirty_gap: usize,
         prefix_len: usize,
         input_len: usize,
-    ) -> usize {
+    ) -> (usize, bool) {
         let first_max = input_len.min(METABLOCK_SIZE + MAX_COPY_LEN);
+        let mut wrapped = false;
         if self.dirty
             && self.max_vpos_used + dirty_gap + prefix_len + first_max
                 > Buckets::<POS_BITS, WAYS>::MAX_VIRTUAL_POS
@@ -1794,6 +2356,9 @@ impl<
             if let Some(tags) = self.tags.as_mut() {
                 tags[..].fill(TagWays::new_zeroed());
             }
+            if let Some(t4) = self.ht4_near.as_deref_mut() {
+                t4.fill(Buckets::new_zeroed());
+            }
             if let Some(t3) = self.ht3.as_deref_mut() {
                 t3.fill(0);
             }
@@ -1801,13 +2366,16 @@ impl<
                 t6[..].fill([0; 4]);
             }
             self.max_vpos_used = 0;
+            wrapped = true;
         }
         self.dirty = true;
-        self.max_vpos_used + dirty_gap
+        (self.max_vpos_used + dirty_gap, wrapped)
     }
 
-    pub(crate) fn prepare_for_input(&mut self, wsize: usize, input_len: usize) {
-        self.next_vpos = self.reserve_vpos_start(wsize.min(input_len) + 1, 0, input_len);
+    pub(crate) fn prepare_for_input(&mut self, wsize: usize, input_len: usize) -> bool {
+        let (next, wrapped) = self.reserve_vpos_start(wsize.min(input_len) + 1, 0, input_len);
+        self.next_vpos = next;
+        wrapped
     }
 
     pub(crate) fn prepare_for_input_with_dict<C: MatchConfig>(
@@ -1815,7 +2383,7 @@ impl<
         wsize: usize,
         input_len: usize,
         dict: &PreparedDictionary,
-    ) {
+    ) -> bool {
         let ad = dict.active_slice(wsize);
         let d_len = ad.len();
         if d_len == 0 {
@@ -1823,8 +2391,19 @@ impl<
         }
         let eff_wsize = wsize.min(d_len.saturating_add(input_len));
         let gap = (eff_wsize + 1).saturating_sub(d_len).max(1);
-        let dv = self.reserve_vpos_start(gap, d_len, input_len);
+        let (dv, wrapped) = self.reserve_vpos_start(gap, d_len, input_len);
 
+        if C::FAST_MATCHING {
+            self.ensure_ht4_near();
+            if d_len >= 4 {
+                for off in d_len.saturating_sub(HT4_DICT_WINDOW)..=d_len - 4 {
+                    self.insert_ht4_near(
+                        u32::from_le_bytes(*sub_array::<u8, 4>(ad, off)),
+                        (dv + off) as u32,
+                    );
+                }
+            }
+        }
         if C::USE_3B_TABLE && d_len >= 3 {
             let _ = self.ht3.get_or_insert_with(|| Box::new([0u32; HT3_SIZE]));
             for off in d_len.saturating_sub(HT3_MAX_DIST as usize)..=d_len - 3 {
@@ -1853,6 +2432,7 @@ impl<
             }
         }
         (self.next_vpos, self.max_vpos_used) = (dv + d_len, dv + d_len);
+        wrapped
     }
 
     pub(crate) fn ensure_vpos_capacity(&mut self, eff_wsize: usize, block_len: usize) {
@@ -1861,6 +2441,9 @@ impl<
             if shift > 0 {
                 let s32 = shift as u32;
                 Buckets::shift_back_table(&mut self.table[..], s32);
+                if let Some(t4) = self.ht4_near.as_deref_mut() {
+                    Buckets::shift_back_table(t4, s32);
+                }
                 if let Some(t3) = self.ht3.as_deref_mut() {
                     t3.iter_mut().for_each(|s| *s = s.saturating_sub(s32));
                 }
@@ -1877,7 +2460,7 @@ impl<
 
     #[cfg(target_arch = "x86_64")]
     #[inline]
-    #[target_feature(enable = "sse")]
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
     pub(crate) fn prefetch_pos(&self, pos: BoundedUsize<TM>) {
         safe_x86_64::_mm_safe_prefetch::<_MM_HINT_ET0, _>(self.bucket(pos));
         if Self::USE_TAGS {
@@ -1905,7 +2488,7 @@ impl<
         fn parse_slice_interior_avx2(this, env, state, md, [_tok])
         setup: |vwsize, eff_w0| _mm256_set1_epi32(eff_w0 as i32);
         prefetch: |ds_pf| {
-            if const { TS * WAYS * 4 > 64 * 1024 } {
+            if const { TS * WAYS * 4 > 256 * 1024 } {
                 let pf_w = u64::from_le_bytes(
                     *ds_pf.get_array::<8, PREFETCH_OFFSET>(BoundedUsize::<PREFETCH_OFFSET>::MAX),
                 );
@@ -1955,6 +2538,7 @@ impl<
 
         while pos + 4 <= len_data {
             let word64 = load_word64_padded(&data[pos..]);
+            let vpos = vpos_base.wrapping_add(pos) as u32;
             let pctx = ProbeCtx {
                 env,
                 anchor,
@@ -1974,11 +2558,9 @@ impl<
             {
                 try_d(ld[0], &mut best);
             }
-            if pos + 5 <= len_data {
-                let ((h_idx, sec_h), vpos) = (
-                    compute_hashes_for::<LOG, TM, C>(word64),
-                    vpos_base.wrapping_add(pos) as u32,
-                );
+            let min_primary = C::PRIMARY_HASH_LEN.max(5);
+            if pos + min_primary <= len_data {
+                let (h_idx, sec_h) = compute_hashes_for::<LOG, TM, C>(word64);
                 let mut mask = self.search_and_insert_at_portable(
                     h_idx,
                     vpos,
@@ -1991,7 +2573,57 @@ impl<
                     mask &= mask - 1;
                 }
             }
-            if C::STATIC_DICT_LIMIT > 0 {
+            if const { C::FAST_MATCHING } {
+                let p32 = (word64 as u32).wrapping_mul(HASH_MUL32);
+                let d4 = self.search_and_insert_ht4_near_p32(p32, vpos, eff_wsize as u32);
+                if d4 != 0 {
+                    let mlen = pctx.cross_len::<HD>(d4 as usize, 0, MAX_COPY_LEN);
+                    if mlen >= 4
+                        && accept_fast_short_match::<LW>(
+                            mlen as usize,
+                            d4,
+                            env.model.max_d4.min(eff_wsize as u32),
+                            ld[0],
+                            ld[1],
+                        )
+                    {
+                        let _ = best.try_lz::<C>(mlen, d4, || pctx.score::<C>(mlen, d4));
+                    }
+                }
+                if const { C::STATIC_DICT_LIMIT > 0 }
+                    && best.len < 4
+                    && pos < C::STATIC_DICT_LIMIT.saturating_sub(env.stream_base)
+                    && pos - anchor < 4096
+                {
+                    let mr = if LW {
+                        MAX_ALLOWED_DISTANCE as u32
+                    } else {
+                        STD_MAX_RAW_STATIC_DIST
+                    };
+                    if let Some(sm) = static_dict::lookup_fast(
+                        static_dict::fast_dict(),
+                        word64,
+                        p32,
+                        || load_word64_padded(data.get(pos + 8..).unwrap_or(&[])) as u32,
+                        || {
+                            let abs_pos = pos.saturating_add(env.stream_base);
+                            let bd = (abs_pos.min(wsize) as u64)
+                                + if HD { env.win.2 as u64 } else { 0 }
+                                + 1;
+                            Some((bd, mr))
+                        },
+                        (
+                            env.model.lit_mult,
+                            env.model.explicit_cmd_off,
+                            STATIC_MIN_DICT_GAIN,
+                        ),
+                    )
+                    .filter(|sm| (sm.out_len as usize) <= len_data - pos)
+                    {
+                        pctx.finish_sd::<C>(&mut best, sm);
+                    }
+                }
+            } else if const { C::STATIC_DICT_LIMIT > 0 } {
                 probe_sd_with!(lookup_with_mode, C, HD, LW, &pctx, &mut best, true);
             }
             if best.dist != 0 {
@@ -2029,10 +2661,13 @@ impl<
             eff_wsize,
             (target_end - slice_start + MAX_COPY_LEN).min(data_len - slice_start),
         );
-        if C::USE_3B_TABLE {
+        if const { C::FAST_MATCHING } {
+            self.ensure_ht4_near();
+        }
+        if const { C::USE_3B_TABLE } {
             let _ = self.ht3.get_or_insert_with(|| Box::new([0u32; HT3_SIZE]));
         }
-        if C::USE_6B_TABLE && eff_wsize > 65_536 {
+        if const { C::USE_6B_TABLE } && eff_wsize > 65_536 {
             let _ = self.ht6.get_or_insert_with(BoxedHugePageArray::new_zeroed);
         }
         let (interior_end, vpos_base) = (

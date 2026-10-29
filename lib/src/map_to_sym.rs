@@ -13,10 +13,10 @@
 // limitations under the License.
 
 use crate::constants::*;
-#[cfg(target_arch = "x86_64")]
 use crate::huffman::HuffmanCodeEntry;
 #[cfg(target_arch = "x86_64")]
 use bounded_utils::{BoundedSlice, BoundedUsize};
+use lsb_bitwriter::BitStreamCursor;
 #[cfg(target_arch = "x86_64")]
 use safe_unaligned_simd::x86_64::{_mm256_loadu_si256, _mm256_storeu_si256, _mm_loadu_si128};
 #[cfg(target_arch = "x86_64")]
@@ -62,8 +62,8 @@ const COPY_CODE_SMALL: [u8; 134] = {
     t
 };
 
-const SHORT_D0_SYM: [u8; 7] = [8, 6, 4, 0, 5, 7, 9];
-const SHORT_D1_SYM: [u8; 7] = [14, 12, 10, 1, 11, 13, 15];
+pub(crate) const SHORT_D0_SYM: [u8; 7] = [8, 6, 4, 0, 5, 7, 9];
+pub(crate) const SHORT_D1_SYM: [u8; 7] = [14, 12, 10, 1, 11, 13, 15];
 
 /// Advances `[d0, d1, d2, d3]` after emitting an explicit non-static-dictionary distance `dist`.
 /// Per RFC 7932 Section 4, `dist_rb` is unchanged when `sc == 0` (`dist == ring[0]`).
@@ -106,7 +106,11 @@ pub(crate) fn copy_code_only(len: u32) -> usize {
 
 /// Computes `iac_sym` (`0..704`) directly from `(ins_code, copy_code, implicit_d0)`.
 #[inline(always)]
-pub(crate) fn iac_sym_from_codes(ins_code: usize, copy_code: usize, implicit_d0: bool) -> usize {
+pub(crate) const fn iac_sym_from_codes(
+    ins_code: usize,
+    copy_code: usize,
+    implicit_d0: bool,
+) -> usize {
     let bits64 = (copy_code & 0x7) | ((ins_code & 0x7) << 3);
     // Specification: 5 Encoding of ... (last table).
     // All values in specification are K * 64, where K = [2, 3, 6, 4, 5, 8, 7, 9, 10],
@@ -115,12 +119,31 @@ pub(crate) fn iac_sym_from_codes(ins_code: usize, copy_code: usize, implicit_d0:
     offset = (offset << 5) + 0x40 + ((0x520D40 >> offset) & 0xC0);
     let sym = offset | bits64;
     if implicit_d0 {
-        debug_assert!((128..256).contains(&sym));
+        debug_assert!(sym >= 128 && sym < 256);
         sym - 128
     } else {
         sym
     }
 }
+
+/// Deterministic extra-bit count (`INS_EXTRA[ins_code] + COPY_EXTRA[copy_code]`) for each IAC symbol `0..704`.
+pub(crate) const IAC_EXTRA_BITS: [u8; MAX_IAC] = {
+    let mut t = [0u8; MAX_IAC];
+    let mut ic = 0;
+    while ic < 24 {
+        let mut cc = 0;
+        while cc < 24 {
+            let eb = (INS_EXTRA[ic] + COPY_EXTRA[cc]) as u8;
+            t[iac_sym_from_codes(ic, cc, false)] = eb;
+            if ic < 8 && cc < 16 {
+                t[iac_sym_from_codes(ic, cc, true)] = eb;
+            }
+            cc += 1;
+        }
+        ic += 1;
+    }
+    t
+};
 
 /// Returns `(symbol, nbits, bits)` with explicit distance (`sym >= 128`).
 #[inline(always)]
@@ -340,6 +363,17 @@ pub(crate) fn insert_copy_len_to_sym_and_bits_simd<
 #[inline(always)]
 pub(crate) const fn dist_alphabet_size(npostfix: u8, ndirect: u8, large_window: bool) -> usize {
     16 + (ndirect as usize) + ((if large_window { 62usize } else { 24usize }) << (npostfix + 1))
+}
+
+/// Deterministic extra-bit count for RFC 7932 distance symbol `sym` under `(npostfix, ndirect)`.
+#[inline(always)]
+pub(crate) const fn dist_extra_bits(sym: usize, npostfix: u8, ndirect: u8) -> u32 {
+    let base = 16 + ndirect as usize;
+    if sym < base {
+        0
+    } else {
+        1 + (((sym - base) >> (npostfix + 1)) as u32)
+    }
 }
 
 /// Maximum legal distance symbol count (`BrotliMaxDistanceSymbol(ndirect, npostfix)` in Large
@@ -582,6 +616,103 @@ pub(crate) fn unpack_even_odd_huff_avx2(
             _mm256_andnot_si256(mask_lo, h_odd),
         ),
     )
+}
+
+#[inline(always)]
+pub(crate) fn pack_huff_extra(h: HuffmanCodeEntry, eb_len: u8, eb: u64) -> (usize, u64) {
+    (
+        usize::from(h.len + u16::from(eb_len)),
+        u64::from(h.bits) | (eb << h.len),
+    )
+}
+
+#[inline(always)]
+pub(crate) fn put_pair(
+    cur: &mut BitStreamCursor<'_, '_>,
+    nb1: usize,
+    b1: u64,
+    nb2: usize,
+    b2: u64,
+) {
+    if nb1 < 64 && nb1 + nb2 <= 64 {
+        cur.put(nb1 + nb2, b1 | (b2 << nb1));
+    } else {
+        cur.put(nb1, b1);
+        cur.put(nb2, b2);
+    }
+}
+
+#[inline(always)]
+pub(crate) fn put_triple(
+    cur: &mut BitStreamCursor<'_, '_>,
+    nb1: usize,
+    b1: u64,
+    nb2: usize,
+    b2: u64,
+    nb3: usize,
+    b3: u64,
+) {
+    let nb12 = nb1 + nb2;
+    if nb1 < 64 && nb12 <= 64 {
+        let b12 = b1 | (b2 << nb1);
+        if nb12 < 64 && nb12 + nb3 <= 64 {
+            cur.put(nb12 + nb3, b12 | (b3 << nb12));
+        } else {
+            cur.put(nb12, b12);
+            cur.put(nb3, b3);
+        }
+    } else {
+        cur.put(nb1, b1);
+        put_pair(cur, nb2, b2, nb3, b3);
+    }
+}
+
+#[inline(always)]
+pub(crate) fn pack_lits_1_to_4(s: &[u8], lut: &[HuffmanCodeEntry; 256]) -> (usize, u64) {
+    let e0 = lut[s[0] as usize];
+    let (mut nb, mut b) = (e0.len as usize, e0.bits as u64);
+    for &byte in &s[1..] {
+        let e = lut[byte as usize];
+        b |= (e.bits as u64) << nb;
+        nb += e.len as usize;
+    }
+    (nb, b)
+}
+
+#[inline(always)]
+pub(crate) fn emit_literals_scalar(
+    slice: &[u8],
+    lut: &[HuffmanCodeEntry; 256],
+    cur: &mut BitStreamCursor<'_, '_>,
+) {
+    let (quads, rem) = slice.as_chunks::<4>();
+    for q in quads {
+        let (nb, b) = pack_lits_1_to_4(q, lut);
+        cur.put(nb, b);
+    }
+    if !rem.is_empty() {
+        let (nb, b) = pack_lits_1_to_4(rem, lut);
+        cur.put(nb, b);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
+pub(crate) fn emit_literals_avx2(
+    slice: &[u8],
+    lut: &[HuffmanCodeEntry; 256],
+    cur: &mut BitStreamCursor<'_, '_>,
+) {
+    let (chunks, rem) = slice.as_chunks::<16>();
+    cur.put_quad_foreach(chunks.iter(), |c16| {
+        let (nb16, b16) = unpack_even_odd_huff_avx2(
+            std::array::from_fn(|k| lut[c16[2 * k] as usize]),
+            std::array::from_fn(|k| lut[c16[2 * k + 1] as usize]),
+        );
+        pack_16x16_to_4x64_avx2(nb16, b16)
+    });
+    emit_literals_scalar(rem, lut, cur);
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]

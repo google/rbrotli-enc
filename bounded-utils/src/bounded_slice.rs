@@ -83,8 +83,9 @@ impl<T, const LOWER_BOUND: usize> BoundedSlice<T, LOWER_BOUND> {
 
     #[inline(always)]
     pub fn new_at_offset(slice: &[T], offset: usize) -> Option<&BoundedSlice<T, LOWER_BOUND>> {
-        if offset <= slice.len() && slice.len() - offset >= LOWER_BOUND {
-            // SAFETY: `offset <= slice.len()` and `(slice.len() - offset) >= LOWER_BOUND`.
+        if slice.len() >= LOWER_BOUND && offset <= slice.len() - LOWER_BOUND {
+            // SAFETY: `slice.len() >= LOWER_BOUND` and `offset <= slice.len() - LOWER_BOUND`
+            // imply `offset <= slice.len()` and `slice.len() - offset >= LOWER_BOUND`.
             Some(unsafe { &*(slice.split_at_unchecked(offset).1 as *const [T] as *const Self) })
         } else {
             None

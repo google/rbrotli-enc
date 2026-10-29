@@ -388,35 +388,33 @@ pub struct BitStreamCursor<'a, 'b> {
     bytes_written: usize,
 }
 
+#[inline(always)]
+fn check_quad_bounds_inline(
+    bytes_written: usize,
+    bits_in_buffer: usize,
+    buf_len: usize,
+    counts: [u64; 4],
+) {
+    let (mut bib, mut bw) = (bits_in_buffer, bytes_written);
+    for c in counts {
+        assert!(bw + 8 <= buf_len);
+        let total = bib + c as usize;
+        bib = total & 63;
+        bw += (total & 64) >> 3;
+    }
+    assert!(bw + (bib >> 3) <= buf_len);
+}
+
 impl<'a, 'b> BitStreamCursor<'a, 'b> {
-    #[cold]
-    #[inline(never)]
-    fn check_put_slow(&self, count: usize) {
-        let final_bytes = self.bytes_written + ((self.bits_in_buffer + count) >> 3);
-        assert!(self.bytes_written + 8 <= self.buf_len && final_bytes <= self.buf_len);
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn check_put_quad_slow(&self, counts: [u64; 4]) {
-        let (mut bib, mut bw) = (self.bits_in_buffer, self.bytes_written);
-        for c in counts {
-            assert!(bw + 8 <= self.buf_len);
-            let total = bib + c as usize;
-            bib = total & 63;
-            bw += (total & 64) >> 3;
-        }
-        assert!(bw + (bib >> 3) <= self.buf_len);
-    }
-
     /// Writes `count` (`0..=64`) LSB-first bits from `bits` (`bits` must have upper bits zeroed).
     #[inline(always)]
     pub fn put(&mut self, count: usize, bits: u64) {
         assert!(count <= 64);
         if (self.bytes_written as isize) > self.safe_end {
-            self.check_put_slow(count);
+            let final_bytes = self.bytes_written + ((self.bits_in_buffer + count) >> 3);
+            assert!(self.bytes_written + 8 <= self.buf_len && final_bytes <= self.buf_len);
         }
-        // SAFETY: Either `self.bytes_written + 15 <= self.buf_len` (fast path) or `check_put_slow`
+        // SAFETY: Either `self.bytes_written + 15 <= self.buf_len` (fast path) or the slow check
         // verified `self.bytes_written + 8 <= self.buf_len` and `final_bytes <= self.buf_len`.
         unsafe {
             push_upto64_raw(
@@ -435,11 +433,16 @@ impl<'a, 'b> BitStreamCursor<'a, 'b> {
     pub fn put_quad(&mut self, counts: [u64; 4], bits: [u64; 4]) {
         assert!(counts[0] <= 64 && counts[1] <= 64 && counts[2] <= 64 && counts[3] <= 64);
         if (self.bytes_written as isize) > self.safe_end_quad {
-            self.check_put_quad_slow(counts);
+            check_quad_bounds_inline(
+                self.bytes_written,
+                self.bits_in_buffer,
+                self.buf_len,
+                counts,
+            );
         }
         for k in 0..4 {
             // SAFETY: Either `self.bytes_written + 39 <= self.buf_len` (fast path) or
-            // `check_put_quad_slow` verified all four 8-byte stores and `Drop` carry bytes fit.
+            // `check_quad_bounds_inline` verified all four 8-byte stores and `Drop` carry fit.
             unsafe {
                 push_upto64_raw(
                     self.out_ptr,
@@ -451,6 +454,44 @@ impl<'a, 'b> BitStreamCursor<'a, 'b> {
                 );
             }
         }
+    }
+
+    /// Writes 4 `(count, bits)` pairs (`count <= 64` each) per item in `iter` while holding
+    /// cursor state in scalar registers across the loop.
+    #[inline(always)]
+    pub fn put_quad_foreach<F, ITER, T>(&mut self, iter: ITER, f: F)
+    where
+        F: Fn(T) -> ([u64; 4], [u64; 4]),
+        ITER: Iterator<Item = T> + GuaranteedSizeIterator,
+    {
+        let (out_ptr, safe_end_quad, buf_len) = (self.out_ptr, self.safe_end_quad, self.buf_len);
+        let (mut bit_buffer, mut bits_in_buffer, mut bytes_written) =
+            (self.bit_buffer, self.bits_in_buffer, self.bytes_written);
+        for t in iter {
+            let (counts, bits) = f(t);
+            if (bytes_written as isize) > safe_end_quad {
+                assert!(counts[0] <= 64 && counts[1] <= 64 && counts[2] <= 64 && counts[3] <= 64);
+                check_quad_bounds_inline(bytes_written, bits_in_buffer, buf_len, counts);
+            }
+            for k in 0..4 {
+                let c = counts[k];
+                assert!(c <= 64);
+                // SAFETY: `c <= 64`, and either `bytes_written + 39 <= buf_len` (fast path) or
+                // `check_quad_bounds_inline` verified all four 8-byte stores and `Drop` carry fit.
+                unsafe {
+                    push_upto64_raw(
+                        out_ptr,
+                        &mut bit_buffer,
+                        &mut bits_in_buffer,
+                        &mut bytes_written,
+                        c as usize,
+                        bits[k],
+                    );
+                }
+            }
+        }
+        (self.bit_buffer, self.bits_in_buffer, self.bytes_written) =
+            (bit_buffer, bits_in_buffer, bytes_written);
     }
 }
 
@@ -469,6 +510,9 @@ impl Drop for BitStreamCursor<'_, '_> {
         }
     }
 }
+
+// SAFETY: `core::slice::Iter` always yields exact `len()` elements.
+unsafe impl<T> GuaranteedSizeIterator for slice::Iter<'_, T> {}
 
 #[cfg(feature = "bounded-utils")]
 use bounded_utils::{BoundedIterable, BoundedIterator};

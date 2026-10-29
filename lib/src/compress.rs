@@ -32,8 +32,8 @@ use crate::{
     },
     huffman::{ContextMap, HuffmanCode, HuffmanCodeEntry},
     map_to_sym::{
-        dist_alphabet_size, distance_to_sym_and_bits_with_ring, insert_copy_len_to_sym_and_bits,
-        match_short_dist_code, push_last_distance,
+        dist_alphabet_size, dist_extra_bits, distance_to_sym_and_bits_with_ring,
+        insert_copy_len_to_sym_and_bits, match_short_dist_code, push_last_distance, IAC_EXTRA_BITS,
     },
     metablock::{
         self, write_empty_last_metablock, write_uncompressed_metablock, write_window_bits,
@@ -45,7 +45,7 @@ use crate::{
 #[cfg(target_arch = "x86_64")]
 use bounded_utils::{BoundedIterable, BoundedSlice, BoundedUsize};
 use hugepage_buffer::BoxedHugePageArray;
-use lsb_bitwriter::{BitWriter, BitWriterCheckpoint};
+use lsb_bitwriter::{BitStreamCursor, BitWriter, BitWriterCheckpoint};
 #[cfg(target_arch = "x86_64")]
 use safe_unaligned_simd::x86_64::{_mm256_loadu_si256, _mm256_storeu_si256, _mm_loadu_si128};
 #[cfg(target_arch = "x86_64")]
@@ -93,7 +93,7 @@ impl HistogramBuffers {
 /// Counts byte frequencies using 4 independent `[u32; 256]` banks to eliminate store-to-load
 /// forwarding stalls on runs of repeated or low-entropy bytes.
 #[inline(always)]
-fn count_literals_x4(lits: &[u8], out: &mut [u32; MAX_LIT]) {
+pub(crate) fn count_literals_x4(lits: &[u8], out: &mut [u32; MAX_LIT]) {
     if lits.len() < 64 {
         out.fill(0);
         for &b in lits {
@@ -640,15 +640,18 @@ impl_metablock_data!({
         count: u32,
         cmap_luts: &[__m128i; 4],
     ) {
+        if count == 0 {
+            return;
+        }
         let tail = self.record_bulk_lit_span(count);
         if tail == 0 {
             return;
         }
+        debug_assert!(self.num_syms.get() + tail as usize <= SYM_LIMIT);
         let literals = BoundedSlice::new_from_equal_array(&self.literals);
         let lit_ctxs = Self::lit_ctx_bounded::<MULTI_CTX>(&self.lit_ctx);
         let syms = BoundedSlice::new_from_equal_array_mut(&mut self.symbol_or_nbits);
         let off = _mm256_set1_epi16((LIT_BASE + SYMBOL_MASK) as i16);
-        debug_assert!(self.num_syms.get() + tail as usize <= SYM_LIMIT);
         for (lit_pos, sym_pos) in <(BoundedUsize<MAX_MB>, BoundedUsize<SYM_LIMIT>)>::iter(
             (self.iac_literals as usize, self.num_syms.get()),
             tail.div_ceil(16) as usize,
@@ -710,47 +713,57 @@ impl_metablock_data!({
         debug_assert!(ICD_LIMIT >= total_icd);
         let mut ring = self.dist_ring;
         for i in BoundedUsize::<ICD_LIMIT>::iter(0, total_icd.div_ceil(8), 8) {
-            let ins_bs = BoundedSlice::new_from_equal_array(&self.insert_len);
-            let copy_bs = BoundedSlice::new_from_equal_array(&self.copy_len);
-            insert_copy_len_to_sym_and_bits_simd::<TWO_DIST_CTX, ICD_BUF, ICD_LIMIT>(
-                ins_bs, copy_bs, i, &mut bufs,
-            );
             let limit = (total_icd - i.get()).min(8);
-            let dist_slice =
-                BoundedSlice::new_from_equal_array(&self.distance).get_array::<8, ICD_LIMIT>(i);
-            let v_raw = _mm256_loadu_si256(dist_slice);
-            let prev = _mm_setr_epi32(
-                ring[3] as i32,
-                ring[2] as i32,
-                ring[1] as i32,
-                ring[0] as i32,
-            );
-            let (lo, hi) = (
-                _mm256_castsi256_si128(v_raw),
-                _mm256_extracti128_si256::<1>(v_raw),
-            );
-            let cand_d0 = _mm256_set_m128i(
-                _mm_alignr_epi8::<12>(hi, lo),
-                _mm_alignr_epi8::<12>(lo, prev),
-            );
-            let skip = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_or_si256(
-                v_raw,
-                _mm256_cmpeq_epi32(v_raw, cand_d0),
-            )));
-            let vd = if limit == 8 && skip == 0 {
-                ring = [dist_slice[7], dist_slice[6], dist_slice[5], dist_slice[4]];
-                [
-                    cand_d0,
-                    _mm256_set_m128i(_mm_alignr_epi8::<8>(hi, lo), _mm_alignr_epi8::<8>(lo, prev)),
-                    _mm256_set_m128i(_mm_alignr_epi8::<4>(hi, lo), _mm_alignr_epi8::<4>(lo, prev)),
-                    _mm256_set_m128i(lo, prev),
-                ]
-            } else {
-                step_dist_ring_batch(dist_slice, limit, &mut ring)
-                    .map(|arr| _mm256_loadu_si256(&arr))
+            let ins_batch = {
+                let ins_bs = BoundedSlice::new_from_equal_array(&self.insert_len);
+                let copy_bs = BoundedSlice::new_from_equal_array(&self.copy_len);
+                insert_copy_len_to_sym_and_bits_simd::<TWO_DIST_CTX, ICD_BUF, ICD_LIMIT>(
+                    ins_bs, copy_bs, i, &mut bufs,
+                );
+                let dist_slice =
+                    BoundedSlice::new_from_equal_array(&self.distance).get_array::<8, ICD_LIMIT>(i);
+                let v_raw = _mm256_loadu_si256(dist_slice);
+                let prev = _mm_setr_epi32(
+                    ring[3] as i32,
+                    ring[2] as i32,
+                    ring[1] as i32,
+                    ring[0] as i32,
+                );
+                let (lo, hi) = (
+                    _mm256_castsi256_si128(v_raw),
+                    _mm256_extracti128_si256::<1>(v_raw),
+                );
+                let cand_d0 = _mm256_set_m128i(
+                    _mm_alignr_epi8::<12>(hi, lo),
+                    _mm_alignr_epi8::<12>(lo, prev),
+                );
+                let skip = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_or_si256(
+                    v_raw,
+                    _mm256_cmpeq_epi32(v_raw, cand_d0),
+                )));
+                let vd = if limit == 8 && skip == 0 {
+                    ring = [dist_slice[7], dist_slice[6], dist_slice[5], dist_slice[4]];
+                    [
+                        cand_d0,
+                        _mm256_set_m128i(
+                            _mm_alignr_epi8::<8>(hi, lo),
+                            _mm_alignr_epi8::<8>(lo, prev),
+                        ),
+                        _mm256_set_m128i(
+                            _mm_alignr_epi8::<4>(hi, lo),
+                            _mm_alignr_epi8::<4>(lo, prev),
+                        ),
+                        _mm256_set_m128i(lo, prev),
+                    ]
+                } else {
+                    step_dist_ring_batch(dist_slice, limit, &mut ring)
+                        .map(|arr| _mm256_loadu_si256(&arr))
+                };
+                distance_to_sym_and_bits_simd::<TWO_DIST_CTX>(
+                    vd, v_raw, npostfix, ndirect, &mut bufs,
+                );
+                *ins_bs.get_array::<8, ICD_LIMIT>(i)
             };
-            distance_to_sym_and_bits_simd::<TWO_DIST_CTX>(vd, v_raw, npostfix, ndirect, &mut bufs);
-            let ins_batch = *ins_bs.get_array::<8, ICD_LIMIT>(i);
             for (ii, &num_lits) in ins_batch[..limit].iter().enumerate() {
                 let (raw_iac, dist_off) = (bufs.iac_sym[ii] as u16, bufs.dist_sym[ii]);
                 let dist_base = dist_off
@@ -804,16 +817,16 @@ impl_metablock_data!({
     #[cfg(target_arch = "x86_64")]
     #[inline]
     #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
-    fn emit_sym_range_avx2(&self, bw: &mut BitWriter, start: usize, end: usize) {
+    fn emit_sym_range_avx2(&self, cur: &mut BitStreamCursor<'_, '_>, start: usize, end: usize) {
         if start >= end {
             return;
         }
-        let get_sym_mask = _mm256_set1_epi16(!SYMBOL_MASK as i16);
         const _: () = assert!(SYMBOL_MASK == 0x8000 && HISTOGRAM_BUF_SIZE == 0x2000);
+        let get_sym_mask = _mm256_set1_epi16(!SYMBOL_MASK as i16);
         let huff_slice = BoundedSlice::<_, HISTOGRAM_BUF_SIZE>::new_from_array(&self.histogram_buf);
         let chunks = (end - start) / 16;
         if chunks != 0 {
-            bw.write_foreach(BoundedUsize::<SYM_LIMIT>::iter(start, chunks, 16), |i| {
+            cur.put_quad_foreach(BoundedUsize::<SYM_LIMIT>::iter(start, chunks, 16), |i| {
                 let sym_arr = BoundedSlice::new_from_equal_array(&self.symbol_or_nbits)
                     .get_array::<16, SYM_LIMIT>(i);
                 let sym_or_nbits = _mm256_loadu_si256(sym_arr);
@@ -829,14 +842,25 @@ impl_metablock_data!({
                 pack_16x16_to_4x64_avx2(nbits, bits)
             });
         }
-        for i in start + chunks * 16..end {
-            let s = self.symbol_or_nbits[i];
-            if (s & SYMBOL_MASK) != 0 {
-                let h = self.histogram_buf[(s & !SYMBOL_MASK) as usize];
-                bw.write(h.len as usize, h.bits as u64);
+        let entry = |idx: usize| -> (usize, u64) {
+            let sym = self.symbol_or_nbits[idx];
+            if (sym & SYMBOL_MASK) != 0 {
+                let h = self.histogram_buf[(sym & !SYMBOL_MASK) as usize];
+                (h.len as usize, h.bits as u64)
             } else {
-                bw.write(s as usize, self.bits[i] as u64);
+                (sym as usize, self.bits[idx] as u64)
             }
+        };
+        let mut i = start + chunks * 16;
+        while i + 3 <= end {
+            let ((n0, b0), (n1, b1), (n2, b2)) = (entry(i), entry(i + 1), entry(i + 2));
+            let n01 = n0 + n1;
+            cur.put(n01 + n2, b0 | (b1 << n0) | (b2 << n01));
+            i += 3;
+        }
+        for idx in i..end {
+            let (n, b) = entry(idx);
+            cur.put(n, b);
         }
     }
 
@@ -849,6 +873,7 @@ impl_metablock_data!({
         cmap: &[u8; 64],
         _token: impl SimdToken,
     ) {
+        let mut cur = bw.cursor();
         let mut sym_cur = 0usize;
         if !self.lit_spans.is_empty() {
             let cmap_luts = Self::cmap_luts_avx2(MULTI_CTX, cmap);
@@ -858,10 +883,10 @@ impl_metablock_data!({
             let lit_ctxs = Self::lit_ctx_bounded::<MULTI_CTX>(&self.lit_ctx);
             for &span in &self.lit_spans {
                 let sym_end = span.sym_pos as usize;
-                self.emit_sym_range_avx2(bw, sym_cur, sym_end);
+                self.emit_sym_range_avx2(&mut cur, sym_cur, sym_end);
                 sym_cur = sym_end;
                 let n_chunks = (span.lit_bulk / 16) as usize;
-                bw.write_foreach(
+                cur.put_quad_foreach(
                     BoundedUsize::<MAX_MB>::iter(span.lit_start as usize, n_chunks, 16),
                     |idx| {
                         let (nbits, bits) = if let Some(ctxs_slice) = lit_ctxs {
@@ -884,7 +909,7 @@ impl_metablock_data!({
                 );
             }
         }
-        self.emit_sym_range_avx2(bw, sym_cur, self.num_syms.get());
+        self.emit_sym_range_avx2(&mut cur, sym_cur, self.num_syms.get());
     }
 
     #[inline(never)]
@@ -1035,12 +1060,12 @@ impl_metablock_data!({
         (cp, single_bits, saved_ring): (BitWriterCheckpoint, u64, [u32; 4]),
         (trailing_literals, npostfix, ndirect): (u32, u8, u8),
         (full_data, mb_start, mb_end): (&[u8], usize, usize),
-    ) {
+    ) -> bool {
         if !C::CTX_BLOCK_SPLIT
             || self.static_out.is_empty()
             || !self.has_multi_regime_signal(mb_end - mb_start)
         {
-            return;
+            return false;
         }
         let total_icd = self.total_icd as usize;
         let mut cmds = Vec::with_capacity(total_icd);
@@ -1099,8 +1124,10 @@ impl_metablock_data!({
                     bw,
                 );
                 self.dist_ring = ring;
+                return true;
             }
         }
+        false
     }
 
     fn prepare_lit_clusters<C: MatchConfig>(
@@ -1145,7 +1172,7 @@ impl_metablock_data!({
         clusters: Option<&mut [LiteralHistogram]>,
         cmap: &[u8; 64],
         bw: &mut BitWriter,
-    ) {
+    ) -> u64 {
         let HistogramBuffers {
             ref iac_hist,
             ref mut dist_hist,
@@ -1156,6 +1183,13 @@ impl_metablock_data!({
         let (iac_dist_buf, mut lit_buf) = self.histogram_buf.split_at_mut(LIT_BASE as usize);
         let (iac_slot, dist_area) = iac_dist_buf.split_at_mut(DIST_BASE as usize);
         let (_, iac_code) = HuffmanCode::from_counts(&iac_hist[..MAX_IAC], 15, iac_slot);
+        let mut payload_bits = 0u64;
+        for (sym, &cnt) in iac_hist[..MAX_IAC].iter().enumerate() {
+            if cnt != 0 {
+                payload_bits +=
+                    (cnt as u64) * (iac_code.code[sym].len as u64 + IAC_EXTRA_BITS[sym] as u64);
+            }
+        }
 
         let (d0_area, d1_area) = dist_area.split_at_mut(MAX_POSSIBLE_DIST_ALPHABET_SIZE);
         let mut dist_codes_arr = [HuffmanCode::default(), HuffmanCode::default()];
@@ -1173,12 +1207,34 @@ impl_metablock_data!({
             let (_, c0) = HuffmanCode::from_counts(&dist_hist[..dist_alpha], 15, d0_area);
             let h1 = &dist_hist[MAX_POSSIBLE_DIST_ALPHABET_SIZE..][..dist_alpha];
             dist_codes_arr = [c0, HuffmanCode::from_counts(h1, 15, d1_area).1];
+            for (hist, hc) in [
+                (&dist_hist[..dist_alpha], &dist_codes_arr[0]),
+                (h1, &dist_codes_arr[1]),
+            ] {
+                for (sym, &cnt) in hist.iter().enumerate() {
+                    if cnt != 0 {
+                        payload_bits += (cnt as u64)
+                            * (hc.code[sym].len as u64
+                                + dist_extra_bits(sym, npostfix, ndirect) as u64);
+                    }
+                }
+            }
             (2, [0, 0, 0, 1])
         } else {
-            if dist_hist[..dist_alpha].iter().sum::<u32>() == 0 {
+            let had_dist = dist_hist[..dist_alpha].iter().any(|&c| c != 0);
+            if !had_dist {
                 dist_hist[0] = 1;
             }
             let (_, c0) = HuffmanCode::from_counts(&dist_hist[..dist_alpha], 15, d0_area);
+            if had_dist {
+                for (sym, &cnt) in dist_hist[..dist_alpha].iter().enumerate() {
+                    if cnt != 0 {
+                        payload_bits += (cnt as u64)
+                            * (c0.code[sym].len as u64
+                                + dist_extra_bits(sym, npostfix, ndirect) as u64);
+                    }
+                }
+            }
             if C::TWO_DIST_CTX {
                 d1_area[..dist_alpha].copy_from_slice(c0.code);
             }
@@ -1190,10 +1246,17 @@ impl_metablock_data!({
             std::array::from_fn(|_| HuffmanCode::default());
         let lit_inputs = clusters.unwrap_or_else(|| std::slice::from_mut(lit_hist));
         for (idx, ch) in lit_inputs.iter_mut().enumerate() {
-            if ch.total == 0 {
+            let had_lits = ch.total != 0;
+            if !had_lits {
                 ch.data[0] = 1;
             }
             (lit_buf, lit_codes_arr[idx]) = HuffmanCode::from_counts(&ch.data, 15, lit_buf);
+            if had_lits {
+                let code = lit_codes_arr[idx].code;
+                for (sym, &cnt) in ch.data.iter().enumerate() {
+                    payload_bits += (cnt as u64) * (code[sym].len as u64);
+                }
+            }
         }
         let num_lit_codes = lit_inputs.len();
         metablock::Header {
@@ -1209,6 +1272,7 @@ impl_metablock_data!({
             ..Default::default()
         }
         .write(bw);
+        payload_bits
     }
 
     #[inline(never)]
@@ -1282,13 +1346,32 @@ impl_metablock_data!({
                 )
             }),
         }
-        self.build_codes_and_write_header::<C, LARGE_WINDOW>(
+        let payload_bits = self.build_codes_and_write_header::<C, LARGE_WINDOW>(
             (block_data.len(), npostfix, ndirect),
             histo_buf,
             multi_ctx.as_mut().map(|(c, _)| c.as_mut_slice()),
             &cmap,
             bw,
         );
+        let est_single_bits = (bw.total_bits() - start_bits) + payload_bits;
+        if block_data.len() >= 64 && (block_data.len() as u64) * 8 + 48 < est_single_bits {
+            bw.restore(cp);
+            self.dist_ring = saved_ring;
+            write_uncompressed_metablock(block_data, bw);
+            let uncomp_bits = bw.total_bits() - start_bits;
+            if !C::CTX_BLOCK_SPLIT
+                || !self.try_overwrite_multi_block::<C, LARGE_WINDOW>(
+                    bw,
+                    (cp, uncomp_bits, saved_ring),
+                    (trailing_literals, npostfix, ndirect),
+                    (full_data, mb_start, mb_end),
+                )
+            {
+                self.total_icd = 0;
+            }
+            return;
+        }
+
         match avx2_tok {
             #[cfg(target_arch = "x86_64")]
             Some(tok) => with_const_bool!(use_multi_ctx, |MC| {
@@ -1300,14 +1383,7 @@ impl_metablock_data!({
         }
 
         let single_bits = bw.total_bits() - start_bits;
-        if self.total_icd == 0
-            && block_data.len() >= 64
-            && (block_data.len() as u64) * 8 + 48 < single_bits
-        {
-            bw.restore(cp);
-            write_uncompressed_metablock(block_data, bw);
-            return;
-        }
+        debug_assert_eq!(single_bits, est_single_bits);
         if C::CTX_BLOCK_SPLIT {
             self.try_overwrite_multi_block::<C, LARGE_WINDOW>(
                 bw,
@@ -1534,6 +1610,9 @@ impl_encoder_internal!({
             (use_mb_hists.then_some(&self.mb_lit_hist), st.ctx_cursor),
             use_avx2,
         );
+        if C::USE_LAST_DISTANCES {
+            st.parse.last_distances = self.md.dist_ring;
+        }
         (st.mb_start, st.parse.anchor, st.ctx_cursor) = (flush_end, flush_end, 0);
         (st.mb_has_slice, st.need_ctx_mode) = (false, true);
     }
@@ -1801,7 +1880,17 @@ impl_encoder_internal!({
 
 #[inline]
 const fn max_two_pass_output_size(input_len: usize) -> usize {
-    input_len.saturating_mul(7).saturating_add(1024 + 8)
+    input_len
+        .saturating_add(input_len >> 10)
+        .saturating_add(8192)
+}
+
+#[inline]
+const fn checked_max_two_pass_output_size(input_len: usize) -> Option<usize> {
+    let Some(a) = input_len.checked_add(input_len >> 10) else {
+        return None;
+    };
+    a.checked_add(8192)
 }
 
 type OptDict<'a> = Option<&'a PreparedDictionary>;
@@ -1876,10 +1965,10 @@ macro_rules! def_q_configs {
 }
 
 def_q_configs! {
-    Q1Config = (true,  4, 1, 4, 0,  5,   2,  32,           0, false, 0, false, 0,                          false,  0, false);
-    Q2Config = (true,  4, 1, 4, 1,  6,   4,  64,           0, false, 0, false, STATIC_DICT_FAST_MAX_POS,   false,  0, false);
-    Q3Config = (true,  4, 1, 4, 1,  7,   8,  64,           0, true,  1, false, STATIC_DICT_FAST_MAX_POS,   false,  0, false);
-    Q4Config = (false, 4, 1, 4, 1, 99,  40,  64,        1536, true,  1, false, STATIC_DICT_MAX_POS,        false,  0, false);
+    Q1Config = (true,  8, 0, 4, 0,  5,   1,  32,           0, true,  0, false, STATIC_DICT_FAST_MAX_POS,   false,  0, false);
+    Q2Config = (true,  8, 0, 4, 0,  6,   2,  48,           0, true,  0, false, STATIC_DICT_FAST_MAX_POS,   false,  0, false);
+    Q3Config = (true,  8, 0, 4, 0,  7,   4,  48,           0, true,  1, false, STATIC_DICT_FAST_MAX_POS,   false,  0, false);
+    Q4Config = (false, 4, 1, 4, 1, 99,  12,  48,        1024, true,  1, false, STATIC_DICT_MAX_POS,        false,  0, false);
     Q5Config = (false, 4, 1, 4, 1, 99,  40,  96,        2048, true,  2, false, { 4 * STATIC_DICT_MAX_POS }, true,  4, false);
     Q6Config = (false, 4, 1, 4, 1, 99,  64, 128,        3072, true,  2, false, { 4 * STATIC_DICT_MAX_POS }, true,  6, false);
     Q7Config = (false, 4, 1, 4, 2, 99, 128, 224,  { i32::MAX }, true, 2, false, { 8 * STATIC_DICT_MAX_POS }, true, 8, false);
@@ -1968,7 +2057,7 @@ macro_rules! two_pass_tier {
 }
 
 macro_rules! op_tier {
-    ($head:ident, $lw:tt, $b_lw:tt, $log:literal) => {
+    ($head:ident, $b_lw:tt, $lw:tt, $log:literal) => {
         $head<{ if $b_lw { 31 } else { 25 } }, $lw, $log, { 1 << $log }, { (1 << $log) - 1 }>
     };
 }
@@ -1985,9 +2074,9 @@ macro_rules! make_q_tier {
             $w,
             $lw,
             tier_makers![
-                op_tier!(OnePassEncoder, $lw, false, $ls),
-                op_tier!(OnePassEncoder, $lw, false, $lm),
-                op_tier!(OnePassEncoder, $lw, false, $ll),
+                op_tier!(OnePassEncoder, false, $lw, $ls),
+                op_tier!(OnePassEncoder, false, $lw, $lm),
+                op_tier!(OnePassEncoder, false, $lw, $ll),
                 op_tier!(OnePassEncoder, $lw, $lw, $ll),
             ],
         )
@@ -2018,11 +2107,11 @@ macro_rules! make_q_stream {
 macro_rules! dispatch_q0_to_q9 {
     (@lw $cb:ident; $quality:expr, $w:expr, $lw:tt) => {
         match $quality {
-            0 => $cb!($w, $lw; ONEPASS 12, 14, 15),
-            1 => $cb!($w, $lw; Q1Config, 1, 13, 1, 15, (128, 18), 1, 16, (128, 18)),
+            0 => $cb!($w, $lw; ONEPASS 12, 13, 14),
+            1 => $cb!($w, $lw; Q1Config, 1, 13, 1, 14, (128, 18), 1, 15, (128, 18)),
             2 => $cb!($w, $lw; Q2Config, 4, 11, 4, 14, (128, 18), 4, 15, (128, 18)),
-            3 => $cb!($w, $lw; Q3Config, 4, 12, 8, 14, (256, 19), 8, 16, (256, 19)),
-            4 => $cb!($w, $lw; Q4Config, 8, 12, 8, 14, (256, 19), 8, 16, (256, 19)),
+            3 => $cb!($w, $lw; Q3Config, 4, 12, 4, 14, (256, 19), 8, 15, (256, 19)),
+            4 => $cb!($w, $lw; Q4Config, 4, 12, 8, 14, (256, 19), 8, 15, (256, 19)),
             5 => $cb!($w, $lw; Q5Config, 8, 12, 8, 15, (256, 19), 8, 16, (512, 20)),
             6 => $cb!($w, $lw; Q6Config, 8, 12, 8, 15, (256, 19), 16, 16, (512, 20)),
             7 => $cb!($w, $lw; Q7Config, 16, 13, 16, 16, (256, 19), 16, 17, (1024, 21)),
@@ -2100,7 +2189,7 @@ impl Encoder {
     fn checked_max_required_size(&self, input_len: usize) -> Option<usize> {
         let n = match self.quality {
             0 => onepass_checked_max_output_size(input_len)?,
-            1..=9 => input_len.checked_mul(7)?.checked_add(1024 + 8)?,
+            1..=9 => checked_max_two_pass_output_size(input_len)?,
             _ => input_len.checked_mul(2)?.checked_add(1024 + 64)?,
         };
         (n <= isize::MAX as usize).then_some(n)

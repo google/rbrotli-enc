@@ -233,46 +233,59 @@ pub(crate) struct Header<'a> {
 
 impl<'a> Header<'a> {
     pub(crate) fn write(&self, bw: &mut BitWriter) {
-        bw.write(1 + usize::from(self.islast), u64::from(self.islast));
         assert!(
             (1..=(1 << 24)).contains(&self.len),
             "invalid len {}",
             self.len
         );
         let mnibbles = usize::from(self.len > (1 << 16)) + usize::from(self.len > (1 << 20));
-        bw.write(
-            18 + 4 * mnibbles,
-            (mnibbles as u64) | (((self.len - 1) as u64) << 2),
-        );
-        if !self.islast {
-            bw.write(1, self.isuncompressed as u64);
+        let mlen_bits = (mnibbles as u64) | (((self.len - 1) as u64) << 2);
+        let mlen_nbits = 18 + 4 * mnibbles;
+        if self.islast {
+            assert!(!self.isuncompressed);
+            bw.write(2 + mlen_nbits, 1 | (mlen_bits << 2));
+        } else {
+            bw.write(
+                2 + mlen_nbits,
+                (mlen_bits << 1) | ((self.isuncompressed as u64) << (1 + mlen_nbits)),
+            );
             if self.isuncompressed {
                 bw.zero_pad_to_byte();
                 return;
             }
-        } else {
-            assert!(!self.isuncompressed);
         }
-        self.literals.write(bw);
-        self.insert_and_copy.write(bw);
-        self.distance.write(bw);
-        bw.write(2, self.npostfix as u64);
         assert!(self.npostfix <= 3);
         assert!(self.ndirect & ((1 << self.npostfix) - 1) == 0);
-        assert!((self.ndirect >> self.npostfix) < 16);
-        bw.write(4, (self.ndirect >> self.npostfix) as u64);
+        let ndir_code = (self.ndirect >> self.npostfix) as u64;
+        assert!(ndir_code < 16);
         assert_eq!(self.context_mode.len(), self.literals.num as usize);
-        for &cm in self.context_mode {
-            bw.write(2, cm as u64);
-        }
-        for (codes, cmap) in [
-            (self.literals_codes, &self.literals_cmap),
-            (self.distance_codes, &self.distance_cmap),
-        ] {
-            write_header_count(codes.len() as u64, bw);
-            if codes.len() >= 2 {
-                cmap.check(codes.len());
-                cmap.write(bw, codes.len());
+        if self.literals.num == 1
+            && self.insert_and_copy.num == 1
+            && self.distance.num == 1
+            && self.literals_codes.len() == 1
+            && self.distance_codes.len() == 1
+        {
+            let mid = ((self.npostfix as u64) << 3)
+                | (ndir_code << 5)
+                | ((self.context_mode[0] as u64) << 9);
+            bw.write(13, mid);
+        } else {
+            self.literals.write(bw);
+            self.insert_and_copy.write(bw);
+            self.distance.write(bw);
+            bw.write(6, (self.npostfix as u64) | (ndir_code << 2));
+            for &cm in self.context_mode {
+                bw.write(2, cm as u64);
+            }
+            for (codes, cmap) in [
+                (self.literals_codes, &self.literals_cmap),
+                (self.distance_codes, &self.distance_cmap),
+            ] {
+                write_header_count(codes.len() as u64, bw);
+                if codes.len() >= 2 {
+                    cmap.check(codes.len());
+                    cmap.write(bw, codes.len());
+                }
             }
         }
         debug_assert_eq!(

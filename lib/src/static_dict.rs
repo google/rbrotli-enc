@@ -478,6 +478,174 @@ fn apply_upper_rfc7932(dst: &mut [u8], word: &[u8], upper_all: bool) {
     }
 }
 
+pub(crate) const FAST_DICT_LOG2: usize = 12;
+pub(crate) const FAST_DICT_SLOTS: usize = 1 << FAST_DICT_LOG2;
+
+#[derive(Clone, Copy)]
+#[repr(C, align(16))]
+pub(crate) struct FastDictEntry {
+    w0: u64,
+    w1: u32,
+    meta: u32,
+}
+
+pub(crate) type FastDictTable = [FastDictEntry; FAST_DICT_SLOTS];
+
+fn expand_transform_rfc7932(
+    out: &mut [u8; 64],
+    base_len: usize,
+    word_idx: usize,
+    tid: usize,
+) -> usize {
+    let (pid, op, sid) = RAW_TRANSFORMS[tid];
+    let pfx = cstr_slice(pid);
+    let sfx = cstr_slice(sid);
+    let word = dict_word(base_len, word_idx);
+    let mut pos = pfx.len();
+    out[..pos].copy_from_slice(pfx);
+    match op {
+        0 => {
+            out[pos..pos + base_len].copy_from_slice(word);
+            pos += base_len;
+        }
+        1..=9 => {
+            let keep = base_len.saturating_sub(op as usize);
+            out[pos..pos + keep].copy_from_slice(&word[..keep]);
+            pos += keep;
+        }
+        10 | 11 => {
+            apply_upper_rfc7932(&mut out[pos..pos + base_len], word, op == 11);
+            pos += base_len;
+        }
+        12..=20 => {
+            let skip = (op - 11) as usize;
+            if base_len > skip {
+                let keep = base_len - skip;
+                out[pos..pos + keep].copy_from_slice(&word[skip..]);
+                pos += keep;
+            }
+        }
+        _ => unreachable!(),
+    }
+    out[pos..pos + sfx.len()].copy_from_slice(sfx);
+    pos + sfx.len()
+}
+
+pub(crate) fn fast_dict() -> &'static FastDictTable {
+    static FAST: OnceLock<Box<FastDictTable>> = OnceLock::new();
+    FAST.get_or_init(|| {
+        let mut table = Box::new(
+            [FastDictEntry {
+                w0: 0,
+                w1: 0,
+                meta: 0,
+            }; FAST_DICT_SLOTS],
+        );
+        let mut best_scores = [0u64; FAST_DICT_SLOTS];
+        let mut buf = [0u8; 64];
+
+        for (tid, &(pid, op, sid)) in RAW_TRANSFORMS.iter().enumerate() {
+            let aff_len = cstr_slice(pid).len() + cstr_slice(sid).len();
+            if aff_len > 8 {
+                continue;
+            }
+            let omit = match op {
+                1..=9 => op as usize,
+                12..=20 => (op - 11) as usize,
+                _ => 0,
+            };
+            let min_bl = (5usize.saturating_sub(aff_len) + omit).max(4).max(omit + 3);
+            let max_bl = (12 - aff_len + omit).min(15);
+            if min_bl > max_bl {
+                continue;
+            }
+            for (base_len, &size_bits) in SIZE_BITS_BY_LEN
+                .iter()
+                .enumerate()
+                .take(max_bl + 1)
+                .skip(min_bl)
+            {
+                let nwords = 1usize << size_bits;
+                let limit = if tid < 32 { nwords } else { nwords.min(512) };
+                let cc = crate::map_to_sym::copy_code_only(base_len as u32);
+                let copy_extra_q5 = (crate::map_to_sym::COPY_EXTRA[cc] << 5) as i32;
+                for word_idx in 0..limit {
+                    let out_len = expand_transform_rfc7932(&mut buf, base_len, word_idx, tid);
+                    if !(5..=12).contains(&out_len) {
+                        continue;
+                    }
+                    let dict_idx = encode_raw_dist(word_idx, base_len, tid);
+                    let est_raw = 8192u32.saturating_add(dict_idx);
+                    let dist_bits_q5 = ((31 ^ (est_raw | 1).leading_zeros()) << 5) as i32;
+                    let gain_q5 = (out_len as i32) * 168 - (352 + dist_bits_q5 + copy_extra_q5);
+                    if gain_q5 < 64 {
+                        continue;
+                    }
+                    let score =
+                        ((gain_q5 as u64) << 16) / ((word_idx as u64 + 24) * (tid as u64 + 3));
+                    let k4 = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                    let slot = (k4.wrapping_mul(DICT_HASH_MUL32) >> (32 - FAST_DICT_LOG2)) as usize;
+                    if score > best_scores[slot] {
+                        best_scores[slot] = score;
+                        let mut b12 = [0u8; 12];
+                        b12[..out_len].copy_from_slice(&buf[..out_len]);
+                        table[slot] = FastDictEntry {
+                            w0: u64::from_le_bytes(*b12.first_chunk::<8>().unwrap()),
+                            w1: u32::from_le_bytes(*b12.last_chunk::<4>().unwrap()),
+                            meta: dict_idx | ((base_len as u32) << 20) | ((out_len as u32) << 26),
+                        };
+                    }
+                }
+            }
+        }
+        table
+    })
+}
+
+#[inline(always)]
+pub(crate) fn lookup_fast(
+    table: &FastDictTable,
+    word64: u64,
+    hash32_4b: u32,
+    next4: impl FnOnce() -> u32,
+    bounds: impl FnOnce() -> Option<(u64, u32)>,
+    (lit_mult, cmd_off, min_gain): (i32, i32, i32),
+) -> Option<StaticDictMatch> {
+    let entry = &table[(hash32_4b >> (32 - FAST_DICT_LOG2)) as usize];
+    if (word64 as u32) != (entry.w0 as u32) {
+        return None;
+    }
+    let meta = entry.meta;
+    let out_len = (meta >> 26) as usize;
+    if out_len == 0 {
+        return None;
+    }
+    if out_len <= 8 {
+        if ((word64 ^ entry.w0) << ((8 - out_len) * 8)) != 0 {
+            return None;
+        }
+    } else if word64 != entry.w0 || ((next4() ^ entry.w1) << ((12 - out_len) * 8)) != 0 {
+        return None;
+    }
+    let (base_dist, max_raw_dist) = bounds()?;
+    let raw64 = base_dist + (meta & 0xF_FFFF) as u64;
+    if raw64 > max_raw_dist as u64 {
+        return None;
+    }
+    let raw_dist = raw64 as u32;
+    let base_len = (meta >> 20) & 0x3F;
+    let cc = crate::map_to_sym::copy_code_only(base_len);
+    let copy_extra_q5 = (crate::map_to_sym::COPY_EXTRA[cc] << 5) as i32;
+    let dist_bits_q5 = ((31 ^ (raw_dist | 1).leading_zeros()) << 5) as i32;
+    let gain = lit_mult * (out_len as i32) - (cmd_off + dist_bits_q5 + copy_extra_q5);
+    (gain >= min_gain).then_some(StaticDictMatch {
+        base_len,
+        out_len: out_len as u32,
+        raw_dist,
+        gain,
+    })
+}
+
 const EXT_BUCKETS_LOG2: usize = 15;
 const EXT_BUCKETS: usize = 1 << EXT_BUCKETS_LOG2;
 
@@ -802,6 +970,48 @@ mod test {
             m.out_len,
             m.base_len,
             m.raw_dist - 100_000,
+        );
+    }
+
+    #[test]
+    fn test_fast_dict_all_entries_match_rfc7932_decoder() {
+        let fd = fast_dict();
+        let mut populated = 0usize;
+        for (slot, entry) in fd.iter().enumerate() {
+            let out_len = entry.meta >> 26;
+            if out_len == 0 {
+                continue;
+            }
+            populated += 1;
+            assert!((5..=12).contains(&out_len));
+            let base_len = (entry.meta >> 20) & 0x3F;
+            let dict_idx = entry.meta & 0xF_FFFF;
+            let mut phrase = [0u8; 16];
+            phrase[..8].copy_from_slice(&entry.w0.to_le_bytes());
+            phrase[8..12].copy_from_slice(&entry.w1.to_le_bytes());
+            verify_word(&phrase[..out_len as usize], out_len, base_len, dict_idx);
+
+            let w64 = u64::from_le_bytes(*phrase.first_chunk::<8>().unwrap());
+            let h32 = (w64 as u32).wrapping_mul(DICT_HASH_MUL32);
+            assert_eq!((h32 >> (32 - FAST_DICT_LOG2)) as usize, slot);
+            let w1 = u32::from_le_bytes(*phrase[8..12].first_chunk::<4>().unwrap());
+            let hit = lookup_fast(
+                fd,
+                w64,
+                h32,
+                || w1,
+                || Some((1, STD_MAX_RAW_STATIC_DIST)),
+                (168, 352, 48),
+            )
+            .expect("populated fast_dict slot must match its own phrase");
+            assert_eq!(
+                (hit.out_len, hit.base_len, hit.raw_dist),
+                (out_len, base_len, dict_idx + 1)
+            );
+        }
+        assert!(
+            populated >= 3800,
+            "unexpectedly low slot occupancy: {populated}"
         );
     }
 }

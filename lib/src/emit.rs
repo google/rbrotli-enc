@@ -92,9 +92,8 @@ impl<'a> BlockSwitchCursor<'a> {
             &mut self.second_prev,
         );
         let (tn, tb) = bti.block_type_code.symbol_info(t_sym);
-        bw.write(tn, tb);
         let (cn, cb) = bti.encode_block_count(self.rem);
-        bw.write(cn, cb);
+        bw.write(tn + cn, tb | (cb << tn));
         true
     }
 }
@@ -206,9 +205,10 @@ pub(crate) fn write_compressed_metablock(
         let iac_bt = iac_cur.step(&header.insert_and_copy, bw);
         let (iac_sym, iac_eb_n, iac_eb_b) = encode_iac(insert_len, copy_len, implicit_d0);
         let (hn, hb) = header.insert_and_copy_codes[iac_bt].symbol_info(iac_sym as usize);
-        bw.write(hn, hb);
-        if iac_eb_n > 0 {
-            bw.write(iac_eb_n as usize, iac_eb_b);
+        let n0 = iac_eb_n.min(24);
+        bw.write(hn + n0 as usize, hb | ((iac_eb_b & 0xFF_FFFF) << hn));
+        if iac_eb_n > 24 {
+            bw.write((iac_eb_n - 24) as usize, iac_eb_b >> 24);
         }
 
         let mut sp = *sp_out;
@@ -270,10 +270,7 @@ pub(crate) fn write_compressed_metablock(
             };
             let tree_id = plan.dist_cmap[dist_bt * 4 + d_ctx] as usize;
             let (dn, db) = header.distance_codes[tree_id].symbol_info(d_sym as usize);
-            bw.write(dn, db);
-            if d_eb_n > 0 {
-                bw.write(d_eb_n as usize, d_eb_b);
-            }
+            bw.write(dn + d_eb_n as usize, db | (d_eb_b << dn));
         }
         stream_pos += cmd.out_len as usize;
     }
