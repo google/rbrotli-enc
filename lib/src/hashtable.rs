@@ -1621,6 +1621,449 @@ fn compute_hash3(word64: u64) -> BoundedUsize<HT3_MASK> {
     )
 }
 
+/// Compact 1-way power-of-two table view for `Q0..=Q2`.
+/// `MODE_PB`: `0` = dynamic (`tags` when `Some`, else `tag_mask`), `1` = untagged runtime
+/// `tag_mask`, `>= 11` = untagged compile-time `pos_bits == MODE_PB`.
+pub(crate) struct TableSlices1<'a> {
+    pub(crate) table: Pow2SliceMut<'a, u32>,
+    pub(crate) tags: Option<Pow2SliceMut<'a, u16>>,
+    pub(crate) ht4: Option<Pow2SliceMut<'a, u32>>,
+    pub(crate) tag_mask: u32,
+}
+
+impl TableSlices1<'_> {
+    #[inline(always)]
+    fn encode_untagged<const MODE_PB: u8>(tag_mask: u32, vpos: u32, sec: u32) -> u32 {
+        let tm = if MODE_PB >= 11 {
+            !pos_mask_u32(MODE_PB)
+        } else {
+            tag_mask
+        };
+        (sec & tm) | vpos
+    }
+
+    #[inline(always)]
+    pub(crate) fn insert_one_hash64<const MODE_PB: u8>(
+        &mut self,
+        p64: u64,
+        vpos: u32,
+        sec_hash: u32,
+    ) {
+        if MODE_PB == 0 {
+            if let Some(t) = self.tags.as_mut() {
+                *t.get_hash64_mut(p64) = shift_tag16(sec_hash);
+                *self.table.get_hash64_mut(p64) = vpos;
+                return;
+            }
+        }
+        *self.table.get_hash64_mut(p64) =
+            Self::encode_untagged::<MODE_PB>(self.tag_mask, vpos, sec_hash);
+    }
+
+    #[inline(always)]
+    pub(crate) fn search_and_insert_one_hash64<const MODE_PB: u8>(
+        &mut self,
+        p64: u64,
+        vpos: u32,
+        sec_hash: u32,
+        eff_wsize: u32,
+    ) -> u32 {
+        if MODE_PB == 0 {
+            if let Some(t) = self.tags.as_mut() {
+                let tag = shift_tag16(sec_hash);
+                let tag_ok = std::mem::replace(t.get_hash64_mut(p64), tag) == tag;
+                let d = bucket_search_one(self.table.get_hash64_mut(p64), vpos, eff_wsize);
+                return if tag_ok { d } else { 0 };
+            }
+        }
+        let target = Self::encode_untagged::<MODE_PB>(self.tag_mask, vpos, sec_hash);
+        bucket_search_one(self.table.get_hash64_mut(p64), target, eff_wsize)
+    }
+
+    #[inline(always)]
+    pub(crate) fn insert_ht4_p32<const MODE_PB: u8>(&mut self, p32: u32, vpos: u32) {
+        let tm = self.tag_mask;
+        if let Some(near) = self.ht4.as_mut() {
+            let sec = p32 << (near.log() & 31);
+            *near.get_hash32_mut(p32) = Self::encode_untagged::<MODE_PB>(tm, vpos, sec);
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn search_and_insert_ht4_one_p32<const MODE_PB: u8>(
+        &mut self,
+        p32: u32,
+        vpos: u32,
+        eff_wsize: u32,
+    ) -> u32 {
+        let tm = self.tag_mask;
+        let Some(near) = self.ht4.as_mut() else {
+            return 0;
+        };
+        let sec = p32 << (near.log() & 31);
+        let target = Self::encode_untagged::<MODE_PB>(tm, vpos, sec);
+        bucket_search_one(near.get_hash32_mut(p32), target, eff_wsize)
+    }
+}
+
+trait InteriorOps<S: SimdBackend> {
+    #[inline(always)]
+    fn is_ht4_one(&self, _: S) -> bool {
+        false
+    }
+    fn step_ht3(&mut self, simd: S, word64: u64, vpos: u32) -> u32;
+    fn prefetch_ahead<C: MatchConfig>(
+        &self,
+        simd: S,
+        pfx_pf: BoundedPrefix<'_, u8, INTERIOR_MARGIN>,
+        pos_pf: usize,
+    );
+    fn insert_main(&mut self, simd: S, p64: u64, vpos: u32, sec_hash: u32);
+    fn search_main(
+        &mut self,
+        simd: S,
+        p64: u64,
+        vpos: u32,
+        sec_hash: u32,
+        wsize: u32,
+        dists: &mut [u32; 32],
+    ) -> u32;
+    fn search_ht4(
+        &mut self,
+        simd: S,
+        p32: u32,
+        vpos: u32,
+        wsize: u32,
+        dists: &mut [u32; 32],
+    ) -> u32;
+    #[inline(always)]
+    fn search_ht4_one(&mut self, simd: S, p32: u32, vpos: u32, wsize: u32) -> u32 {
+        let mut d = [0u32; 32];
+        if self.search_ht4(simd, p32, vpos, wsize, &mut d) != 0 {
+            d[0]
+        } else {
+            0
+        }
+    }
+    fn insert_ht4(&mut self, simd: S, p32: u32, vpos: u32);
+
+    #[inline(always)]
+    fn insert_positions(
+        &mut self,
+        simd: S,
+        acfg: ArchCfg,
+        data: &[u8],
+        (ins_start, ins_end): (usize, usize),
+        vpos_base: usize,
+        max_insert_len: usize,
+    ) {
+        let Some(pfx8) = BoundedPrefix::<u8, 8>::from_prefix(data, ins_end + 7) else {
+            return;
+        };
+        if acfg.fast {
+            if ins_end > ins_start + 4 {
+                let p_t2 = ins_end - 2;
+                let main_ps = if max_insert_len >= 2 && p_t2 > ins_start {
+                    &[ins_start, p_t2][..]
+                } else {
+                    std::slice::from_ref(&p_t2)
+                };
+                for &p in main_ps {
+                    if let Some(c8) = pfx8.get_at(p) {
+                        let (p64, sec_h, _) = hash8_p64(u64::from_le_bytes(*c8));
+                        self.insert_main(simd, p64, vpos_base.wrapping_add(p) as u32, sec_h);
+                    }
+                }
+                if let Some(c4) = pfx8.get_sub_at::<4, 0>(ins_end - 1) {
+                    let p32 = u32::from_le_bytes(*c4).wrapping_mul(HASH_MUL32);
+                    self.insert_ht4(simd, p32, vpos_base.wrapping_add(ins_end - 1) as u32);
+                }
+            }
+        } else {
+            let tail = max_insert_len.min(5);
+            let (head_end, h4_end, h3_end) = (
+                ins_end.min(ins_start + max_insert_len - tail),
+                ins_start + if acfg.lazy2 { 12 } else { 4 },
+                ins_start + 8,
+            );
+            let mut p = ins_start;
+            while p < ins_end {
+                if p == head_end {
+                    p = p.max(ins_end.saturating_sub(tail));
+                }
+                if let Some(c8) = pfx8.get_at(p) {
+                    let w64 = u64::from_le_bytes(*c8);
+                    let vp = vpos_base.wrapping_add(p) as u32;
+                    let (p64, sec_h, p32) = hash8_p64(w64);
+                    self.insert_main(simd, p64, vp, sec_h);
+                    if p < h4_end || p + 5 >= ins_end {
+                        self.insert_ht4(simd, p32, vp);
+                    }
+                    if acfg.ht3 && (p < h3_end || p + 4 >= ins_end) {
+                        let _ = self.step_ht3(simd, w64, vp);
+                    }
+                }
+                p += 1;
+            }
+        }
+    }
+}
+
+/// Typed table view for `Q3..=Q9` (`(POS_BITS, WAYS, HT4_WAYS)` specialized AVX2 hot paths).
+#[cfg(any(target_arch = "x86_64", test))]
+pub(crate) struct InteriorTables<'a, const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize> {
+    table: Pow2SliceMut<'a, [u32; WAYS]>,
+    tags: Option<Pow2SliceMut<'a, [u16; WAYS]>>,
+    heads: Option<Pow2SliceMut<'a, u8>>,
+    ht4_near: Pow2SliceMut<'a, [u32; HT4_WAYS]>,
+    ht4_tags: Option<Pow2SliceMut<'a, [u16; HT4_WAYS]>>,
+    ht3: Option<&'a mut [u32; HT3_SIZE]>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize>
+    InteriorTables<'_, POS_BITS, WAYS, HT4_WAYS>
+{
+    #[inline(always)]
+    fn invariants_hold<C: MatchConfig>(&self) -> bool {
+        if POS_BITS == 31 {
+            let msh = self.table.shift64();
+            let Some(t) = self.tags.as_ref() else {
+                return false;
+            };
+            if t.shift64() != msh {
+                return false;
+            }
+            if WAYS >= 32 {
+                let Some(h) = self.heads.as_ref() else {
+                    return false;
+                };
+                if h.shift64() != msh {
+                    return false;
+                }
+            }
+            let Some(t4) = self.ht4_tags.as_ref() else {
+                return false;
+            };
+            if t4.shift64() != self.ht4_near.shift64() {
+                return false;
+            }
+        }
+        !C::USE_3B_TABLE || self.ht3.is_some()
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", test))]
+impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize, S: SimdBackend> InteriorOps<S>
+    for InteriorTables<'_, POS_BITS, WAYS, HT4_WAYS>
+{
+    #[inline(always)]
+    fn is_ht4_one(&self, _: S) -> bool {
+        const { HT4_WAYS == 1 }
+    }
+
+    #[inline(always)]
+    fn step_ht3(&mut self, _: S, word64: u64, vpos: u32) -> u32 {
+        let Some(t3) = self.ht3.as_deref_mut() else {
+            return 0;
+        };
+        std::mem::replace(t3.bget_mut(compute_hash3(word64)), vpos)
+    }
+
+    #[inline(always)]
+    fn prefetch_ahead<C: MatchConfig>(
+        &self,
+        simd: S,
+        pfx_pf: BoundedPrefix<'_, u8, INTERIOR_MARGIN>,
+        pos_pf: usize,
+    ) {
+        const { assert!(WAYS >= 4) };
+        if const { S::IS_AVX2 } {
+            let p64 = u64::from_le_bytes(*pfx_pf.get_sub_clamped::<8, 0>(pos_pf))
+                .wrapping_mul(HASH_MUL64);
+            if const { POS_BITS == 31 } {
+                if let Some(t) = self.tags.as_ref() {
+                    simd.prefetch_et0(t.get_hash64(p64));
+                }
+                if const { WAYS >= 32 } {
+                    if let Some(h) = self.heads.as_ref() {
+                        simd.prefetch_et0(h.get_hash64(p64));
+                    }
+                }
+            }
+            simd.prefetch_et0(self.table.get_hash64(p64));
+            if C::MULTI_CONTEXT && (HT4_WAYS > 1 || WAYS == 8) {
+                let p32 = p64 as u32;
+                simd.prefetch_et0(self.ht4_near.get_hash32(p32));
+                if const { POS_BITS == 31 } {
+                    if let Some(t4) = self.ht4_tags.as_ref() {
+                        simd.prefetch_et0(t4.get_hash32(p32));
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn insert_main(&mut self, simd: S, p64: u64, vpos: u32, sec_hash: u32) {
+        if const { POS_BITS == 31 } {
+            if const { WAYS >= 32 } {
+                if let (Some(h), Some(t)) = (self.heads.as_mut(), self.tags.as_mut()) {
+                    if let (Some(ts), Some(bs)) = (
+                        t.get_hash64_mut(p64).first_chunk_mut::<32>(),
+                        self.table.get_hash64_mut(p64).first_chunk_mut::<32>(),
+                    ) {
+                        ring_insert(h.get_hash64_mut(p64), ts, bs, ring_tag16(sec_hash), vpos);
+                    }
+                }
+            } else {
+                let tag = shift_tag16(sec_hash);
+                if let Some(t) = self.tags.as_mut() {
+                    let row = t.get_hash64_mut(p64);
+                    dispatch_simd!(
+                        simd, S => |tok| tags_insert_avx2(row, tag, tok),
+                        tags_insert_portable(row, tag)
+                    );
+                }
+                buckets_insert(self.table.get_hash64_mut(p64), simd, vpos);
+            }
+        } else {
+            buckets_insert(
+                self.table.get_hash64_mut(p64),
+                simd,
+                encode_vpos(POS_BITS, vpos, sec_hash),
+            );
+        }
+    }
+
+    #[inline(always)]
+    fn search_main(
+        &mut self,
+        simd: S,
+        p64: u64,
+        vpos: u32,
+        sec_hash: u32,
+        wsize: u32,
+        dists: &mut [u32; 32],
+    ) -> u32 {
+        if const { POS_BITS == 31 } {
+            if const { WAYS >= 32 } {
+                let (Some(h), Some(t)) = (self.heads.as_mut(), self.tags.as_mut()) else {
+                    return 0;
+                };
+                ring_search(
+                    simd,
+                    h.get_hash64_mut(p64),
+                    t.get_hash64_mut(p64),
+                    self.table.get_hash64_mut(p64),
+                    (sec_hash, vpos, wsize),
+                    dists,
+                )
+            } else {
+                let Some(t) = self.tags.as_mut() else {
+                    return 0;
+                };
+                shift_tagged_search(
+                    simd,
+                    t.get_hash64_mut(p64),
+                    self.table.get_hash64_mut(p64),
+                    (sec_hash, vpos, wsize),
+                    dists,
+                )
+            }
+        } else {
+            buckets_search_and_insert(
+                self.table.get_hash64_mut(p64),
+                simd,
+                encode_vpos(POS_BITS, vpos, sec_hash),
+                wsize,
+                dists,
+            )
+        }
+    }
+
+    #[inline(always)]
+    fn search_ht4_one(&mut self, _: S, p32: u32, vpos: u32, wsize: u32) -> u32 {
+        let sec = p32 << (self.ht4_near.log() & 31);
+        let slot = &mut self.ht4_near.get_hash32_mut(p32)[0];
+        if const { POS_BITS == 31 } {
+            let Some(t4) = self.ht4_tags.as_mut() else {
+                return 0;
+            };
+            let tag = shift_tag16(sec);
+            if std::mem::replace(&mut t4.get_hash32_mut(p32)[0], tag) != tag {
+                *slot = vpos;
+                return 0;
+            }
+            bucket_search_one(slot, vpos, wsize)
+        } else {
+            bucket_search_one(slot, encode_vpos(POS_BITS, vpos, sec), wsize)
+        }
+    }
+
+    #[inline(always)]
+    fn search_ht4(
+        &mut self,
+        simd: S,
+        p32: u32,
+        vpos: u32,
+        wsize: u32,
+        dists: &mut [u32; 32],
+    ) -> u32 {
+        if const { HT4_WAYS == 1 } {
+            dists[0] = self.search_ht4_one(simd, p32, vpos, wsize);
+            return u32::from(dists[0] != 0);
+        }
+        let sec = p32 << (self.ht4_near.log() & 31);
+        if const { POS_BITS == 31 } {
+            let Some(t4) = self.ht4_tags.as_mut() else {
+                return 0;
+            };
+            shift_tagged_search(
+                simd,
+                t4.get_hash32_mut(p32),
+                self.ht4_near.get_hash32_mut(p32),
+                (sec, vpos, wsize),
+                dists,
+            )
+        } else {
+            buckets_search_and_insert(
+                self.ht4_near.get_hash32_mut(p32),
+                simd,
+                encode_vpos(POS_BITS, vpos, sec),
+                wsize,
+                dists,
+            )
+        }
+    }
+
+    #[inline(always)]
+    fn insert_ht4(&mut self, simd: S, p32: u32, vpos: u32) {
+        let sec = p32 << (self.ht4_near.log() & 31);
+        if const { POS_BITS == 31 } {
+            let tag = shift_tag16(sec);
+            if let Some(t4) = self.ht4_tags.as_mut() {
+                let row = t4.get_hash32_mut(p32);
+                if const { HT4_WAYS == 1 } {
+                    row[0] = tag;
+                } else {
+                    dispatch_simd!(
+                        simd, S => |tok| tags_insert_avx2(row, tag, tok),
+                        tags_insert_portable(row, tag)
+                    );
+                }
+            }
+            buckets_insert(self.ht4_near.get_hash32_mut(p32), simd, vpos);
+        } else {
+            buckets_insert(
+                self.ht4_near.get_hash32_mut(p32),
+                simd,
+                encode_vpos(POS_BITS, vpos, sec),
+            );
+        }
+    }
+}
+
 pub(crate) mod legacy {
 
     use crate::compress::MetablockData;
