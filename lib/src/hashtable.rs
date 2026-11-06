@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::compress::MetablockSink;
 use crate::constants::*;
 use crate::map_to_sym::{
     can_use_implicit_d0, copy_code_bounded, match_short_dist_code, push_last_distance,
@@ -94,6 +95,14 @@ pub(crate) trait MatchConfig: Send + Sync + 'static {
     const TWO_DIST_CTX: bool;
     const MULTI_CONTEXT: bool;
     const USE_3B_TABLE: bool;
+
+    fn run_interior(
+        ht: &mut HashTable,
+        env: &SliceEnv<'_>,
+        state: &mut SliceParseState,
+        md: &mut MetablockSink<'_>,
+        avx2: OptAvx2,
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -128,8 +137,34 @@ macro_rules! def_arch {
             const MULTI_CONTEXT: bool = $mc;
             const USE_3B_TABLE: bool = $h3;
 
+            #[inline(always)]
+            fn run_interior(
+                ht: &mut HashTable,
+                env: &SliceEnv<'_>,
+                state: &mut SliceParseState,
+                md: &mut MetablockSink<'_>,
+                avx2: OptAvx2,
+            ) {
+                #[cfg(target_arch = "x86_64")]
+                if !env.has_dict {
+                    if let Some(tok) = avx2 {
+                        let eff_lw = env.large_window && env.win.1 > FAST_LDM_MIN_DIST;
+                        match (ht.pos_bits, ht.ways, ht.ht4_ways, eff_lw) {
+                            $(($pb, $w, $h4w, $lw) => {
+                                if let Some(it) = ht.interior_mut::<$pb, $w, $h4w>(Self::USE_3B_TABLE) {
+                                    return parse_slice_interior_avx2::<$pb, $w, $h4w, Self, $lw>(
+                                        it, env, state, md, tok, tok,
+                                    );
+                                }
+                            })+
+                            _ => {}
+                        }
+                    }
+                }
+                let _ = avx2;
+                parse_slice_interior_portable::<Self>(ht, env, state, md);
+            }
         }
-        const _: usize = [$(($pb, $w, $h4w, $lw)),+].len();
     };
 }
 
@@ -3303,6 +3338,618 @@ impl HashTable {
                 self.max_vpos_used = self.next_vpos;
             }
         }
+    }
+}
+
+macro_rules! def_parse_slice_interior {
+    (|$ht:ident, $simd:ident: $S:ident, $lw:ident, $hd:ident, $env:ident, $state:ident, $md:ident| $body:block) => {
+        #[cfg(target_arch = "x86_64")]
+        #[simd_entry]
+        #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
+        #[inline(never)]
+        fn parse_slice_interior_avx2<
+            const POS_BITS: u8,
+            const WAYS: usize,
+            const HT4_WAYS: usize,
+            C: MatchConfig,
+            const LW: bool,
+        >(
+            mut it: InteriorTables<'_, POS_BITS, WAYS, HT4_WAYS>,
+            env_ref: &SliceEnv<'_>,
+            $state: &mut SliceParseState,
+            $md: &mut MetablockSink<'_>,
+            $simd: X64V3,
+            _tok: impl SimdToken,
+        ) {
+            type $S = X64V3;
+            if !it.invariants_hold::<C>() {
+                return;
+            }
+            let $ht = &mut it;
+            let ($env, $lw, $hd) = (*env_ref, LW, false);
+            $body
+        }
+
+        #[cfg_attr(target_arch = "x86_64", cold)]
+        #[inline(never)]
+        fn parse_slice_interior_portable<C: MatchConfig>(
+            $ht: &mut HashTable,
+            env_ref: &SliceEnv<'_>,
+            $state: &mut SliceParseState,
+            $md: &mut MetablockSink<'_>,
+        ) {
+            type $S = Scalar;
+            if !(10..=20).contains(&$ht.log) || !(10..=20).contains(&$ht.ht4_log) {
+                return;
+            }
+            let ($simd, $env) = (Scalar, *env_ref);
+            let ($lw, $hd) = ($env.large_window, $env.has_dict);
+            $body
+        }
+    };
+}
+
+def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| {
+    let SliceEnv {
+        data,
+        active_dict,
+        model,
+        ldm_spans,
+        bounds: (slice_start, interior_end),
+        win: (wsize, eff_wsize, _, vpos_base),
+        stream_base,
+        qcfg,
+        use_sd,
+        ..
+    } = env;
+    let end_ub = data.len().saturating_sub(INTERIOR_MARGIN - 1);
+    let end = end_ub.min(interior_end);
+    if end <= slice_start {
+        return;
+    }
+    let Some(pfx16) =
+        BoundedPrefix::<u8, INTERIOR_MARGIN>::from_prefix(data, end + INTERIOR_MARGIN - 1)
+    else {
+        return;
+    };
+    let acfg = const { arch_cfg::<C>() };
+    let (nice_len, max_insert_len) = (qcfg.nice_len as u32, qcfg.max_insert_len as usize);
+    let (mut anchor, mut last_distances) = (state.anchor, state.last_distances);
+    macro_rules! emit {
+        ($mp:expr, $el:expr, $cl:expr, $d:expr, $is:expr) => {{
+            let (mp, el, cl, d, ins_s) = ($mp, $el, $cl, $d, $is);
+            md.emit_command(C::MULTI_CONTEXT, data, anchor, mp, (cl, el as u32), d);
+            if (d & STATIC_DICT_DIST_FLAG) == 0 {
+                push_last_distance(&mut last_distances, d);
+            }
+            let match_end = mp + el;
+            let ins_e = match_end.min(end_ub);
+            if max_insert_len > 0 && ins_s < ins_e {
+                ht.insert_positions(simd, acfg, data, (ins_s, ins_e), vpos_base, max_insert_len);
+            }
+            anchor = match_end;
+            match_end
+        }};
+    }
+    let sd_pos_limit = if use_sd {
+        (qcfg.static_dict_limit as usize).saturating_sub(stream_base)
+    } else {
+        0
+    };
+    let fast_sd = if !C::MULTI_CONTEXT && slice_start < sd_pos_limit {
+        Some(static_dict::fast_dict())
+    } else {
+        None
+    };
+    let lw_ldm = large_window && !ldm_spans.is_empty();
+    let eff_w32 = eff_wsize as u32;
+    let (d_len, d_full_len) = if has_dict {
+        (active_dict.len(), env.win.2)
+    } else {
+        (0, 0)
+    };
+    let (max_d4, lazy_margin) = (model.max_d4.min(eff_w32), model.lazy_margin);
+    let (mut dists, mut dists4) = ([0u32; 32], [0u32; 32]);
+    let (mut lazy_pos, mut lazy, mut has_lazy) = (0usize, BestMatch::default(), false);
+    let (mut ldm_i, mut pos) = (0usize, slice_start);
+
+    while let Some(at_pos) = pfx16.cursor_at(pos) {
+        let hl = const { !C::FAST_MATCHING } && has_lazy;
+        let unm = pos.saturating_sub(anchor);
+        let word64 = at_pos.load_u64_le::<0>();
+        let (p64, sec_hash, p32) = hash8_p64(word64);
+        let pf_off = if const { C::STEP_SHIFT < 32 } {
+            PREFETCH_OFFSET * unmatched_step::<C>(unm)
+        } else {
+            PREFETCH_OFFSET
+        };
+        ht.prefetch_ahead::<C>(simd, pfx16, pos + pf_off);
+        let vpos = vpos_base.wrapping_add(pos) as u32;
+        let mut mask = ht.search_main(simd, p64, vpos, sec_hash, eff_w32, &mut dists);
+        let prev_vpos3 = if const { C::USE_3B_TABLE } && !hl && unm < 64 {
+            ht.step_ht3(simd, word64, vpos)
+        } else {
+            0
+        };
+        let pctx = ProbeCtx::at_cursor::<C>(env, anchor, at_pos, word64, last_distances);
+        let (mut best, mut best_is_rep) = (BestMatch::new(C::FAST_MATCHING), false);
+
+        if !C::FAST_MATCHING || unm < 8 {
+            let allow_sub4 = const { !C::FAST_MATCHING } && !hl && unm < 12;
+            let max_valid_dist = (pos + d_len).min(wsize);
+            'rep: {
+                macro_rules! probe_rep {
+                    ($k:literal) => {{
+                        let rep_dist = last_distances[$k];
+                        let sub_min = if $k <= 1 && C::USE_3B_TABLE { 2 } else { 3 };
+                        if !($k == 0 && pos == anchor && !hl)
+                            && rep_dist != 0
+                            && (rep_dist as usize) <= max_valid_dist
+                        {
+                            let (du, rep_bl) = (
+                                rep_dist as usize,
+                                if C::FAST_MATCHING { best.len } else { 0 },
+                            );
+                            let mlen = if let Some(c16) = at_pos.lookback(du) {
+                                let d32 = u32::from_le_bytes(*c16.first_chunk::<4>().unwrap())
+                                    ^ (word64 as u32);
+                                if d32 != 0 {
+                                    if allow_sub4 {
+                                        d32.trailing_zeros() >> 3
+                                    } else {
+                                        0
+                                    }
+                                } else {
+                                    let d_hi =
+                                        u32::from_le_bytes(*c16[4..8].first_chunk::<4>().unwrap())
+                                            ^ ((word64 >> 32) as u32);
+                                    if d_hi != 0 {
+                                        4 + (d_hi.trailing_zeros() >> 3)
+                                    } else {
+                                        pctx.in_win_tail8(simd, at_pos, c16, du, rep_bl)
+                                    }
+                                }
+                            } else if has_dict {
+                                pctx.cross_dict_ge(du, rep_bl, if allow_sub4 { 2 } else { 4 })
+                            } else {
+                                0
+                            };
+                            if mlen >= 4 {
+                                if best.try_lz(mlen, mlen, rep_dist, &pctx, acfg) {
+                                    best_is_rep = true;
+                                    if mlen >= nice_len {
+                                        mask = 0;
+                                        break 'rep;
+                                    }
+                                }
+                            } else if allow_sub4 && mlen >= sub_min {
+                                best.try_sub4::<C>(mlen, sub_min, unm == 0, rep_dist, &pctx, acfg);
+                            }
+                        }
+                    }};
+                }
+                probe_rep!(0);
+                probe_rep!(1);
+                if const { C::COST_MODEL_LEVEL >= 2 } && !hl {
+                    probe_rep!(2);
+                    probe_rep!(3);
+                }
+            }
+        }
+
+        if pctx.scan_main_candidates::<S, C>(simd, has_dict, at_pos, &dists, mask, &mut best) {
+            best_is_rep = false;
+        }
+
+        if lw_ldm && best.len < 32 {
+            if let Some((sp_start, sp_end, sp_dist)) =
+                probe_ldm_span(ldm_spans, &mut ldm_i, slice_start, pos)
+            {
+                if sp_dist != best.dist {
+                    let lfwd = (sp_end - pos) as u32;
+                    let lbak = if const { C::FAST_MATCHING } || (!hl && lfwd < 32) {
+                        pos.saturating_sub(sp_start.max(anchor.max(slice_start))) as u32
+                    } else {
+                        0
+                    };
+                    if (lfwd + lbak) as usize >= FAST_LDM_MIN_LEN
+                        && best.try_lz(lfwd, lfwd + lbak, sp_dist, &pctx, acfg)
+                    {
+                        best_is_rep = false;
+                    }
+                }
+            }
+        }
+
+        if const { C::FAST_MATCHING } {
+            if best.len < 8 && unm < 128 {
+                let d4 = ht.search_ht4_one(simd, p32, vpos, eff_w32);
+                if d4 != 0 && d4 != best.dist {
+                    let len4 = pctx.lookback_len(
+                        simd,
+                        has_dict,
+                        at_pos,
+                        d4 as usize,
+                        best.len,
+                        (false, false),
+                    );
+                    let near_rep = d4.wrapping_sub(last_distances[0]).wrapping_add(2) <= 4
+                        || d4.wrapping_sub(last_distances[1]).wrapping_add(2) <= 4;
+                    let max_d = match len4 {
+                        4 => max_d4,
+                        5 => (1 << 18) - 1,
+                        6 => (1 << 21) - 1,
+                        7 if large_window => (1 << 26) - 1,
+                        _ => u32::MAX,
+                    };
+                    let non_trivial4 = len4 > 4
+                        || d4 == last_distances[0]
+                        || (word64 as u32) != (word64 as u8 as u32).wrapping_mul(0x0101_0101);
+                    if len4 >= 4
+                        && len4 > best.len
+                        && non_trivial4
+                        && (near_rep || d4 <= max_d)
+                        && best.try_lz(len4, len4, d4, &pctx, acfg)
+                    {
+                        best_is_rep = false;
+                    }
+                }
+            }
+        } else if best.len < 8 {
+            if ht.is_ht4_one(simd) {
+                let d4 = ht.search_ht4_one(simd, p32, vpos, eff_w32);
+                if d4 != 0 && d4 != best.dist {
+                    let len4 =
+                        pctx.lookback_len(simd, has_dict, at_pos, d4 as usize, 0, (false, false));
+                    if len4 >= 4 && (len4 > best.len || d4 < best.dist) {
+                        let gain = pctx.score(acfg, len4, d4);
+                        if gain > best.gain {
+                            best.set(d4, len4, len4, gain);
+                        }
+                    }
+                }
+            } else {
+                let mut mask4 = ht.search_ht4(simd, p32, vpos, eff_w32, &mut dists4);
+                if mask4 != 0 {
+                    let mut best4_len = 0u32;
+                    while mask4 != 0 {
+                        let d4 = *dists4.bget_masked(mask4.trailing_zeros() as usize);
+                        mask4 &= mask4 - 1;
+                        if d4 == 0 || d4 == best.dist {
+                            continue;
+                        }
+                        let len4 = pctx.lookback_len(
+                            simd,
+                            has_dict,
+                            at_pos,
+                            d4 as usize,
+                            best4_len,
+                            (false, false),
+                        );
+                        if len4 >= 4 && len4 > best4_len {
+                            best4_len = len4;
+                            if len4 > best.len || d4 < best.dist {
+                                let gain = pctx.score(acfg, len4, d4);
+                                if gain > best.gain {
+                                    best.set(d4, len4, len4, gain);
+                                    if len4 >= nice_len {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else if hl || best.gain <= qcfg.min_gain_for_greedy {
+            ht.insert_ht4(simd, p32, vpos);
+        }
+
+        if const { C::USE_3B_TABLE } && !hl {
+            if best.len < 4 && prev_vpos3 != 0 {
+                let (d3, max_d3) = (
+                    vpos.wrapping_sub(prev_vpos3),
+                    ((pos + d_len).min(wsize) as u32).min(HT3_MAX_DIST),
+                );
+                if (1..=max_d3).contains(&d3) {
+                    let mlen3 = match at_pos.lookback_sub::<8, 0>(d3 as usize) {
+                        Some(c8) => {
+                            let diff = u64::from_le_bytes(*c8) ^ word64;
+                            if diff != 0 {
+                                diff.trailing_zeros() >> 3
+                            } else {
+                                pctx.cross_len(false, d3 as usize, 0)
+                            }
+                        }
+                        None => pctx.cross_len(has_dict, d3 as usize, 0),
+                    };
+                    if mlen3 >= 3 && mlen3 > best.len {
+                        let gain = pctx.score(acfg, mlen3, d3);
+                        if gain >= if mlen3 == 3 { 64 } else { 0 } && gain > best.gain {
+                            best.set(d3, mlen3, mlen3, gain);
+                        }
+                    }
+                }
+            }
+            if best.len == 0 {
+                probe_periodic_2b_stride::<C>(&pctx, &mut best);
+            }
+        }
+
+        if pos < sd_pos_limit {
+            if const { !C::MULTI_CONTEXT } {
+                if !hl && best.len <= 4 && unm < 4096 {
+                    if let Some(sd_tbl) = fast_sd {
+                        if let Some(sm) = pctx.lookup_fast_sd(
+                            sd_tbl,
+                            p32,
+                            d_full_len,
+                            large_window,
+                            at_pos.sub_array::<4, 8>(),
+                        ) {
+                            pctx.finish_sd(acfg, &mut best, sm);
+                        }
+                    }
+                }
+            } else {
+                let a4 = C::TWO_STEP_LAZY || pos.saturating_add(stream_base) < 32_768;
+                pctx.probe_sd(simd, acfg, &mut best, a4, large_window, has_dict);
+            }
+        }
+
+        let (mut mp, m, ins_start, do_back) = if hl
+            && best.gain <= lazy.gain + (pos - lazy_pos) as i32 * lazy_margin
+        {
+            if C::TWO_STEP_LAZY
+                && pos - lazy_pos == 1
+                && (4..32).contains(&lazy.len)
+                && pos + 1 < end
+            {
+                pos += 1;
+                continue;
+            }
+            (
+                lazy_pos,
+                lazy,
+                pos + 1,
+                large_window && lazy.dist > FAST_LDM_MIN_DIST as u32,
+            )
+        } else if best.dist != 0 && (C::FAST_MATCHING || best.gain > qcfg.min_gain_for_greedy) {
+            let mut next_ins_start = pos + 1;
+            if const { C::FAST_MATCHING }
+                && (best.dist & STATIC_DICT_DIST_FLAG) == 0
+                && !best_is_rep
+                && best.len < 8
+            {
+                if let Some(at_p1) = pfx16.cursor_at(pos + 1) {
+                    let (p1, w1) = (pos + 1, at_p1.load_u64_le::<0>());
+                    let (p64_1, sh1, _) = hash8_p64(w1);
+                    let m1 =
+                        ht.search_main(simd, p64_1, vpos.wrapping_add(1), sh1, eff_w32, &mut dists);
+                    next_ins_start = pos + 2;
+                    let pctx1 = ProbeCtx::at_cursor::<C>(env, anchor, at_p1, w1, last_distances);
+                    let mut b1 = BestMatch {
+                        dist: 0,
+                        len: best.len,
+                        copy_len: 0,
+                        gain: best.gain + 16,
+                    };
+                    if pctx1
+                        .scan_main_candidates::<S, C>(simd, has_dict, at_p1, &dists, m1, &mut b1)
+                    {
+                        (pos, best, next_ins_start) = (p1, b1, p1 + 1);
+                    }
+                }
+            }
+            let back = (C::STEP_SHIFT < 32
+                || (large_window && best.dist > FAST_LDM_MIN_DIST as u32))
+                && !hl
+                && best.len >= 4;
+            (pos, best, next_ins_start, back)
+        } else if !C::FAST_MATCHING && best.dist != 0 {
+            (lazy_pos, lazy, has_lazy) = (pos, best, true);
+            pos += 1;
+            continue;
+        } else {
+            let next_pos = pos + unmatched_step::<C>(unm);
+            pos = if lw_ldm {
+                clamp_ldm_next_pos(ldm_spans, ldm_i, slice_start, pos, next_pos)
+            } else {
+                next_pos
+            };
+            continue;
+        };
+        let (mut elen, mut clen) = (m.len as usize, m.copy_len);
+        if do_back && (m.dist & STATIC_DICT_DIST_FLAG) == 0 {
+            mp = extend_match_backward(
+                has_dict,
+                data,
+                active_dict,
+                mp,
+                m.dist as usize,
+                anchor.max(slice_start),
+                &mut elen,
+            );
+            clen = elen as u32;
+        }
+        if const { !C::FAST_MATCHING } {
+            has_lazy = false;
+        }
+        pos = emit!(mp, elen, clen, m.dist, ins_start);
+    }
+
+    if !C::FAST_MATCHING && has_lazy {
+        let _ = emit!(lazy_pos, lazy.len as usize, lazy.copy_len, lazy.dist, pos);
+    }
+    (state.anchor, state.last_distances) = (anchor, last_distances);
+});
+
+impl HashTable {
+    #[cfg_attr(target_arch = "x86_64", cold)]
+    #[inline(never)]
+    fn parse_tail_env(
+        &self,
+        env: SliceEnv<'_>,
+        acfg: ArchCfg,
+        mut pos: usize,
+        state: &mut SliceParseState,
+        md: &mut MetablockSink<'_>,
+    ) {
+        let (data, (wsize, eff_wsize, _, vpos_base), lw, hd) =
+            (env.data, env.win, env.large_window, env.has_dict);
+        let (len_data, d_len, pm) = (
+            data.len(),
+            if hd { env.active_dict.len() } else { 0 },
+            pos_mask_u32(self.pos_bits),
+        );
+        let (mut anchor, mut ld) = (state.anchor, state.last_distances);
+        while pos + 4 <= len_data {
+            let (word64, vpos) = (
+                load_word64_padded(&data[pos..]),
+                vpos_base.wrapping_add(pos) as u32,
+            );
+            let (p64, _, p32) = hash8_p64(word64);
+            let pctx = ProbeCtx::from_pos(env, acfg.lvl, anchor, pos, word64, ld);
+            let mut best = BestMatch::new(acfg.fast);
+            let newest_d = |s: &[u32], heads: &[u8], row: usize, w: usize| {
+                let sub = if self.pos_bits == 31 && w == 32 {
+                    heads.get(row).map_or(0, |&h| (h & 31) as usize)
+                } else {
+                    0
+                };
+                vpos.wrapping_sub(s.get(row * w + sub).copied().unwrap_or(0) & pm)
+            };
+            let m_d = if pos + 8 <= len_data && self.log >= 10 {
+                newest_d(
+                    &self.table,
+                    &self.heads,
+                    (p64 >> (64 - self.log)) as usize,
+                    self.ways as usize,
+                )
+            } else {
+                0
+            };
+            let h4_d = if self.ht4_log >= 10 {
+                newest_d(
+                    &self.ht4_near,
+                    &[],
+                    (p32 >> (32 - self.ht4_log)) as usize,
+                    self.ht4_ways as usize,
+                )
+            } else {
+                0
+            };
+            let max_d = (pos + d_len).min(wsize).min(eff_wsize) as u32;
+            for d in [if pos > anchor { ld[0] } else { 0 }, m_d, h4_d] {
+                if (1..=max_d).contains(&d) && (!acfg.fast || d != h4_d || d <= env.model.max_d4) {
+                    let mlen = pctx.cross_len(hd, d as usize, 0);
+                    let _ = best.try_lz(mlen, mlen, d, &pctx, acfg);
+                }
+            }
+            pctx.probe_sd(Scalar, acfg, &mut best, true, lw, hd);
+            if best.dist != 0 {
+                md.emit_command(
+                    md.has_lit_ctx(),
+                    data,
+                    anchor,
+                    pos,
+                    (best.copy_len, best.len),
+                    best.dist,
+                );
+                if (best.dist & STATIC_DICT_DIST_FLAG) == 0 {
+                    push_last_distance(&mut ld, best.dist);
+                }
+                pos += best.len as usize;
+                anchor = pos;
+            } else {
+                pos += 1;
+            }
+        }
+        (state.anchor, state.last_distances) = (anchor, ld);
+    }
+
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn parse_slice<C: MatchConfig>(
+        &mut self,
+        qcfg: QualityCfg,
+        large_window: bool,
+        has_dict: bool,
+        (data, target_end, wsize): (&[u8], usize, usize),
+        (active_dict, full_dict_len): (&[u8], usize),
+        state: &mut SliceParseState,
+        md: &mut MetablockSink<'_>,
+        model: &SliceCostModel,
+        use_avx2: bool,
+    ) {
+        let slice_start = state.pos;
+        if slice_start >= target_end {
+            return;
+        }
+        let (data_len, d_len) = (data.len(), if has_dict { active_dict.len() } else { 0 });
+        let eff_wsize = wsize.min(d_len.saturating_add(data_len));
+        self.ensure_vpos_capacity(
+            eff_wsize,
+            (target_end - slice_start + MAX_COPY_LEN).min(data_len - slice_start),
+        );
+        self.ensure_ht4_near();
+        if const { C::USE_3B_TABLE } {
+            let _ = self.ht3.get_or_insert_with(|| Box::new([0u32; HT3_SIZE]));
+        }
+        let (interior_end, vpos_base) = (
+            target_end.min(data_len.saturating_sub(INTERIOR_MARGIN)),
+            self.next_vpos.wrapping_sub(slice_start),
+        );
+        let mut ldm_spans = if large_window && eff_wsize > 262_144 && interior_end > slice_start {
+            let mut spans = self
+                .ldm
+                .as_mut()
+                .map_or_else(Vec::new, |l| std::mem::take(&mut l.spans));
+            self.scan_ldm_with_density(
+                u8::from(self.ways <= 2),
+                data,
+                slice_start,
+                interior_end,
+                eff_wsize,
+                vpos_base,
+                &mut spans,
+                use_avx2,
+            );
+            spans
+        } else {
+            Vec::new()
+        };
+        let use_sd =
+            slice_start.saturating_add(state.stream_base) < qcfg.static_dict_limit as usize;
+        let env = SliceEnv {
+            data,
+            active_dict,
+            model,
+            ldm_spans: &ldm_spans,
+            bounds: (slice_start, interior_end),
+            win: (wsize, eff_wsize, full_dict_len, vpos_base),
+            stream_base: state.stream_base,
+            qcfg,
+            large_window,
+            has_dict,
+            use_sd,
+        };
+        if interior_end > slice_start {
+            C::run_interior(self, &env, state, md, try_avx2(use_avx2));
+        }
+        if target_end == data_len {
+            let tail = state.anchor.max(interior_end).max(slice_start);
+            self.parse_tail_env(env, arch_cfg::<C>(), tail, state, md);
+        }
+        if large_window && ldm_spans.capacity() > 0 {
+            ldm_spans.clear();
+            if let Some(ldm) = self.ldm.as_mut() {
+                ldm.spans = ldm_spans;
+            }
+        }
+        let new_pos = state.anchor.max(target_end);
+        self.next_vpos += new_pos - slice_start;
+        (self.max_vpos_used, state.pos) = (self.next_vpos, new_pos);
     }
 }
 
