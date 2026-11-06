@@ -1,4 +1,3 @@
-#![allow(unused_imports)]
 // Copyright 2024 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -950,18 +949,617 @@ fn probe_sc_mask<const SINGLE_BEAM: bool>(
     (s0.unwrap_or(0) | sc1 | (v2b(4, rb[2]) << 2) | (v2b(8, rb[3]) << 3)) & allowed_sc
 }
 
+pub(super) fn parse_chunk_optimal(
+    beam_width: usize,
+    env: ChunkEnv<'_>,
+    matches: &ChunkMatches,
+    model: &ChunkCostModel,
+    init: ([u32; 4], u8),
+    scratch: &mut OptimalParseScratch,
+) -> ChunkParseResult {
+    if beam_width == 1 {
+        parse_chunk_optimal_impl::<true>(1, env, matches, model, init, scratch)
+    } else {
+        parse_chunk_optimal_impl::<false>(beam_width, env, matches, model, init, scratch)
+    }
+}
+
+fn parse_chunk_optimal_impl<const SINGLE_BEAM: bool>(
+    beam_width: usize,
+    env: ChunkEnv<'_>,
+    matches: &ChunkMatches,
+    model: &ChunkCostModel,
+    init: ([u32; 4], u8),
+    scratch: &mut OptimalParseScratch,
+) -> ChunkParseResult {
+    assert!(matches!(beam_width, 1 | 2 | 4 | 8));
+    let bw = if SINGLE_BEAM {
+        1
+    } else {
+        beam_width.clamp(2, 8)
+    };
+    let bw_shift = if SINGLE_BEAM {
+        0
+    } else {
+        beam_width.trailing_zeros().min(3)
+    };
+    let chunk_len = env.len();
+    if chunk_len == 0 {
+        return ChunkParseResult::empty(init, 0);
+    }
+
+    let total_nodes = (chunk_len + 1) << bw_shift;
+    scratch.beam_costs.clear();
+    scratch.beam_costs.resize(total_nodes, COST_INF);
+    if scratch.beam_meta.len() < total_nodes {
+        scratch.beam_meta.resize(total_nodes, BeamMeta::default());
+    }
+    let mut beam = BeamBuf::<SINGLE_BEAM> {
+        costs: &mut scratch.beam_costs,
+        meta: &mut scratch.beam_meta,
+        bw_shift,
+    };
+    let mut hz = HorizonDispatcher::new(&mut scratch.hz, chunk_len);
+    let lit_pareto = &mut scratch.lit_pareto;
+    lit_pareto.reset();
+
+    beam.costs[0] = 0;
+    beam.meta[0] = BeamMeta {
+        rb: init.0,
+        valid_mask: init.1,
+        ..BeamMeta::default()
+    };
+
+    let mut carries_buf = [LitCarry::default(); 8];
+    let carries = &mut carries_buf[..bw];
+    let mut sc_cache = StartCostCache::default();
+    let mut cont_cache = [(u32::MAX, 0u32, 0u32); 16];
+    let (mut long_skip_start, mut long_skip_end) = (0usize, 0usize);
+
+    #[derive(Clone, Copy, Default)]
+    struct CarryPre {
+        ic_any: u8,
+        base_any: u64,
+        ic_short: u8,
+        base_short: u64,
+    }
+    #[derive(Clone, Copy)]
+    struct UniqueDist {
+        d: u32,
+        mlen: u32,
+        exp_sc: [u8; 8],
+        imp_mask: u8,
+    }
+    let mut cpre_buf = [CarryPre::default(); 8];
+    let cpre = &mut cpre_buf[..bw];
+    let mut unique_dists = [UniqueDist {
+        d: 0,
+        mlen: 0,
+        exp_sc: [u8::MAX; 8],
+        imp_mask: 0,
+    }; 64];
+    let (allowed_sc, sc_lim) = match bw {
+        1 => (0x003Fu16, 6u8),
+        2 => (0x0FFF, 12),
+        _ => (0xFFFF, 16),
+    };
+    let (lo_margin, hi_margin) = match bw {
+        1 => (2, 4),
+        8 => (8, 8),
+        _ => (4, 4),
+    };
+    let min_skip_l = if SINGLE_BEAM || bw == 8 { 128 } else { 64 };
+
+    for pos in 0..=chunk_len {
+        if pos >= 1 {
+            if let Some((cost, orig_id)) = hz.pop_at(pos) {
+                if beam.can_improve(pos, cost) {
+                    beam.insert(pos, cost, hz.s.origins[orig_id]);
+                }
+            }
+        }
+        if pos == chunk_len {
+            break;
+        }
+
+        let lit_pref_pos = model.lit_pref[pos];
+        if pos >= LIT_MONO_BASE {
+            let g18 = beam.g_at(pos - LIT_MONO_BASE, &model.lit_pref);
+            let g23 = (pos >= LIT_IC23_BASE)
+                .then(|| beam.g_at(pos - LIT_IC23_BASE, &model.lit_pref))
+                .flatten();
+            lit_pareto.push_at(pos, g18, g23);
+        }
+
+        let base_idx = pos << bw_shift;
+        update_lit_carries::<SINGLE_BEAM>(
+            carries,
+            pos,
+            &beam.costs[base_idx..base_idx + bw],
+            &beam.meta[base_idx..base_idx + bw],
+            lit_pref_pos,
+        );
+
+        if chunk_len - pos < 2 {
+            continue;
+        }
+
+        let ivs = matches.at(pos);
+        let stream_pos = env.start + pos;
+        if pos >= long_skip_start + lo_margin
+            && pos + hi_margin < long_skip_end
+            && (SINGLE_BEAM
+                || ivs
+                    .last()
+                    .is_none_or(|top| pos + (top.l_hi as usize) <= long_skip_end))
+        {
+            continue;
+        }
+        if let Some(top_iv) = ivs.last() {
+            let cand_end = pos + (top_iv.l_hi as usize);
+            let extends = if SINGLE_BEAM {
+                pos + 4 >= long_skip_end || cand_end > long_skip_end + 8
+            } else {
+                cand_end > long_skip_end
+            };
+            if (SINGLE_BEAM || bw != 8 || top_iv.dist == 1)
+                && top_iv.l_hi >= min_skip_l
+                && (top_iv.dist as usize) <= stream_pos
+                && extends
+            {
+                (long_skip_start, long_skip_end) = (pos, cand_end);
+            }
+        }
+
+        let cost_slice = pos >> COST_SLICE_SHIFT;
+        let iac_tree_idx = model.pos_iac_tree[cost_slice] as usize;
+        let iac_exp_tree = &model.iac_exp_by_cc[iac_tree_idx];
+        let iac_imp_tree = &model.iac_imp_by_ic[iac_tree_idx];
+        let dist_tree_idx = model.pos_dist_tree[cost_slice] as usize;
+
+        let max_lz_dist = env.max_lz_dist(stream_pos);
+        if max_lz_dist >= 1 {
+            let bp = (env.data[stream_pos], env.data[stream_pos + 1]);
+            let mut n_ud = 0usize;
+            let mut get_ud = |unique_dists: &mut [UniqueDist; 64], d: u32| -> usize {
+                if let Some(k) = unique_dists[..n_ud].iter().position(|ud| ud.d == d) {
+                    return k;
+                }
+                if n_ud >= unique_dists.len() {
+                    return unique_dists.len();
+                }
+                let (pos_u32, slot) = (
+                    pos as u32,
+                    &mut cont_cache[(d as usize).wrapping_mul(0x9E37) & 15],
+                );
+                let mlen = if slot.1 == d && pos_u32 > slot.0 && pos_u32 + 1 < slot.0 + slot.2 {
+                    slot.0 + slot.2 - pos_u32
+                } else {
+                    let l = env.match_len(pos, d);
+                    if l >= 3 {
+                        *slot = (pos_u32, d, l);
+                    }
+                    l
+                };
+                let idx = n_ud;
+                unique_dists[idx] = UniqueDist {
+                    d,
+                    mlen,
+                    exp_sc: [u8::MAX; 8],
+                    imp_mask: 0,
+                };
+                n_ud += 1;
+                idx
+            };
+
+            for ci in 0..bw {
+                let carry = carries[ci];
+                if !carry.used {
+                    continue;
+                }
+                let mut any_d0_hit = false;
+                if carry.any.valid_mask != 0 {
+                    let rb = carry.any.rb;
+                    let mut sc_hits = probe_sc_mask::<SINGLE_BEAM>(
+                        env,
+                        stream_pos,
+                        max_lz_dist,
+                        bp,
+                        (rb, carry.any.valid_mask),
+                        (allowed_sc, sc_lim),
+                    );
+                    any_d0_hit = (sc_hits & 1) != 0;
+                    if sc_hits != 0 {
+                        (cpre[ci].ic_any, cpre[ci].base_any) =
+                            carry.any.pre_cost(pos, lit_pref_pos);
+                        while sc_hits != 0 {
+                            let sc = sc_hits.trailing_zeros() as u8;
+                            sc_hits &= sc_hits - 1;
+                            let (slot, delta) = SHORT_CODE_SPEC[sc as usize];
+                            let d = rb[slot as usize].wrapping_add_signed(delta as i32);
+                            let u_idx = get_ud(&mut unique_dists, d);
+                            if u_idx < unique_dists.len()
+                                && unique_dists[u_idx].exp_sc[ci] == u8::MAX
+                            {
+                                unique_dists[u_idx].exp_sc[ci] = sc;
+                            }
+                        }
+                    }
+                }
+
+                if carry.has_short_ins && (carry.short.valid_mask & 1) != 0 {
+                    let d_imp = carry.short.rb[0];
+                    let imp_hit = if (carry.any.valid_mask & 1) != 0 && d_imp == carry.any.rb[0] {
+                        any_d0_hit
+                    } else {
+                        env.has_2b(stream_pos, d_imp, bp.0, bp.1)
+                    };
+                    if imp_hit {
+                        (cpre[ci].ic_short, cpre[ci].base_short) =
+                            carry.short.pre_cost(pos, lit_pref_pos);
+                        let u_idx = get_ud(&mut unique_dists, d_imp);
+                        if u_idx < unique_dists.len() {
+                            unique_dists[u_idx].imp_mask |= 1u8 << ci;
+                        }
+                    }
+                }
+            }
+
+            for ud in &unique_dists[..n_ud] {
+                let d = ud.d;
+                let min_l = if (d as usize) > stream_pos {
+                    4u32
+                } else {
+                    2u32
+                };
+                if ud.mlen < min_l {
+                    continue;
+                }
+                for cc in copy_code_only(min_l)..=copy_code_only(ud.mlen) {
+                    let (lo_l, hi_l) = (COPY_BASE[cc].max(min_l), COPY_MAX[cc].min(ud.mlen));
+                    if lo_l > hi_l {
+                        continue;
+                    }
+                    let copy_extra_q8 = (COPY_EXTRA[cc] as u64) << 8;
+                    let d_ctx = cc.min(3);
+                    let exp_iac_row = &iac_exp_tree[cc];
+                    let (mut best_c, mut best_ci, mut best_mode) = (COST_INF, 0usize, 0u8);
+
+                    for ci in 0..bw {
+                        let sc = ud.exp_sc[ci];
+                        if sc != u8::MAX {
+                            let c = cpre[ci].base_any
+                                + (exp_iac_row[cpre[ci].ic_any as usize] as u64)
+                                + copy_extra_q8
+                                + model.dist_sym_cost_q8(dist_tree_idx, d_ctx, sc as usize);
+                            if c < best_c {
+                                (best_c, best_ci, best_mode) = (c, ci, sc);
+                            }
+                        }
+                        if cc < 16 && (ud.imp_mask & (1u8 << ci)) != 0 {
+                            let c = cpre[ci].base_short
+                                + (iac_imp_tree[cpre[ci].ic_short as usize][cc] as u64)
+                                + copy_extra_q8;
+                            if c < best_c {
+                                (best_c, best_ci, best_mode) = (c, ci, DIST_MODE_IMPLICIT_D0);
+                            }
+                        }
+                    }
+                    if best_c < COST_INF {
+                        hz.emit_copy_interval::<SINGLE_BEAM>(
+                            &mut beam,
+                            pos,
+                            cc,
+                            (lo_l, hi_l),
+                            best_c,
+                            |_| {
+                                let tr = if best_mode == DIST_MODE_IMPLICIT_D0 {
+                                    carries[best_ci].short
+                                } else {
+                                    carries[best_ci].any
+                                };
+                                tr.to_meta(pos as u32, d, best_mode)
+                            },
+                        );
+                    }
+                }
+            }
+        }
+
+        let static_cands = matches.static_at(pos);
+        if !ivs.is_empty() || !static_cands.is_empty() {
+            sc_cache.reset();
+            let mut best_ge = COST_INF;
+            for ic in 0..LIT_MONO_BASE.min(pos + 1) {
+                let anc = pos - ic;
+                let bc = beam.costs[anc << bw_shift];
+                if bc < COST_INF {
+                    let ge = bc + (lit_pref_pos - model.lit_pref[anc]);
+                    sc_cache.ic_mask |= 1u32 << ic;
+                    (sc_cache.anchor[ic], sc_cache.g_extra[ic]) = (anc as u32, ge);
+                    best_ge = best_ge.min(ge);
+                }
+            }
+            if pos >= LIT_MONO_BASE {
+                let tol = if SINGLE_BEAM { 1536 } else { 2816 };
+                lit_pareto.fill_ge6(pos, lit_pref_pos, best_ge, tol, &mut sc_cache);
+            }
+
+            if sc_cache.ic_mask != 0 {
+                let pos_u = pos as u32;
+                for iv in ivs {
+                    let d = iv.dist;
+                    let dp = encode_raw_distance_params(d, model.npostfix, model.ndirect);
+                    for cc in copy_code_only(iv.l_lo)..=copy_code_only(iv.l_hi) {
+                        let (lo_l, hi_l) = (COPY_BASE[cc].max(iv.l_lo), COPY_MAX[cc].min(iv.l_hi));
+                        if lo_l > hi_l {
+                            continue;
+                        }
+                        let (end_cost, sc_anc) =
+                            sc_cache.copy_end_cost(cc, dp, dist_tree_idx, model, iac_exp_tree);
+                        hz.emit_copy_interval::<SINGLE_BEAM>(
+                            &mut beam,
+                            pos,
+                            cc,
+                            (lo_l, hi_l),
+                            end_cost,
+                            |bm| {
+                                BeamMeta::from_slot0(
+                                    bm,
+                                    sc_anc,
+                                    bw_shift,
+                                    (pos_u, d, DIST_MODE_RAW, 0),
+                                )
+                            },
+                        );
+                    }
+                }
+
+                for sm in static_cands {
+                    let cc = copy_code_only(sm.base_len as u32);
+                    let dp = encode_raw_distance_params(sm.raw_dist, model.npostfix, model.ndirect);
+                    let (end_cost, sc_anc) =
+                        sc_cache.copy_end_cost(cc, dp, dist_tree_idx, model, iac_exp_tree);
+                    let (out_l, rd, bl) = (sm.out_len as u32, sm.raw_dist, sm.base_len);
+                    beam.insert_range(pos, out_l, out_l, end_cost, |bm| {
+                        BeamMeta::from_slot0(
+                            bm,
+                            sc_anc,
+                            bw_shift,
+                            (pos_u, rd, DIST_MODE_STATIC_DICT, bl),
+                        )
+                    });
+                }
+            }
+        }
+
+        hz.flush_at_pos(&mut beam, pos);
+    }
+
+    let lit_end_total = model.lit_pref[chunk_len];
+    let last_iac_cc2 = &model.iac_exp_by_cc[*model.pos_iac_tree.last().unwrap_or(&0) as usize][2];
+    let (mut best_final_cost, mut best_end_pos, mut best_end_slot) = (COST_INF, 0usize, 0usize);
+
+    for end_pos in 0..=chunk_len {
+        let base_idx = end_pos << bw_shift;
+        for (s_idx, &ncost) in beam.costs[base_idx..base_idx + bw].iter().enumerate() {
+            if ncost >= COST_INF {
+                continue;
+            }
+            let total_c = if end_pos == chunk_len {
+                ncost
+            } else {
+                let ic = ins_code_only((chunk_len - end_pos) as u32);
+                let trail_cmd_q8 = (last_iac_cc2[ic] as u64) + ((INS_EXTRA[ic] as u64) << 8);
+                ncost + (lit_end_total - model.lit_pref[end_pos]) + trail_cmd_q8
+            };
+            if total_c < best_final_cost {
+                (best_final_cost, best_end_pos, best_end_slot) = (total_c, end_pos, s_idx);
+            }
+        }
+    }
+
+    let final_meta = beam.meta[(best_end_pos << bw_shift) + best_end_slot];
+    let trailing_literals = (chunk_len - best_end_pos) as u32;
+    let mut commands = Vec::new();
+    let (mut cur_pos, mut cur_slot) = (best_end_pos, best_end_slot);
+    while cur_pos > 0 {
+        let node = beam.meta[(cur_pos << bw_shift) + cur_slot];
+        if node.prev_end == u32::MAX {
+            break;
+        }
+        let (cmd_pos, prev_end) = (node.cmd_pos as usize, node.prev_end as usize);
+        let out_len = (cur_pos - cmd_pos) as u32;
+        let copy_len = if node.dist_mode == DIST_MODE_STATIC_DICT {
+            node.static_base_len as u32
+        } else {
+            out_len
+        };
+        commands.push(OptimalCommand::new(
+            (cmd_pos - prev_end) as u32,
+            copy_len,
+            out_len,
+            node.dist,
+            node.dist_mode,
+        ));
+        (cur_pos, cur_slot) = (prev_end, node.prev_slot as usize);
+    }
+    commands.reverse();
+
+    let res = ChunkParseResult {
+        commands,
+        trailing_literals,
+        final_rb: final_meta.rb,
+        final_valid_mask: final_meta.valid_mask,
+    };
+    debug_assert_eq!(res.covered_len(), chunk_len);
+    res
+}
+
+/// Fast single-pass greedy seed parser over prebuilt `ChunkMatches` for Pass-0 histograms and
+/// cross-chunk `dist_rb` prediction.
+pub(super) fn parse_chunk_greedy_seed(
+    env: ChunkEnv<'_>,
+    matches: &ChunkMatches,
+    (mut rb, mut vmask): ([u32; 4], u8),
+    is_q11: bool,
+) -> ChunkParseResult {
+    let (chunk_len, slice) = (env.len(), env.slice());
+    let boost_static = is_q11
+        && context::choose_context_mode_modes(
+            &slice[..slice.len().min(65_536)],
+            &context::ALL_CONTEXT_MODES[..2],
+        ) == ContextMode::UTF8;
+    let static_ov = if boost_static { 72i32 } else { 96i32 };
+    let d_bits8 = |d: u32| (encode_raw_distance_params(d, 0, 0).1 as i32) * 8;
+    let eval_at = |p: usize, anchor: usize, rb: [u32; 4], vmask: u8| {
+        let (sp, ins_len) = (env.start + p, (p - anchor) as u32);
+        let mut best = (0i32, 0u32, 0u32, 0u32, 0u8);
+        let consider =
+            |best: &mut (i32, u32, u32, u32, u8), (ol, cl, d, dm): (u32, u32, u32, u8), ov: i32| {
+                let gain = (ol as i32) * 44 - (ov + (COPY_EXTRA[copy_code_only(cl)] as i32) * 8);
+                if gain > best.0 {
+                    *best = (gain, ol, cl, d, dm);
+                }
+            };
+        let mut hits = probe_sc_mask::<true>(
+            env,
+            sp,
+            env.max_lz_dist(sp),
+            (env.data[sp], env.data[sp + 1]),
+            (rb, vmask),
+            (0x000F, 4),
+        );
+        while hits != 0 {
+            let sc = hits.trailing_zeros() as usize;
+            hits &= hits - 1;
+            let d = rb[sc];
+            let mlen = env.match_len(p, d);
+            if mlen
+                >= if (d as usize) > sp {
+                    4
+                } else {
+                    3 - u32::from(sc == 0)
+                }
+            {
+                let (dm, ov) = if sc == 0 && can_use_implicit_d0(ins_len, mlen) {
+                    (DIST_MODE_IMPLICIT_D0, 44)
+                } else {
+                    (sc as u8, 72 + (sc as i32) * 6)
+                };
+                consider(&mut best, (mlen, mlen, d, dm), ov);
+            }
+        }
+        for iv in matches.at(p) {
+            consider(
+                &mut best,
+                (iv.l_hi, iv.l_hi, iv.dist, DIST_MODE_RAW),
+                if vmask == 0 && iv.dist <= 64 { 56 } else { 88 } + d_bits8(iv.dist),
+            );
+        }
+        if boost_static || best.1 < 7 {
+            for sm in matches.static_at(p) {
+                consider(
+                    &mut best,
+                    (
+                        sm.out_len as u32,
+                        sm.base_len as u32,
+                        sm.raw_dist,
+                        DIST_MODE_STATIC_DICT,
+                    ),
+                    static_ov + d_bits8(sm.raw_dist),
+                );
+            }
+        }
+        best
+    };
+
+    let mut commands = Vec::with_capacity(chunk_len / 8);
+    let (mut anchor, mut pos, mut cached) = (0usize, 0usize, None);
+    while pos + 2 <= chunk_len {
+        let mut best = cached
+            .take()
+            .unwrap_or_else(|| eval_at(pos, anchor, rb, vmask));
+        if best.0 <= 0 {
+            pos += 1;
+            continue;
+        }
+        if best.1 < 32 && pos + 3 <= chunk_len {
+            let nxt = eval_at(pos + 1, anchor, rb, vmask);
+            if nxt.0 > best.0 + 10 {
+                cached = Some(nxt);
+                pos += 1;
+                continue;
+            }
+        }
+        let ins_len = (pos - anchor) as u32;
+        if best.4 == DIST_MODE_IMPLICIT_D0 && !can_use_implicit_d0(ins_len, best.2) {
+            best.4 = 0;
+        }
+        commands.push(OptimalCommand::new(ins_len, best.2, best.1, best.3, best.4));
+        (rb, vmask) = advance_dist_rb(rb, vmask, best.3, best.4);
+        pos += best.1 as usize;
+        anchor = pos;
+    }
+
+    ChunkParseResult {
+        commands,
+        trailing_literals: (chunk_len - anchor) as u32,
+        final_rb: rb,
+        final_valid_mask: vmask,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block_split::{try_plan_metablock, PlanOpts};
     use crate::constants::{MAX_ALLOWED_DISTANCE, STD_MAX_RAW_STATIC_DIST};
     use crate::map_to_sym::dist_alphabet_size;
+    use crate::q11::match_gen::{tests::build_test_matches, ChunkMatches};
     use crate::q11::test_helpers::miri_or;
+
+    const INIT_RB: ([u32; 4], u8) = (INITIAL_LAST_DISTANCES, 0x0F);
+
+    fn test_plan(env: ChunkEnv<'_>, res: &ChunkParseResult, effort: u8) -> MetablockPlan {
+        try_plan_metablock(
+            env.data,
+            env.start,
+            env.end,
+            &res.commands,
+            res.trailing_literals,
+            PlanOpts::q11(false, effort, 1),
+        )
+        .unwrap()
+    }
+
+    fn setup_dp(buf: &[u8]) -> (ChunkEnv<'_>, ChunkMatches, ChunkCostModel) {
+        let env = ChunkEnv::new(buf, 0, buf.len(), 1 << 20, &[]);
+        let cm = build_test_matches(env, miri_or(10, 11));
+        let res0 = parse_chunk_greedy_seed(env, &cm, INIT_RB, true);
+        let mut model = ChunkCostModel::default();
+        model.refine_from_metablock_plan(env, &res0.commands, &test_plan(env, &res0, 11));
+        (env, cm, model)
+    }
+
+    fn check_opt(
+        bw: usize,
+        env: ChunkEnv<'_>,
+        cm: &ChunkMatches,
+        model: &ChunkCostModel,
+        sc: &mut OptimalParseScratch,
+    ) -> ChunkParseResult {
+        let res = parse_chunk_optimal(bw, env, cm, model, INIT_RB, sc);
+        assert_eq!(res.covered_len(), env.len());
+        res
+    }
 
     #[test]
     fn test_lit_pareto_mono_invariants_and_p23_oracle() {
-        let (n, check_mod, win_lo, win_hi) = miri_or(
-            (384usize, 31usize, 320usize, 350usize),
-            (26_000, 197, 22_590, 22_615),
+        let n = miri_or(23_000usize, 26_000);
+        let (head_chk, stride, tail_chk) = miri_or(
+            (32usize, 4099usize, 22593..=22597),
+            (160, 197, 22590..=22615),
         );
         let mut raw_g = vec![None::<i64>; n];
         let mut lp = LitPareto::default();
@@ -989,7 +1587,7 @@ mod tests {
                 lp.push_at(pos, g18, g23);
             }
 
-            if pos < 96 || pos.is_multiple_of(check_mod) || (win_lo..=win_hi).contains(&pos) {
+            if pos < head_chk || pos % stride == 0 || tail_chk.contains(&pos) {
                 let s = &lp.mono[lp.head..];
                 for w in s.windows(2) {
                     assert!(w[0].0 < w[1].0 && w[0].1 < w[1].1);
@@ -1048,7 +1646,7 @@ mod tests {
             );
         }
         let mut rng = 0x9E37_79B9_7F4A_7C15u64;
-        for trial in 0..miri_or(256usize, 4000) {
+        for trial in 0..miri_or(128usize, 4000) {
             rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
             let win8 = match trial % 4 {
                 0 => 0x01_00_01_00_80_7F_01_00u64 ^ (rng & 0x00FF_0000_0000_FF00),
@@ -1073,7 +1671,7 @@ mod tests {
     fn test_encode_raw_distance_all_npostfix_ndirect() {
         #[rustfmt::skip]
         let extra = [1008, 4096, 65535, 65536, 1_000_000, 16_777_200, MAX_ALLOWED_DISTANCE as u32];
-        let test_dists: Vec<u32> = (1..=miri_or(36u32, 300)).chain(extra).collect();
+        let test_dists: Vec<u32> = (1..=miri_or(16, 300)).chain(extra).collect();
         for np in 0..=3u8 {
             for k in 0..=15u8 {
                 let nd = k << np;
@@ -1103,6 +1701,107 @@ mod tests {
                     assert_eq!(dec, d);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_optimal_parse_rle_and_prose_roundtrip_accounting() {
+        let mut sc = OptimalParseScratch::default();
+        let rle = vec![b'A'; miri_or(96, 65_536)];
+        let (env_r, cm_r, model_r) = setup_dp(&rle);
+        assert!(
+            check_opt(miri_or(2, 4), env_r, &cm_r, &model_r, &mut sc)
+                .commands
+                .len()
+                <= 2
+        );
+
+        let prose: Vec<u8> = (0..miri_or(1u32, 80))
+            .flat_map(|i| {
+                format!(
+                    "Information about the government of the United States and University research: {{\"idx\":{i},\"ok\":true}}\n"
+                )
+                .into_bytes()
+            })
+            .collect();
+        let (env_p, cm_p, mut model_p) = setup_dp(&prose);
+        let bw = miri_or(2, 4);
+        let pass1 = check_opt(bw, env_p, &cm_p, &model_p, &mut sc);
+        model_p.refine_from_metablock_plan(env_p, &pass1.commands, &test_plan(env_p, &pass1, 11));
+        check_opt(miri_or(8, 4), env_p, &cm_p, &model_p, &mut sc);
+    }
+
+    #[test]
+    fn test_horizon_ring512_oracle_parity_and_long_span_dp() {
+        let n = miri_or(640usize, 4096);
+        let mut oracle = vec![u64::MAX; n + 1];
+        let mut s_hz = HorizonScratch::default();
+        let mut disp = HorizonDispatcher::new(&mut s_hz, n);
+        let (mut dc, mut dm) = (vec![COST_INF; n + 1], vec![BeamMeta::default(); n + 1]);
+        let mut dummy_beam = BeamBuf::<true> {
+            costs: &mut dc,
+            meta: &mut dm,
+            bw_shift: 0,
+        };
+        let (mut rng, mut next_oid) = (0xD1CE_BEEF_4242_9999u64, 0u32);
+        for pos in 0..=n {
+            if pos >= 1 {
+                let exp_pk = oracle[pos];
+                let exp = (exp_pk != u64::MAX).then_some((
+                    exp_pk >> PACKED_COST_SHIFT,
+                    (exp_pk & PACKED_ID_MASK) as usize,
+                ));
+                assert_eq!(disp.pop_at(pos), exp, "pos={pos}");
+            }
+            if pos == n {
+                break;
+            }
+            for _ in 0..=(((rng >> 60) as usize) & 3) {
+                rng = rng
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let a = 1 + ((rng as usize) % 350);
+                let b = (a + (((rng >> 16) as usize) % 250)).min(HORIZON_LEN);
+                let (lo_pos, hi_pos) = (pos + a, (pos + b).min(n));
+                if lo_pos <= hi_pos {
+                    let cost = pos as u64 * 1024 + ((rng >> 32) & 7);
+                    let pk = (cost << PACKED_COST_SHIFT) | (next_oid as u64);
+                    next_oid += 1;
+                    oracle[lo_pos..=hi_pos]
+                        .iter_mut()
+                        .for_each(|x| *x = (*x).min(pk));
+                    disp.emit_flushed_span(
+                        &mut dummy_beam,
+                        pos,
+                        PendingSpan {
+                            cost,
+                            lo: a as u32,
+                            hi: b as u32,
+                            meta: BeamMeta::default(),
+                        },
+                    );
+                }
+            }
+        }
+
+        let block600 = b"LongRepeatedStructuredBlock_0123456789_ABCDEFGHIJKLMNOPQRSTUVWXYZ_"
+            .repeat(miri_or(8, 10));
+        let mut buf = block600.clone();
+        for i in 0..miri_or(1u32, 120) {
+            buf.extend_from_slice(
+                format!("entry={i} the quick brown fox jumps over the lazy dog; ").as_bytes(),
+            );
+        }
+        buf.extend_from_slice(&block600);
+
+        let (env, cm, mut model) = setup_dp(&buf);
+        let mut sc = OptimalParseScratch::default();
+        check_opt(1, env, &cm, &model, &mut sc);
+        if !cfg!(miri) {
+            check_opt(2, env, &cm, &model, &mut sc);
+            let r4 = check_opt(4, env, &cm, &model, &mut sc);
+            model.refine_from_metablock_plan(env, &r4.commands, &test_plan(env, &r4, 12));
+            check_opt(8, env, &cm, &model, &mut sc);
         }
     }
 }
