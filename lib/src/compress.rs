@@ -336,14 +336,18 @@ impl MetablockData {
         let (buf, iac_code) = HuffmanCode::from_counts(&iac_hist[..MAX_IAC], 15, buf);
         let (buf, dist_code) = HuffmanCode::from_counts(dist_hist, 15, buf);
         let (_, lit_code) = HuffmanCode::from_counts(&lit_hist.data, 15, buf);
+        let ctx_modes = [self.context_mode];
+        let iac_codes = [iac_code];
+        let dist_codes = [dist_code];
+        let lit_codes = [lit_code];
         let header = metablock::Header {
             len: count,
-            context_mode: vec![self.context_mode],
-            insert_and_copy_codes: vec![iac_code],
+            context_mode: &ctx_modes,
+            insert_and_copy_codes: &iac_codes,
             distance_cmap: ContextMap::new(&[0; 4]),
-            distance_codes: vec![dist_code],
+            distance_codes: &dist_codes,
             literals_cmap: ContextMap::new(&[0; 64]),
-            literals_codes: vec![lit_code],
+            literals_codes: &lit_codes,
             ..Default::default()
         };
         header.write(bw);
@@ -534,12 +538,7 @@ impl<
                 virtual_start += SHIFT_INTERVAL;
             }
         }
-        let header = metablock::Header {
-            islast: true,
-            islastempty: true,
-            ..Default::default()
-        };
-        header.write(&mut bw);
+        metablock::write_empty_last_metablock(&mut bw);
         Some(bw.finalize())
     }
 }
