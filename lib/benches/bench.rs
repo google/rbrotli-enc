@@ -12,30 +12,38 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    fs,
-    mem::MaybeUninit,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{fs, mem::MaybeUninit, path::Path, time::Duration};
 
 use criterion::{
     criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, Criterion, Throughput,
 };
 use rbrotli_enc_lib::Encoder;
 
+fn read_bench_file(file: &str) -> Option<Vec<u8>> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for dir in [
+        Path::new("data"),
+        &manifest_dir.join("data"),
+        &manifest_dir.join("../data"),
+    ] {
+        if let Ok(bytes) = fs::read(dir.join(file)) {
+            return Some(bytes);
+        }
+    }
+    eprintln!("skipping benchmark input {file:?} (not found under data/)");
+    None
+}
+
 fn bench_impl(c: &mut BenchmarkGroup<WallTime>, files: &[&str], quality: u32) {
     let mut encoder = Encoder::new(quality);
     for file in files {
-        let f = fs::read(format!("data/{}", file)).unwrap();
-        let outbuf = Arc::new(Mutex::new(vec![
-            MaybeUninit::uninit();
-            encoder.max_required_size(f.len())
-        ]));
+        let Some(f) = read_bench_file(file) else {
+            continue;
+        };
+        let mut outbuf = vec![MaybeUninit::uninit(); encoder.max_required_size(f.len())];
         c.throughput(Throughput::Bytes(f.len() as u64));
         c.bench_with_input(file.to_owned(), &f, |b, f| {
             b.iter(|| {
-                let mut outbuf = outbuf.lock().unwrap();
                 encoder.compress(f, Some(&mut outbuf)).unwrap();
             })
         });
