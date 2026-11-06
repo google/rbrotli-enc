@@ -23,6 +23,7 @@ mod hashtable;
 mod huffman;
 #[allow(dead_code, unused_imports)]
 mod map_to_sym;
+#[allow(dead_code)]
 mod metablock;
 
 pub use compress::Encoder;

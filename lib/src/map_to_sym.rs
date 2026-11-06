@@ -14,8 +14,7 @@
 
 use crate::constants::*;
 use crate::huffman::HuffmanCodeEntry;
-const DIST_MODE_IMPLICIT_D0: u8 = 1;
-const DIST_MODE_STATIC_DICT: u8 = 2;
+use crate::metablock::{DIST_MODE_IMPLICIT_D0, DIST_MODE_STATIC_DICT};
 use bounded_utils::{BoundedArrayExt, BoundedPrefix, BoundedU16, BoundedU8, BoundedUsize};
 use lsb_bitwriter::BitStreamCursor;
 #[cfg(target_arch = "x86_64")]
