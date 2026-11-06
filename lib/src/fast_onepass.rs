@@ -42,10 +42,14 @@ use crate::stream::ChunkStreamEncoder;
 use bounded_utils::{
     BoundedArrayExt, BoundedPrefix, BoundedPrefixCursor, BoundedU16, BoundedU8, BoundedUsize,
 };
+#[cfg(target_arch = "aarch64")]
+use core::arch::aarch64::*;
 use lsb_bitwriter::{BitStreamCursor, BitWriter};
+#[cfg(target_arch = "aarch64")]
+use safe_unaligned_simd::aarch64::vld1q_u8;
 #[cfg(target_arch = "x86_64")]
 use safe_unaligned_simd::x86_64::_mm256_loadu_si256;
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use simd_tokens::{simd_entry, SimdToken};
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -443,16 +447,48 @@ fn or_rows_avx2(c32s: &[[u8; 32]], _tok: impl SimdToken) -> u16 {
     fold8_avx2(alo) | (fold8_avx2(ahi) << 8)
 }
 
-fn compute_present_rows(chunk: &[u8], mut mask: u16, avx2: OptSimd) -> u16 {
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+fn fold8_neon(a: uint8x16_t) -> u16 {
+    let p = vreinterpret_u64_u8(vorr_u8(vget_low_u8(a), vget_high_u8(a)));
+    let mut w = vget_lane_u64::<0>(p);
+    w |= w >> 32;
+    w |= w >> 16;
+    ((w | (w >> 8)) & 0xFF) as u16
+}
+
+#[cfg(target_arch = "aarch64")]
+#[simd_entry]
+#[target_feature(enable = "neon")]
+fn or_rows_neon(c16s: &[[u8; 16]], _tok: impl SimdToken) -> u16 {
+    let lut_lo = vld1q_u8(&[1, 2, 4, 8, 16, 32, 64, 128, 0, 0, 0, 0, 0, 0, 0, 0]);
+    let lut_hi = vld1q_u8(&[0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 4, 8, 16, 32, 64, 128]);
+    let (mut alo, mut ahi) = (vdupq_n_u8(0), vdupq_n_u8(0));
+    for c16 in c16s {
+        let hi = vshrq_n_u8::<4>(vld1q_u8(c16));
+        alo = vorrq_u8(alo, vqtbl1q_u8(lut_lo, hi));
+        ahi = vorrq_u8(ahi, vqtbl1q_u8(lut_hi, hi));
+    }
+    fold8_neon(alo) | (fold8_neon(ahi) << 8)
+}
+
+fn compute_present_rows(chunk: &[u8], mut mask: u16, simd: OptSimd) -> u16 {
     for block in chunk.chunks(4096) {
         if mask == 0xFFFF {
             return 0xFFFF;
         }
-        let tail = match avx2 {
+        let tail = match simd {
             #[cfg(target_arch = "x86_64")]
             Some(tok) => {
                 let (c32s, rem) = block.as_chunks::<32>();
                 mask |= or_rows_avx2(c32s, tok);
+                rem
+            }
+            #[cfg(target_arch = "aarch64")]
+            Some(tok) => {
+                let (c16s, rem) = block.as_chunks::<16>();
+                mask |= or_rows_neon(c16s, tok);
                 rem
             }
             _ => block,
@@ -1155,7 +1191,76 @@ macro_rules! def_fast_parse_chunk {
             $body
         }
 
-        #[cfg_attr(target_arch = "x86_64", cold)]
+        #[cfg(target_arch = "aarch64")]
+        #[simd_entry]
+        #[target_feature(enable = "neon")]
+        #[inline(never)]
+        #[allow(clippy::too_many_arguments)]
+        fn fast_parse_neon<
+            const $MODE_PB: u8,
+            const LW: bool,
+            const $IS_Q0: bool,
+            const MODE: u8,
+            const MLS: u8,
+            const FLAG: bool,
+            I: FastSinkInit,
+        >(
+            $ts: TableSlices1<'_>,
+            $vpos_base: usize,
+            $span: ChunkSpan<'_>,
+            $ldm_spans: &[FastLdmSpan],
+            $ring: &mut [u32; 2],
+            $init: I,
+            $simd: A64Neon,
+            _tok: impl SimdToken,
+        ) -> bool {
+            let ($lw, $mode, $hd, $mls, $flag) = (!$IS_Q0 && LW, MODE, false, MLS, FLAG);
+            $body
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        #[simd_entry]
+        #[target_feature(enable = "neon")]
+        #[inline(never)]
+        #[allow(clippy::too_many_arguments)]
+        fn fast_parse_neon_dict<const $MODE_PB: u8, const $IS_Q0: bool, I: FastSinkInit>(
+            $ts: TableSlices1<'_>,
+            $vpos_base: usize,
+            ($mode, $mls, $flag): (u8, u8, bool),
+            $span: ChunkSpan<'_>,
+            $ldm_spans: &[FastLdmSpan],
+            $ring: &mut [u32; 2],
+            $init: I,
+            $simd: A64Neon,
+            _tok: impl SimdToken,
+        ) -> bool {
+            let ($lw, $hd) = (false, true);
+            let $mode = if $IS_Q0 { 0 } else { $mode };
+            $body
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        #[simd_entry]
+        #[target_feature(enable = "neon")]
+        #[inline(never)]
+        #[allow(clippy::too_many_arguments)]
+        fn fast_parse_neon_dyn<const $IS_Q0: bool, I: FastSinkInit>(
+            $ts: TableSlices1<'_>,
+            $vpos_base: usize,
+            ($lw, $mode, $hd, $mls, $flag): (bool, u8, bool, u8, bool),
+            $span: ChunkSpan<'_>,
+            $ldm_spans: &[FastLdmSpan],
+            $ring: &mut [u32; 2],
+            $init: I,
+            $simd: A64Neon,
+            _tok: impl SimdToken,
+        ) -> bool {
+            const $MODE_PB: u8 = 0;
+            let $mode = if $IS_Q0 { 0 } else { $mode };
+            $body
+        }
+
+        #[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), cold)]
         #[inline(never)]
         fn fast_parse_scalar<const $IS_Q0: bool, I: FastSinkInit>(
             $ts: TableSlices1<'_>,
@@ -1182,12 +1287,12 @@ macro_rules! def_fast_parse_chunk {
             ldm_spans: &[FastLdmSpan],
             ring: &mut [u32; 2],
             init: I,
-            avx2: OptSimd,
+            simd: OptSimd,
         ) -> bool {
             let dict_no_lw = cfg.2 && !cfg.0;
             let dict23 = dict_no_lw && IS_Q0 && ts.tag_mask == !((1u32 << 23) - 1);
             let dict25 = dict_no_lw && ts.tag_mask == !((1u32 << 25) - 1);
-            match avx2 {
+            match simd {
                 #[cfg(target_arch = "x86_64")]
                 Some(tok) if dict23 => fast_parse_avx2_dict::<23, IS_Q0, I>(
                     ts,
@@ -1214,6 +1319,34 @@ macro_rules! def_fast_parse_chunk {
                 ),
                 #[cfg(target_arch = "x86_64")]
                 Some(tok) => fast_parse_avx2_dyn::<IS_Q0, I>(
+                    ts, vpos_base, cfg, span, ldm_spans, ring, init, tok, tok,
+                ),
+                #[cfg(target_arch = "aarch64")]
+                Some(tok) if dict23 => fast_parse_neon_dict::<23, IS_Q0, I>(
+                    ts,
+                    vpos_base,
+                    (cfg.1, cfg.3, cfg.4),
+                    span,
+                    ldm_spans,
+                    ring,
+                    init,
+                    tok,
+                    tok,
+                ),
+                #[cfg(target_arch = "aarch64")]
+                Some(tok) if dict25 => fast_parse_neon_dict::<25, IS_Q0, I>(
+                    ts,
+                    vpos_base,
+                    (cfg.1, cfg.3, cfg.4),
+                    span,
+                    ldm_spans,
+                    ring,
+                    init,
+                    tok,
+                    tok,
+                ),
+                #[cfg(target_arch = "aarch64")]
+                Some(tok) => fast_parse_neon_dyn::<IS_Q0, I>(
                     ts, vpos_base, cfg, span, ldm_spans, ring, init, tok, tok,
                 ),
                 _ => fast_parse_scalar::<IS_Q0, I>(ts, vpos_base, cfg, span, ldm_spans, ring, init),
@@ -1629,7 +1762,7 @@ pub(crate) fn compress_fast_with_tok<E: ChunkStreamEncoder>(
     data: &[u8],
     dict: Option<&PreparedDictionary>,
     bw: &mut BitWriter<'_>,
-    avx2: OptSimd,
+    simd: OptSimd,
 ) {
     let (wbits, n) = (enc.wbits(), data.len());
     write_window_bits(wbits, wbits > STD_MAX_WBITS, bw);
@@ -1641,7 +1774,7 @@ pub(crate) fn compress_fast_with_tok<E: ChunkStreamEncoder>(
         return;
     }
     let mut ring = INITIAL_RING01;
-    enc.run_chunks((Some(n), true, 0), data, 0..n, dict, &mut ring, bw, avx2);
+    enc.run_chunks((Some(n), true, 0), data, 0..n, dict, &mut ring, bw, simd);
 }
 
 #[inline(always)]
@@ -1822,7 +1955,7 @@ impl OnePassEncoder {
         ring: &mut [u32; 2],
         bw: &mut BitWriter,
         bank: &FixedBank,
-        avx2: OptSimd,
+        simd: OptSimd,
     ) -> (usize, bool) {
         let mut raw_chunk = &span.prefix[span.start..];
         let mut chunk_len = raw_chunk.len();
@@ -1913,7 +2046,7 @@ impl OnePassEncoder {
                     for (r, row) in raw_sample.as_chunks::<16>().0.iter().enumerate() {
                         init_mask |= u16::from(row.iter().any(|&c| c != 0)) << r;
                     }
-                    compute_present_rows(raw_chunk, init_mask, avx2)
+                    compute_present_rows(raw_chunk, init_mask, simd)
                 };
                 for r in 0..16 {
                     if ((present_rows >> r) & 1) != 0 {
@@ -1965,11 +2098,11 @@ impl OnePassEncoder {
                 hist: rolling.as_mut(),
                 high_ent_lits,
             };
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             macro_rules! q0_pb {
-                ($t:ident, $p:literal) => {
+                ($func:ident, $t:ident, $p:literal) => {
                     match (mls, track) {
-                        (4, false) => fast_parse_avx2::<$p, false, true, 0, 4, false, _>(
+                        (4, false) => $func::<$p, false, true, 0, 4, false, _>(
                             ts,
                             vpos_base,
                             span,
@@ -1979,7 +2112,7 @@ impl OnePassEncoder {
                             $t,
                             $t,
                         ),
-                        (5, false) => fast_parse_avx2::<$p, false, true, 0, 5, false, _>(
+                        (5, false) => $func::<$p, false, true, 0, 5, false, _>(
                             ts,
                             vpos_base,
                             span,
@@ -1989,7 +2122,7 @@ impl OnePassEncoder {
                             $t,
                             $t,
                         ),
-                        (5, true) => fast_parse_avx2::<$p, false, true, 0, 5, true, _>(
+                        (5, true) => $func::<$p, false, true, 0, 5, true, _>(
                             ts,
                             vpos_base,
                             span,
@@ -2007,18 +2140,24 @@ impl OnePassEncoder {
                             &[],
                             ring,
                             init,
-                            avx2,
+                            simd,
                         ),
                     }
                 };
             }
-            match (avx2, hd, self.pos_bits) {
+            match (simd, hd, self.pos_bits) {
                 #[cfg(target_arch = "x86_64")]
-                (Some(tok), false, 23) => q0_pb!(tok, 23),
+                (Some(tok), false, 23) => q0_pb!(fast_parse_avx2, tok, 23),
                 #[cfg(target_arch = "x86_64")]
-                (Some(tok), false, 25) => q0_pb!(tok, 25),
+                (Some(tok), false, 25) => q0_pb!(fast_parse_avx2, tok, 25),
                 #[cfg(target_arch = "x86_64")]
-                (Some(tok), false, 26) => q0_pb!(tok, 26),
+                (Some(tok), false, 26) => q0_pb!(fast_parse_avx2, tok, 26),
+                #[cfg(target_arch = "aarch64")]
+                (Some(tok), false, 23) => q0_pb!(fast_parse_neon, tok, 23),
+                #[cfg(target_arch = "aarch64")]
+                (Some(tok), false, 25) => q0_pb!(fast_parse_neon, tok, 25),
+                #[cfg(target_arch = "aarch64")]
+                (Some(tok), false, 26) => q0_pb!(fast_parse_neon, tok, 26),
                 _ => fast_parse_dyn::<true, _>(
                     ts,
                     vpos_base,
@@ -2027,7 +2166,7 @@ impl OnePassEncoder {
                     &[],
                     ring,
                     init,
-                    avx2,
+                    simd,
                 ),
             }
         };
@@ -2230,7 +2369,26 @@ macro_rules! def_twopass_p2 {
             $body
         }
 
-        #[cfg_attr(target_arch = "x86_64", cold)]
+        #[cfg(target_arch = "aarch64")]
+        #[simd_entry]
+        #[target_feature(enable = "neon")]
+        #[inline(never)]
+        #[allow(clippy::too_many_arguments)]
+        fn twopass_p2_neon(
+            $prefix: &[u8],
+            $cmds: &[FastCmd],
+            $lit_lut: &[HuffmanCodeEntry; 256],
+            $lit_singleton: bool,
+            $iac_lut: &[HuffmanCodeEntry; MAX_IAC],
+            $dist_lut: &DistLut,
+            $bw: &mut BitWriter<'_>,
+            $simd: A64Neon,
+            _tok: impl SimdToken,
+        ) {
+            $body
+        }
+
+        #[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), cold)]
         #[inline(never)]
         #[allow(clippy::too_many_arguments)]
         fn twopass_p2_scalar(
@@ -2453,17 +2611,32 @@ fn count_fast_cmd_lits_avx2(
     count_fast_cmd_lits_impl(raw_chunk, known_lits, cmds, out);
 }
 
+#[cfg(target_arch = "aarch64")]
+#[simd_entry]
+#[target_feature(enable = "neon")]
+fn count_fast_cmd_lits_neon(
+    raw_chunk: &[u8],
+    known_lits: usize,
+    cmds: &[FastCmd],
+    out: &mut [u32; 256],
+    _tok: impl SimdToken,
+) {
+    count_fast_cmd_lits_impl(raw_chunk, known_lits, cmds, out);
+}
+
 #[inline(never)]
 fn count_fast_cmd_lits(
     raw_chunk: &[u8],
     known_lits: usize,
     cmds: &[FastCmd],
     out: &mut [u32; 256],
-    avx2: OptSimd,
+    simd: OptSimd,
 ) {
-    match avx2 {
+    match simd {
         #[cfg(target_arch = "x86_64")]
         Some(tok) => count_fast_cmd_lits_avx2(raw_chunk, known_lits, cmds, out, tok),
+        #[cfg(target_arch = "aarch64")]
+        Some(tok) => count_fast_cmd_lits_neon(raw_chunk, known_lits, cmds, out, tok),
         _ => count_fast_cmd_lits_impl(raw_chunk, known_lits, cmds, out),
     }
 }
@@ -2475,7 +2648,7 @@ fn encode_twopass_chunk(
     span: ChunkSpan<'_>,
     ring: &mut [u32; 2],
     bw: &mut BitWriter,
-    avx2: OptSimd,
+    simd: OptSimd,
 ) -> bool {
     let raw_chunk = &span.prefix[span.start..];
     let chunk_len = raw_chunk.len();
@@ -2496,7 +2669,7 @@ fn encode_twopass_chunk(
                 span.eff_wsize,
                 vpos_base,
                 ldm_spans,
-                avx2.is_some(),
+                simd.is_some(),
             );
         } else {
             ldm_spans.clear();
@@ -2524,12 +2697,12 @@ fn encode_twopass_chunk(
             (&mut *cmds_buf, &mut st, span.start),
             &ldm_spans[..],
         );
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         macro_rules! p1_all {
-            ($tok:ident, $mpb:literal, $lw_c:literal) => {{
+            ($func:ident, $tok:ident, $mpb:literal, $lw_c:literal) => {{
                 macro_rules! run {
                     ($m:literal, $mls:literal, $sd:literal) => {
-                        fast_parse_avx2::<$mpb, $lw_c, false, $m, $mls, $sd, _>(
+                        $func::<$mpb, $lw_c, false, $m, $mls, $sd, _>(
                             ts, vpos_base, span, ldm, ring, init, $tok, $tok,
                         )
                     };
@@ -2543,29 +2716,39 @@ fn encode_twopass_chunk(
                 }
             }};
         }
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         macro_rules! p1_big_lw {
-            ($tok:ident, $mpb:literal) => {
+            ($func:ident, $tok:ident, $mpb:literal) => {
                 match (mode >= 2, chunk_sd) {
-                    (true, true) => fast_parse_avx2::<$mpb, true, false, 2, 4, true, _>(
+                    (true, true) => $func::<$mpb, true, false, 2, 4, true, _>(
                         ts, vpos_base, span, ldm, ring, init, $tok, $tok,
                     ),
-                    (true, false) => fast_parse_avx2::<$mpb, true, false, 2, 4, false, _>(
+                    (true, false) => $func::<$mpb, true, false, 2, 4, false, _>(
                         ts, vpos_base, span, ldm, ring, init, $tok, $tok,
                     ),
-                    (false, _) => fast_parse_avx2::<$mpb, true, false, 1, 6, false, _>(
+                    (false, _) => $func::<$mpb, true, false, 1, 6, false, _>(
                         ts, vpos_base, span, ldm, ring, init, $tok, $tok,
                     ),
                 }
             };
         }
-        let _ = match (avx2, hd, lw, pos_bits) {
+        let _ = match (simd, hd, lw, pos_bits) {
             #[cfg(target_arch = "x86_64")]
-            (Some(tok), false, false, 25) => p1_all!(tok, 25, false),
+            (Some(tok), false, false, 25) => p1_all!(fast_parse_avx2, tok, 25, false),
             #[cfg(target_arch = "x86_64")]
-            (Some(tok), false, true, 25) => p1_all!(tok, 25, true),
+            (Some(tok), false, true, 25) => p1_all!(fast_parse_avx2, tok, 25, true),
             #[cfg(target_arch = "x86_64")]
-            (Some(tok), false, true, 29) if mode >= 2 || mls == 6 => p1_big_lw!(tok, 29),
+            (Some(tok), false, true, 29) if mode >= 2 || mls == 6 => {
+                p1_big_lw!(fast_parse_avx2, tok, 29)
+            }
+            #[cfg(target_arch = "aarch64")]
+            (Some(tok), false, false, 25) => p1_all!(fast_parse_neon, tok, 25, false),
+            #[cfg(target_arch = "aarch64")]
+            (Some(tok), false, true, 25) => p1_all!(fast_parse_neon, tok, 25, true),
+            #[cfg(target_arch = "aarch64")]
+            (Some(tok), false, true, 29) if mode >= 2 || mls == 6 => {
+                p1_big_lw!(fast_parse_neon, tok, 29)
+            }
             _ => fast_parse_dyn::<false, _>(
                 ts,
                 vpos_base,
@@ -2574,7 +2757,7 @@ fn encode_twopass_chunk(
                 ldm,
                 ring,
                 init,
-                avx2,
+                simd,
             ),
         };
     }
@@ -2586,7 +2769,7 @@ fn encode_twopass_chunk(
     if st.total_lits == 0 {
         lit_counts[0] = 1;
     } else {
-        count_fast_cmd_lits(raw_chunk, st.total_lits, cmds, &mut lit_counts, avx2);
+        count_fast_cmd_lits(raw_chunk, st.total_lits, cmds, &mut lit_counts, simd);
     }
 
     if should_emit_uncompressed(
@@ -2626,9 +2809,21 @@ fn encode_twopass_chunk(
     dist_huff.write(bw);
 
     let lit_singleton = lit_huff.singleton.is_some();
-    match avx2 {
+    match simd {
         #[cfg(target_arch = "x86_64")]
         Some(tok) => twopass_p2_avx2(
+            raw_chunk,
+            cmds,
+            &lit_lut,
+            lit_singleton,
+            &iac_lut,
+            &dist_lut,
+            bw,
+            tok,
+            tok,
+        ),
+        #[cfg(target_arch = "aarch64")]
+        Some(tok) => twopass_p2_neon(
             raw_chunk,
             cmds,
             &lit_lut,
@@ -2681,7 +2876,7 @@ impl ChunkStreamEncoder for OnePassEncoder {
         dict: Option<&PreparedDictionary>,
         ring: &mut [u32; 2],
         bw: &mut BitWriter<'_>,
-        avx2: OptSimd,
+        simd: OptSimd,
     ) {
         if prep_len.is_some() {
             self.icd_age = 0;
@@ -2698,7 +2893,7 @@ impl ChunkStreamEncoder for OnePassEncoder {
             data,
             range,
             bw,
-            |span, bw| self.encode_one_chunk(hd, span, (is_eof, end), ring, bw, bank, avx2),
+            |span, bw| self.encode_one_chunk(hd, span, (is_eof, end), ring, bw, bank, simd),
         );
     }
 }
@@ -2720,7 +2915,7 @@ impl ChunkStreamEncoder for FastTwoPassEncoder {
         dict: Option<&PreparedDictionary>,
         ring: &mut [u32; 2],
         bw: &mut BitWriter<'_>,
-        avx2: OptSimd,
+        simd: OptSimd,
     ) {
         let raw_wsize = window_size(self.wbits);
         let dict_info = prepare_fast_ht(&mut self.ht, raw_wsize, prep_len, dict);
@@ -2740,7 +2935,7 @@ impl ChunkStreamEncoder for FastTwoPassEncoder {
                     span,
                     ring,
                     bw,
-                    avx2,
+                    simd,
                 );
                 (chunk_end, uncomp)
             },
@@ -2765,7 +2960,7 @@ mod tests {
             fast_twopass_max_output_size_for(inp.len(), ONEPASS_CHUNK_SIZE),
             dict.map(|(p, _)| p),
         );
-        let enc = |avx| {
+        let enc = |simd| {
             let mut buf = vec![0u8; cap];
             let mut bw = BitWriter::new(&mut buf);
             compress_fast_with_tok(
@@ -2773,7 +2968,7 @@ mod tests {
                 inp,
                 prep,
                 &mut bw,
-                avx,
+                simd,
             );
             bw.finalize().to_vec()
         };
@@ -2879,7 +3074,7 @@ mod tests {
     #[test]
     fn test_onepass_avx2_parity_regimes_dict_lw_and_stream() {
         let tok = try_simd(true);
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         if let Some(t) = tok {
             let bank = fixed_bank();
             let all_256: Vec<u8> = (0u8..=255).collect();
