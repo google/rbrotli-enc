@@ -43,6 +43,7 @@ use crate::{
         DIST_MODE_STATIC_DICT,
     },
     q11::Q11Encoder,
+    stream::{StreamEngine, StreamOp},
 };
 use bounded_utils::Pow2SliceMut;
 #[cfg(target_arch = "x86_64")]
@@ -1649,6 +1650,8 @@ struct EncoderInternal<C: MatchConfig> {
     wbits: usize,
     large_window: bool,
     tiers: [TierParams; 3],
+    stream_st: EncoderSliceState,
+    stream_init: bool,
     _config: std::marker::PhantomData<C>,
 }
 
@@ -1665,6 +1668,8 @@ impl<C: MatchConfig> EncoderInternal<C> {
             wbits,
             large_window,
             tiers,
+            stream_st: EncoderSliceState::default(),
+            stream_init: false,
             _config: std::marker::PhantomData,
         }
     }
@@ -2119,15 +2124,6 @@ const fn max_two_pass_output_size(input_len: usize) -> usize {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum StreamOp {
-    #[allow(dead_code)]
-    Process,
-    #[allow(dead_code)]
-    Flush,
-    Finish,
-}
-
 type OptDict<'a> = Option<&'a PreparedDictionary>;
 
 trait EncoderImpl: Send + Sync {
@@ -2193,6 +2189,71 @@ impl EncoderImpl for Q11Encoder {
     }
 }
 
+impl<C: MatchConfig> StreamEngine for EncoderInternal<C> {
+    fn step_ingest_cap(&self) -> usize {
+        (self.tiers[2].4 as usize) * 1024 + SLICE_SIZE * 2
+    }
+
+    fn reset_stream(&mut self) {
+        self.stream_st = EncoderSliceState::default();
+        self.stream_init = false;
+    }
+
+    fn unemitted_start(&self) -> usize {
+        self.stream_st.mb_start
+    }
+
+    fn on_compact(&mut self, drop_len: usize) {
+        self.stream_st.mb_start -= drop_len;
+        self.stream_st.parse.pos -= drop_len;
+        self.stream_st.parse.anchor -= drop_len;
+        self.stream_st.parse.stream_base =
+            self.stream_st.parse.stream_base.saturating_add(drop_len);
+    }
+
+    fn step_max_bytes(&self, op: StreamOp, in_len: usize) -> Option<usize> {
+        match op {
+            StreamOp::Process if in_len < self.stream_st.parse.pos + SLICE_SIZE + 1024 => None,
+            StreamOp::Flush if self.stream_st.mb_start >= in_len => None,
+            StreamOp::Finish if self.stream_st.mb_start >= in_len => Some(64),
+            _ => Some(max_two_pass_output_size(in_len - self.stream_st.mb_start)),
+        }
+    }
+
+    fn emit_step(
+        &mut self,
+        op: StreamOp,
+        in_buf: &[u8],
+        dict: Option<&PreparedDictionary>,
+        bw: &mut BitWriter<'_>,
+    ) -> bool {
+        if self.stream_st.mb_start < in_buf.len() {
+            if !self.stream_init {
+                let TierParams(ways, ht4_ways, log, ht4_log, mb_kib) = self.tiers[2];
+                let max_len = (op == StreamOp::Finish).then_some(in_buf.len());
+                let pos_bits = if self.large_window { 31 } else { 25 };
+                self.configure_tier(
+                    pos_bits,
+                    ways,
+                    ht4_ways,
+                    log as u32,
+                    ht4_log as u32,
+                    (mb_kib as usize) * 1024,
+                    max_len,
+                );
+                let non_empty_dict = dict.filter(|d| !d.is_empty());
+                self.seed_stream_state(in_buf, window_size(self.wbits), non_empty_dict);
+                self.stream_st = EncoderSliceState::default();
+                self.stream_init = true;
+            }
+            let mut st = std::mem::take(&mut self.stream_st);
+            self.advance_slices(&mut st, in_buf, dict, op, bw, true);
+            self.stream_st = st;
+        }
+        false
+    }
+}
+
 const fn q0_tiers(lw: bool) -> [(u8, u8); 3] {
     [(4, 13), (5, 14), (5, if lw { 15 } else { 14 })]
 }
@@ -2249,6 +2310,25 @@ macro_rules! box_two_pass {
             _ => $fb,
         }
     }};
+}
+
+pub(crate) fn build_stream_engine(
+    quality: u32,
+    wbits: usize,
+    _num_threads: usize,
+) -> Box<dyn StreamEngine> {
+    let (q, lw) = (quality.clamp(3, 9), wbits > STD_MAX_WBITS);
+    box_two_pass!(
+        q,
+        wbits,
+        lw,
+        Box::new(EncoderInternal::<ArchQ9>::new(
+            wbits,
+            QualityCfg::Q9,
+            lw,
+            TWO_PASS_TIERS[6],
+        ))
+    )
 }
 
 type OptOut<'a> = Option<&'a mut [MaybeUninit<u8>]>;
@@ -3363,6 +3443,17 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
                 .unwrap();
             assert_eq!(decompress_brotli_with_dict(c10, &dict_raw), payload);
 
+            let mut s_enc = crate::StreamingEncoder::with_lgwin(5, 11);
+            s_enc.set_dictionary(&dict_from_q11).unwrap();
+            let mut out = vec![0u8; payload.len() * 2 + 1024];
+            let res = s_enc
+                .compress_stream(StreamOp::Finish, &payload, &mut out)
+                .unwrap();
+            assert_eq!(res.status, crate::stream::StreamStatus::Finished);
+            assert_eq!(
+                decompress_brotli_with_dict(&out[..res.bytes_written], &dict_raw),
+                payload
+            );
             return;
         }
         let small_lgwin =
@@ -3389,6 +3480,19 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
                     decompress_brotli_with_dict(encoded, &dict_raw),
                     payload,
                     "one-shot mismatch for q={q}, lgwin={lgwin}"
+                );
+
+                let mut s_enc = crate::StreamingEncoder::with_lgwin(q, lgwin);
+                s_enc.set_dictionary(dict).unwrap();
+                let mut out = vec![0u8; payload.len() * 2 + 4096];
+                let res = s_enc
+                    .compress_stream(StreamOp::Finish, &payload, &mut out)
+                    .unwrap();
+                assert_eq!(res.status, crate::stream::StreamStatus::Finished);
+                assert_eq!(
+                    decompress_brotli_with_dict(&out[..res.bytes_written], &dict_raw),
+                    payload,
+                    "streaming mismatch for q={q}, lgwin={lgwin}"
                 );
             }
         }
