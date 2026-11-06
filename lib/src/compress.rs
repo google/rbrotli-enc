@@ -41,7 +41,7 @@ use crate::{
         write_window_bits, ContextMode, OptimalCommand, DIST_MODE_IMPLICIT_D0, DIST_MODE_RAW,
         DIST_MODE_STATIC_DICT,
     },
-    q11::Q11Encoder,
+    q11::{Q11Encoder, Q11StreamBackend},
     stream::{ChunkStreamBackend, ChunkStreamEncoder, StreamEngine, StreamOp},
 };
 use bounded_utils::Pow2SliceMut;
@@ -2314,7 +2314,7 @@ macro_rules! box_two_pass {
 pub(crate) fn build_stream_engine(
     quality: u32,
     wbits: usize,
-    _num_threads: usize,
+    num_threads: usize,
 ) -> Box<dyn StreamEngine> {
     let lw = wbits > STD_MAX_WBITS;
     match quality {
@@ -2343,12 +2343,7 @@ pub(crate) fn build_stream_engine(
             quality,
             wbits,
             lw,
-            Box::new(EncoderInternal::<ArchQ9>::new(
-                wbits,
-                QualityCfg::Q9,
-                lw,
-                TWO_PASS_TIERS[6]
-            ))
+            Box::new(Q11StreamBackend::new(quality, wbits, num_threads))
         ),
     }
 }

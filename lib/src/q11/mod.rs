@@ -33,6 +33,7 @@ use crate::metablock::{
     write_uncompressed_metablock, write_window_bits, OptimalCommand, DIST_MODE_IMPLICIT_D0,
     DIST_MODE_RAW, DIST_MODE_STATIC_DICT,
 };
+use crate::stream::{StreamEngine, StreamOp};
 
 pub(crate) use match_gen::DictChain;
 use match_gen::{
@@ -159,6 +160,8 @@ pub(crate) struct Q11Encoder {
     wave_state: (RbPair, RbPair),
     unemitted_pos: usize,
 }
+
+pub(crate) type Q11StreamBackend = Q11Encoder;
 
 impl Q11Encoder {
     pub(crate) fn new(quality: u32, wbits: usize, num_threads: usize) -> Self {
@@ -982,13 +985,6 @@ impl Q11Encoder {
         self.encode_chunks_pipeline(range_env, &chunks, full_dict_len, dc, eff_win, is_eof, bw)
     }
 
-    fn reset_stream(&mut self) {
-        self.mg_scratch.reset_h10();
-        self.ldm.reset_stream();
-        self.wave_state = (INIT_RB, INIT_RB);
-        self.unemitted_pos = 0;
-    }
-
     pub(crate) fn compress_into(
         &mut self,
         data: &[u8],
@@ -1001,6 +997,71 @@ impl Q11Encoder {
             || !self.encode_range_with_dict(data, (0, data.len()), dict, (false, true), bw)
         {
             write_empty_last_metablock(bw);
+        }
+    }
+}
+
+const STREAM_Q11_WAVE_BYTES: usize = 8 * DP_CHUNK_SIZE;
+
+impl StreamEngine for Q11Encoder {
+    fn step_ingest_cap(&self) -> usize {
+        STREAM_Q11_WAVE_BYTES + DP_CHUNK_SIZE
+    }
+
+    fn reset_stream(&mut self) {
+        self.mg_scratch.reset_h10();
+        self.ldm.reset_stream();
+        self.wave_state = (INIT_RB, INIT_RB);
+        self.unemitted_pos = 0;
+    }
+
+    fn unemitted_start(&self) -> usize {
+        self.unemitted_pos
+    }
+
+    fn on_compact(&mut self, drop_len: usize) {
+        self.unemitted_pos -= drop_len;
+        self.mg_scratch.reset_h10();
+        self.ldm.on_compact(drop_len);
+    }
+
+    fn step_max_bytes(&self, op: StreamOp, in_len: usize) -> Option<usize> {
+        let avail = in_len - self.unemitted_pos;
+        match op {
+            StreamOp::Process if avail < STREAM_Q11_WAVE_BYTES + DP_TAIL_MERGE => None,
+            StreamOp::Process => {
+                let waves = (avail - DP_TAIL_MERGE) / STREAM_Q11_WAVE_BYTES;
+                Some(self.max_output_size(waves * STREAM_Q11_WAVE_BYTES))
+            }
+            StreamOp::Flush if avail == 0 => None,
+            StreamOp::Flush | StreamOp::Finish => Some(self.max_output_size(avail)),
+        }
+    }
+
+    fn emit_step(
+        &mut self,
+        op: StreamOp,
+        in_buf: &[u8],
+        dict: Option<&PreparedDictionary>,
+        bw: &mut BitWriter<'_>,
+    ) -> bool {
+        let mut emit = |s: &mut Self, r_end: usize, is_eof: bool| {
+            let r_start = std::mem::replace(&mut s.unemitted_pos, r_end);
+            r_start < r_end
+                && s.encode_range_with_dict(in_buf, (r_start, r_end), dict, (true, is_eof), bw)
+        };
+        match op {
+            StreamOp::Process => {
+                while in_buf.len() - self.unemitted_pos >= STREAM_Q11_WAVE_BYTES + DP_TAIL_MERGE {
+                    let r_end = self.unemitted_pos + STREAM_Q11_WAVE_BYTES;
+                    emit(self, r_end, false);
+                }
+                false
+            }
+            StreamOp::Flush | StreamOp::Finish => {
+                let is_eof = op == StreamOp::Finish;
+                emit(self, in_buf.len(), is_eof) && is_eof
+            }
         }
     }
 }
