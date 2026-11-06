@@ -13,6 +13,8 @@
 // limitations under the License.
 #![deny(unsafe_code)]
 
+#[allow(dead_code)]
+mod block_split;
 mod compress;
 #[allow(dead_code)]
 mod constants;
