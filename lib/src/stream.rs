@@ -119,6 +119,116 @@ pub(crate) trait StreamEngine: Send + Sync {
     ) -> bool;
 }
 
+/// Chunk-oriented engine hook shared by [`OnePassEncoder`](crate::fast_onepass::OnePassEncoder)
+/// (`Q0`) and [`FastTwoPassEncoder`](crate::fast_onepass::FastTwoPassEncoder) (`Q1..=Q2`).
+pub(crate) trait ChunkStreamEncoder: Send + Sync {
+    fn wbits(&self) -> usize;
+    fn chunk_size(&self) -> usize;
+    fn retain_window(&self, wsize: usize) -> usize {
+        wsize
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn run_chunks(
+        &mut self,
+        ctx: (Option<usize>, bool, usize),
+        in_buf: &[u8],
+        range: core::ops::Range<usize>,
+        dict: Option<&PreparedDictionary>,
+        ring: &mut [u32; 2],
+        bw: &mut BitWriter<'_>,
+        avx2: OptAvx2,
+    );
+}
+
+pub(crate) struct ChunkStreamBackend<E> {
+    enc: E,
+    ring: [u32; 2],
+    unemitted_pos: usize,
+    stream_base: usize,
+    initialized: bool,
+}
+
+impl<E: ChunkStreamEncoder> ChunkStreamBackend<E> {
+    pub(crate) fn boxed(enc: E) -> Box<Self> {
+        Box::new(Self {
+            enc,
+            ring: [INITIAL_LAST_DISTANCES[0], INITIAL_LAST_DISTANCES[1]],
+            unemitted_pos: 0,
+            stream_base: 0,
+            initialized: false,
+        })
+    }
+}
+
+impl<E: ChunkStreamEncoder> StreamEngine for ChunkStreamBackend<E> {
+    fn step_ingest_cap(&self) -> usize {
+        self.enc.chunk_size() * 2
+    }
+
+    fn retain_window(&self, wsize: usize) -> usize {
+        self.enc.retain_window(wsize)
+    }
+
+    fn reset_stream(&mut self) {
+        self.ring = [INITIAL_LAST_DISTANCES[0], INITIAL_LAST_DISTANCES[1]];
+        (self.unemitted_pos, self.stream_base, self.initialized) = (0, 0, false);
+    }
+
+    fn unemitted_start(&self) -> usize {
+        self.unemitted_pos
+    }
+
+    fn on_compact(&mut self, drop_len: usize) {
+        self.unemitted_pos -= drop_len;
+        self.stream_base = self.stream_base.saturating_add(drop_len);
+    }
+
+    fn step_max_bytes(&self, op: StreamOp, in_len: usize) -> Option<usize> {
+        let (avail, cs) = (in_len - self.unemitted_pos, self.enc.chunk_size());
+        let n = match op {
+            StreamOp::Process if avail > cs => ((avail - 1) / cs) * cs,
+            StreamOp::Flush if avail > 0 => avail,
+            StreamOp::Finish => avail,
+            _ => return None,
+        };
+        Some(fast_twopass_max_output_size_for(n, cs))
+    }
+
+    fn emit_step(
+        &mut self,
+        op: StreamOp,
+        in_buf: &[u8],
+        dict: Option<&PreparedDictionary>,
+        bw: &mut BitWriter<'_>,
+    ) -> bool {
+        let cs = self.enc.chunk_size();
+        let end = if op == StreamOp::Process {
+            self.unemitted_pos + ((in_buf.len() - self.unemitted_pos - 1) / cs) * cs
+        } else {
+            in_buf.len()
+        };
+        if self.unemitted_pos >= end {
+            return false;
+        }
+        let prep_len = (!std::mem::replace(&mut self.initialized, true))
+            .then(|| self.enc.retain_window(window_size(self.enc.wbits())));
+        let (pos, eof) = (
+            std::mem::replace(&mut self.unemitted_pos, end),
+            op == StreamOp::Finish,
+        );
+        self.enc.run_chunks(
+            (prep_len, eof, self.stream_base),
+            in_buf,
+            pos..end,
+            dict,
+            &mut self.ring,
+            bw,
+            try_avx2(true),
+        );
+        eof
+    }
+}
+
 #[derive(Default)]
 struct StreamState {
     out_pos: usize,
@@ -744,7 +854,7 @@ mod tests {
     fn test_empty_streams_and_reset_all_qualities() {
         let sample = make_mixed_corpus(miri_or(128, dbg_or(32_768, 96_000)));
         let lgwin = miri_or(12, 22);
-        let qs: &[u32] = miri_or(&[5], &[3, 4, 5, 6, 7, 8, 9]);
+        let qs: &[u32] = miri_or(&[0, 1, 5], &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
         for &q in qs {
             let (mut enc, mut out) = (StreamingEncoder::with_lgwin(q, lgwin), [0u8; 64]);
             let res = enc
@@ -784,7 +894,7 @@ mod tests {
                 .repeat(miri_or(32, 60));
         let expected = [chunk.as_slice(), chunk.as_slice()].concat();
         let lgwin = miri_or(12, 20);
-        for &q in miri_or(&[4u32][..], &[4, 6, 9][..]) {
+        for &q in miri_or(&[0u32, 1, 5][..], &[0, 1, 4, 6, 9][..]) {
             let (mut enc, mut comp, mut buf) = (
                 StreamingEncoder::with_lgwin(q, lgwin),
                 Vec::new(),
@@ -814,7 +924,7 @@ mod tests {
     fn test_one_byte_input_and_one_byte_output_backpressure() {
         let data = make_mixed_corpus(miri_or(96, dbg_or(6_500, 18_000)));
         let lgwin = miri_or(12, 18);
-        for &q in miri_or(&[5u32][..], &[5, 8][..]) {
+        for &q in miri_or(&[0u32, 5][..], &[0, 2, 5, 8][..]) {
             let (mut enc, mut comp, mut out1) =
                 (StreamingEncoder::with_lgwin(q, lgwin), Vec::new(), [0u8; 1]);
             for (idx, b) in data.iter().enumerate() {
@@ -828,6 +938,60 @@ mod tests {
             pump_op(&mut enc, StreamOp::Finish, &[], &mut out1, &mut comp);
             assert_eq!(decompress_brotli(&comp), data, "1B/1B mismatch at q={q}");
         }
+    }
+
+    #[test]
+    fn test_streaming_writer_retryable_timed_out_no_duplicate_bytes() {
+        struct TimedOutSink {
+            out: Vec<u8>,
+            calls: usize,
+        }
+        impl Write for TimedOutSink {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.calls += 1;
+                if self.calls % 2 == 1 {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "transient timeout"));
+                }
+                let n = buf.len().min(53);
+                self.out.extend_from_slice(&buf[..n]);
+                Ok(n)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.calls += 1;
+                if self.calls.is_multiple_of(3) {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "flush timeout"));
+                }
+                Ok(())
+            }
+        }
+
+        let payload = make_mixed_corpus(miri_or(1_500, 200_000));
+        let mut sw = StreamingWriter::with_lgwin(
+            TimedOutSink {
+                out: Vec::new(),
+                calls: 0,
+            },
+            1,
+            miri_or(12, 18),
+        );
+        for mut slice in payload.chunks(miri_or(512, 65_536)) {
+            while !slice.is_empty() {
+                match sw.write(slice) {
+                    Ok(n) => slice = &slice[n..],
+                    Err(e) if e.kind() == io::ErrorKind::TimedOut => continue,
+                    Err(e) => panic!("unexpected write error: {e}"),
+                }
+            }
+        }
+        loop {
+            match sw.try_finish() {
+                Ok(()) => break,
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => continue,
+                Err(e) => panic!("unexpected finish error: {e}"),
+            }
+        }
+        let sink = sw.finish().unwrap();
+        assert_eq!(decompress_brotli(&sink.out), payload);
     }
 
     #[test]

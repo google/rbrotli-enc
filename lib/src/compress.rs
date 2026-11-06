@@ -23,9 +23,8 @@ use crate::{
     constants::*,
     context::{self, LiteralHistogram},
     fast_onepass::{
-        compress_fast_with_tok, fast_twopass_checked_max_output_size_for, ChunkStreamEncoder,
-        FastTwoPassEncoder, OnePassEncoder, FAST_Q2_CHUNK_SIZE, FAST_TWOPASS_CHUNK_SIZE,
-        ONEPASS_CHUNK_SIZE,
+        compress_fast_with_tok, fast_twopass_checked_max_output_size_for, FastTwoPassEncoder,
+        OnePassEncoder, FAST_Q2_CHUNK_SIZE, FAST_TWOPASS_CHUNK_SIZE, ONEPASS_CHUNK_SIZE,
     },
     hashtable::{
         ArchQ3, ArchQ4, ArchQ5To8, ArchQ9, HashTable, MatchConfig, PreparedDictionary, QualityCfg,
@@ -43,7 +42,7 @@ use crate::{
         DIST_MODE_STATIC_DICT,
     },
     q11::Q11Encoder,
-    stream::{StreamEngine, StreamOp},
+    stream::{ChunkStreamBackend, ChunkStreamEncoder, StreamEngine, StreamOp},
 };
 use bounded_utils::Pow2SliceMut;
 #[cfg(target_arch = "x86_64")]
@@ -2317,18 +2316,41 @@ pub(crate) fn build_stream_engine(
     wbits: usize,
     _num_threads: usize,
 ) -> Box<dyn StreamEngine> {
-    let (q, lw) = (quality.clamp(3, 9), wbits > STD_MAX_WBITS);
-    box_two_pass!(
-        q,
-        wbits,
-        lw,
-        Box::new(EncoderInternal::<ArchQ9>::new(
+    let lw = wbits > STD_MAX_WBITS;
+    match quality {
+        0 => ChunkStreamBackend::boxed(OnePassEncoder::with_params(
             wbits,
-            QualityCfg::Q9,
+            5,
+            if lw { 15 } else { 14 },
+        )),
+        1 => ChunkStreamBackend::boxed(FastTwoPassEncoder::with_params(
+            1,
+            wbits,
+            FAST_TWOPASS_CHUNK_SIZE,
+            6,
+            16,
+            14,
+        )),
+        2 => ChunkStreamBackend::boxed(FastTwoPassEncoder::with_params(
+            2,
+            wbits,
+            FAST_Q2_CHUNK_SIZE,
+            4,
+            16,
+            15,
+        )),
+        _ => box_two_pass!(
+            quality,
+            wbits,
             lw,
-            TWO_PASS_TIERS[6],
-        ))
-    )
+            Box::new(EncoderInternal::<ArchQ9>::new(
+                wbits,
+                QualityCfg::Q9,
+                lw,
+                TWO_PASS_TIERS[6]
+            ))
+        ),
+    }
 }
 
 type OptOut<'a> = Option<&'a mut [MaybeUninit<u8>]>;

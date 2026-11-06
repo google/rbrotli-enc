@@ -38,25 +38,7 @@ use crate::metablock::{
     write_window_bits,
 };
 use crate::static_dict;
-pub(crate) trait ChunkStreamEncoder: Send {
-    fn wbits(&self) -> usize;
-    #[allow(dead_code)]
-    fn chunk_size(&self) -> usize;
-    fn retain_window(&self, wsize: usize) -> usize {
-        wsize
-    }
-    #[allow(clippy::too_many_arguments)]
-    fn run_chunks(
-        &mut self,
-        ctx: (Option<usize>, bool, usize),
-        in_buf: &[u8],
-        range: core::ops::Range<usize>,
-        dict: Option<&PreparedDictionary>,
-        ring: &mut [u32; 2],
-        bw: &mut BitWriter<'_>,
-        avx2: OptAvx2,
-    );
-}
+use crate::stream::ChunkStreamEncoder;
 use bounded_utils::{
     BoundedArrayExt, BoundedPrefix, BoundedPrefixCursor, BoundedU16, BoundedU8, BoundedUsize,
 };
@@ -2723,6 +2705,7 @@ mod tests {
     use super::*;
     use crate::metablock::test_helpers::{decompress_brotli, decompress_brotli_with_dict};
     use crate::metablock::{self, ContextMode};
+    use std::io::Write;
 
     fn check_eq<const MLS: u8>(
         inp: &[u8],
@@ -2975,6 +2958,25 @@ mod tests {
         // Regression test: > 600 KiB multi-chunk adaptive `TRACK` + streaming compaction.
         let big_prose = prose.repeat(4);
         check_eq::<5>(&big_prose, None, 24, tok);
+        for q in 0..=3 {
+            let mut sw0 = crate::StreamingWriter::with_threads(Vec::new(), q, 10, 1);
+            big_prose
+                .chunks(17_777)
+                .for_each(|c| sw0.write_all(c).unwrap());
+            let out0 = sw0.finish().unwrap();
+            assert_eq!(decompress_brotli(&out0), big_prose);
+        }
+
+        let mut sw = crate::StreamingWriter::with_threads(Vec::new(), 0, 28, 1);
+        sw.set_dictionary(&prep).unwrap();
+        prose.chunks(19_997).for_each(|c| sw.write_all(c).unwrap());
+        sw.flush().unwrap();
+        sw.write_all(&rand_blob[..20_000]).unwrap();
+        let out = sw.finish().unwrap();
+        assert_eq!(
+            decompress_brotli_with_dict(&out, dict_raw),
+            [prose.as_slice(), &rand_blob[..20_000]].concat()
+        );
 
         for inp in [
             &[][..],
