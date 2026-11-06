@@ -16,6 +16,8 @@
 mod compress;
 #[allow(dead_code)]
 mod constants;
+#[allow(dead_code)]
+mod context;
 mod hashtable;
 #[allow(dead_code)]
 mod huffman;
