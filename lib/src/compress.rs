@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::{
-    hashtable::HashTable,
+    hashtable::legacy::HashTable,
     huffman::{ContextMap, HuffmanCode, HuffmanCodeEntry},
     map_to_sym::{encode_iac, encode_raw_distance_00, match_short_dist_code},
     metablock::{self, ContextMode},
