@@ -24,6 +24,29 @@
 
 typedef struct RBrotliEncoder RBrotliEncoder;
 typedef struct RBrotliDictionary RBrotliDictionary;
+typedef struct RBrotliStreamingEncoder RBrotliStreamingEncoder;
+
+/**
+ * Operation code for [`RBrotliEncCompressStream`].
+ */
+typedef enum RBrotliEncStreamOp {
+  /**
+   * Ingest input and emit compressed bytes opportunistically as internal chunks fill.
+   */
+  RBROTLI_ENC_STREAM_PROCESS = 0,
+  /**
+   * Flush buffered input and emit a byte-aligned sync-flush block for immediate prefix recovery.
+   */
+  RBROTLI_ENC_STREAM_FLUSH = 1,
+  /**
+   * Emit all remaining input and close the Brotli stream (`ISLAST = 1`).
+   */
+  RBROTLI_ENC_STREAM_FINISH = 2,
+  /**
+   * Internal sentinel ensuring 32-bit enum width even under `-fshort-enums` / bare-metal AAPCS.
+   */
+  RBROTLI_ENC_STREAM_FORCE_U32 = 0x7fffffff,
+} RBrotliEncStreamOp;
 
 #ifdef __cplusplus
 extern "C" {
@@ -118,6 +141,101 @@ size_t RBrotliEncMaxRequiredSize(const RBrotliEncoder *encoder, size_t in_size);
  * `encoder` must be null or a live `RBrotliEncMakeEncoder*` pointer, not used afterwards.
  */
 void RBrotliEncFreeEncoder(RBrotliEncoder *encoder);
+
+/**
+ * Creates a new streaming encoder for `quality` (`lgwin = 24`, 1 thread).
+ */
+RBrotliStreamingEncoder *RBrotliEncMakeStreamingEncoder(uint32_t quality);
+
+/**
+ * Creates a new streaming encoder configured with `(quality, lgwin, num_threads)` (`lgwin == 0`
+ * selects `24`).
+ */
+RBrotliStreamingEncoder *RBrotliEncMakeStreamingEncoderWithParams(uint32_t quality,
+                                                                  uint32_t lgwin,
+                                                                  size_t num_threads);
+
+/**
+ * Frees `encoder` if non-null.
+ *
+ * # Safety
+ * `encoder` must be null or a live `RBrotliEncMakeStreamingEncoder*` pointer, not used afterwards.
+ */
+void RBrotliEncFreeStreamingEncoder(RBrotliStreamingEncoder *encoder);
+
+/**
+ * Resets `encoder` for a fresh Brotli stream (clearing buffered data, framing state, and any
+ * attached dictionary) while retaining allocated buffers/threads.
+ *
+ * # Safety
+ * If non-null, `encoder` must be a live streaming encoder with exclusive access.
+ */
+void RBrotliEncStreamingReset(RBrotliStreamingEncoder *encoder);
+
+/**
+ * Attaches a prepared dictionary to `encoder` before encoding starts (`dict` may be freed right
+ * after this call).
+ *
+ * # Safety
+ * If non-null, `encoder` requires exclusive access and `dict` requires shared read access.
+ */
+bool RBrotliEncStreamingAttachDictionary(RBrotliStreamingEncoder *encoder,
+                                         const RBrotliDictionary *dict);
+
+/**
+ * Incrementally compresses `*next_in` (`*available_in` bytes) into `*next_out` (`*available_out`
+ * bytes), advancing pointers/counts in-place (`next_out` / `*next_out` may be null when
+ * `*available_out == 0`; drain via [`RBrotliEncTakeOutput`]). Writes cumulative output byte count
+ * (saturating to `SIZE_MAX` on 32-bit overflow) to `*total_out` when non-null.
+ *
+ * # Safety
+ * - `encoder` must be a live streaming encoder with exclusive access.
+ * - `available_in` and `available_out` must be distinct, non-null, aligned, initialized, and
+ *   readable/writable.
+ * - When `*available_in > 0`, `next_in` must be non-null, aligned, initialized, and
+ *   readable/writable, and `*next_in` must point to `*available_in` initialized readable bytes.
+ * - When `*available_out > 0`, `next_out` must be non-null, aligned, initialized, and
+ *   readable/writable, and `*next_out` must point to `*available_out` writable bytes that do not
+ *   overlap `encoder` (or any attached dictionary), `*next_in`, `available_in`, `next_in`,
+ *   `available_out`, `next_out`, or `total_out`.
+ * - If non-null, `total_out` must be aligned, writable, and distinct from `*next_out`.
+ */
+bool RBrotliEncCompressStream(RBrotliStreamingEncoder *encoder,
+                              RBrotliEncStreamOp op,
+                              size_t *available_in,
+                              const uint8_t **next_in,
+                              size_t *available_out,
+                              uint8_t **next_out,
+                              size_t *total_out);
+
+/**
+ * Zero-copy drain of staged output bytes (`*size == 0` drains all, else at most `*size`), writing
+ * drained length to `*size` (`0` whenever null is returned and `size` is valid) and returning a
+ * pointer valid until the next mutating `encoder` call (or null when `*size == 0` or on invalid /
+ * poisoned `encoder`).
+ *
+ * # Safety
+ * - If non-null, `encoder` must be a live streaming encoder with exclusive access.
+ * - If non-null, `size` must be aligned, initialized, readable/writable, and distinct from
+ *   `encoder`.
+ */
+const uint8_t *RBrotliEncTakeOutput(RBrotliStreamingEncoder *encoder, size_t *size);
+
+/**
+ * Returns `true` if staged compressed output bytes remain in `encoder`.
+ *
+ * # Safety
+ * If non-null, `encoder` must be a valid streaming encoder with shared read access.
+ */
+bool RBrotliEncHasMoreOutput(const RBrotliStreamingEncoder *encoder);
+
+/**
+ * Returns `true` if `encoder` has emitted `ISLAST = 1` and drained all staged output.
+ *
+ * # Safety
+ * If non-null, `encoder` must be a valid streaming encoder with shared read access.
+ */
+bool RBrotliEncIsFinished(const RBrotliStreamingEncoder *encoder);
 
 /**
  * Returns true if this machine is supported by the encoder.
