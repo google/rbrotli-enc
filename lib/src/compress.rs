@@ -334,63 +334,62 @@ impl MetablockData {
     fn write_bits(&mut self, bw: &mut BitWriter) {
         let get_sym_mask = _mm256_set1_epi16(!SYMBOL_MASK as i16);
         const _: () = assert!(SYMBOL_MASK == 0x8000);
-        bw.write_foreach(
-            BoundedUsize::<{ SYMBOL_BUF_SIZE - 16 }>::iter(0, self.num_syms.get() / 16, 16),
-            |i| {
-                let sym_arr = BoundedSlice::new_from_equal_array(
-                    self.symbol_or_nbits
-                        .first_chunk::<SYMBOL_BUF_SIZE>()
-                        .unwrap(),
+        for i in BoundedUsize::<{ SYMBOL_BUF_SIZE - 16 }>::iter(0, self.num_syms.get() / 16, 16) {
+            let sym_arr = BoundedSlice::new_from_equal_array(
+                self.symbol_or_nbits
+                    .first_chunk::<SYMBOL_BUF_SIZE>()
+                    .unwrap(),
+            )
+            .get_array::<16, { SYMBOL_BUF_SIZE - 16 }>(i);
+            let sym_or_nbits = _mm256_loadu_si256(sym_arr);
+            let bits = _mm256_loadu_si256(
+                BoundedSlice::new_from_equal_array(
+                    self.bits.first_chunk::<SYMBOL_BUF_SIZE>().unwrap(),
                 )
-                .get_array::<16, { SYMBOL_BUF_SIZE - 16 }>(i);
-                let sym_or_nbits = _mm256_loadu_si256(sym_arr);
-                let bits = _mm256_loadu_si256(
-                    BoundedSlice::new_from_equal_array(
-                        self.bits.first_chunk::<SYMBOL_BUF_SIZE>().unwrap(),
-                    )
-                    .get_array::<16, { SYMBOL_BUF_SIZE - 16 }>(i),
-                );
-                const _: () = assert!(SYMBOL_MASK == 0x8000);
-                let is_symbol = _mm256_srai_epi16::<15>(sym_or_nbits);
-                let sym_or_nbits = _mm256_and_si256(get_sym_mask, sym_or_nbits);
-                let mask_even_lanes = _mm256_set1_epi32(0xFFFF);
-                let load_huff =
-                    |idx: u16| -> u32 { transmute!(self.histogram_buf[(idx & 0x7FFF) as usize]) };
-                let huff_even_nbits_bits =
-                    _mm256_loadu_si256(&std::array::from_fn(|k| load_huff(sym_arr[k * 2])));
-                let huff_odd_nbits_bits =
-                    _mm256_loadu_si256(&std::array::from_fn(|k| load_huff(sym_arr[k * 2 + 1])));
-                let huff_nbits = _mm256_or_si256(
-                    _mm256_slli_epi32::<16>(huff_odd_nbits_bits),
-                    _mm256_and_si256(mask_even_lanes, huff_even_nbits_bits),
-                );
-                let huff_bits = _mm256_or_si256(
-                    _mm256_srli_epi32::<16>(huff_even_nbits_bits),
-                    _mm256_andnot_si256(mask_even_lanes, huff_odd_nbits_bits),
-                );
-                let bits = _mm256_blendv_epi8(bits, huff_bits, is_symbol);
-                let nbits = _mm256_blendv_epi8(sym_or_nbits, huff_nbits, is_symbol);
+                .get_array::<16, { SYMBOL_BUF_SIZE - 16 }>(i),
+            );
+            const _: () = assert!(SYMBOL_MASK == 0x8000);
+            let is_symbol = _mm256_srai_epi16::<15>(sym_or_nbits);
+            let sym_or_nbits = _mm256_and_si256(get_sym_mask, sym_or_nbits);
+            let mask_even_lanes = _mm256_set1_epi32(0xFFFF);
+            let load_huff =
+                |idx: u16| -> u32 { transmute!(self.histogram_buf[(idx & 0x7FFF) as usize]) };
+            let huff_even_nbits_bits =
+                _mm256_loadu_si256(&std::array::from_fn(|k| load_huff(sym_arr[k * 2])));
+            let huff_odd_nbits_bits =
+                _mm256_loadu_si256(&std::array::from_fn(|k| load_huff(sym_arr[k * 2 + 1])));
+            let huff_nbits = _mm256_or_si256(
+                _mm256_slli_epi32::<16>(huff_odd_nbits_bits),
+                _mm256_and_si256(mask_even_lanes, huff_even_nbits_bits),
+            );
+            let huff_bits = _mm256_or_si256(
+                _mm256_srli_epi32::<16>(huff_even_nbits_bits),
+                _mm256_andnot_si256(mask_even_lanes, huff_odd_nbits_bits),
+            );
+            let bits = _mm256_blendv_epi8(bits, huff_bits, is_symbol);
+            let nbits = _mm256_blendv_epi8(sym_or_nbits, huff_nbits, is_symbol);
 
-                let nbits_lo = _mm256_and_si256(mask_even_lanes, nbits);
-                let nbits32 = _mm256_add_epi32(_mm256_srli_epi32::<16>(nbits), nbits_lo);
-                let bits32_hi = _mm256_srli_epi32::<16>(bits);
-                let bits32_lo = _mm256_and_si256(mask_even_lanes, bits);
-                let bits32 = _mm256_or_si256(bits32_lo, _mm256_sllv_epi32(bits32_hi, nbits_lo));
+            let nbits_lo = _mm256_and_si256(mask_even_lanes, nbits);
+            let nbits32 = _mm256_add_epi32(_mm256_srli_epi32::<16>(nbits), nbits_lo);
+            let bits32_hi = _mm256_srli_epi32::<16>(bits);
+            let bits32_lo = _mm256_and_si256(mask_even_lanes, bits);
+            let bits32 = _mm256_or_si256(bits32_lo, _mm256_sllv_epi32(bits32_hi, nbits_lo));
 
-                let mask_even_lanes_32 = _mm256_set1_epi64x(0xFFFFFFFF);
-                let nbits32_lo = _mm256_and_si256(mask_even_lanes_32, nbits32);
-                let nbits64 = _mm256_add_epi64(_mm256_srli_epi64::<32>(nbits32), nbits32_lo);
-                let bits64_hi = _mm256_srli_epi64::<32>(bits32);
-                let bits64_lo = _mm256_and_si256(mask_even_lanes_32, bits32);
-                let bits64 = _mm256_or_si256(bits64_lo, _mm256_sllv_epi64(bits64_hi, nbits32_lo));
+            let mask_even_lanes_32 = _mm256_set1_epi64x(0xFFFFFFFF);
+            let nbits32_lo = _mm256_and_si256(mask_even_lanes_32, nbits32);
+            let nbits64 = _mm256_add_epi64(_mm256_srli_epi64::<32>(nbits32), nbits32_lo);
+            let bits64_hi = _mm256_srli_epi64::<32>(bits32);
+            let bits64_lo = _mm256_and_si256(mask_even_lanes_32, bits32);
+            let bits64 = _mm256_or_si256(bits64_lo, _mm256_sllv_epi64(bits64_hi, nbits32_lo));
 
-                let mut bitsa = [0u64; 4];
-                let mut nbitsa = [0u64; 4];
-                _mm256_storeu_si256(&mut bitsa, bits64);
-                _mm256_storeu_si256(&mut nbitsa, nbits64);
-                (nbitsa, bitsa)
-            },
-        );
+            let mut bitsa = [0u64; 4];
+            let mut nbitsa = [0u64; 4];
+            _mm256_storeu_si256(&mut bitsa, bits64);
+            _mm256_storeu_si256(&mut nbitsa, nbits64);
+            for k in 0..4 {
+                bw.write(nbitsa[k] as usize, bitsa[k]);
+            }
+        }
         // The rest of the code here is not performance-critical (it only runs at most 16
         // iterations per 4mb of input).
 
