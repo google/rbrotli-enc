@@ -28,11 +28,12 @@ use crate::{
     context::{self, LiteralHistogram},
     fast_onepass::{
         compress_fast_with_tok, fast_twopass_checked_max_output_size_for, FastTwoPassEncoder,
-        OnePassEncoder, FAST_Q2_CHUNK_SIZE, FAST_TWOPASS_CHUNK_SIZE, ONEPASS_CHUNK_SIZE,
+        OnePassEncoder, FAST_TWOPASS_CHUNK_SIZE, ONEPASS_CHUNK_SIZE,
     },
     hashtable::{
-        ArchQ3, ArchQ4, ArchQ5To8, ArchQ9, HashTable, MatchConfig, PreparedDictionary, QualityCfg,
-        SliceCostModel, SliceParseState, HT4_DICT_WINDOW, STATIC_LIT_MULT,
+        ArchQ3, ArchQ35, ArchQ4, ArchQ56, ArchQ78, ArchQ9, HashTable, MatchConfig,
+        PreparedDictionary, QualityCfg, SliceCostModel, SliceParseState, HT4_DICT_WINDOW,
+        STATIC_LIT_MULT,
     },
     huffman::{ContextMap, HuffmanCode, HuffmanCodeEntry, MAX_HUFFMAN_ALPHABET},
     map_to_sym::{
@@ -1440,7 +1441,7 @@ impl MetablockData {
         }
     }
 
-    fn has_multi_regime_signal(&self, mb_len: usize) -> bool {
+    fn has_multi_regime_signal(&self, mb_len: usize, thorough: bool) -> bool {
         if mb_len < 32_768 {
             return false;
         }
@@ -1448,7 +1449,11 @@ impl MetablockData {
         if tl >= 4096 {
             let n_win = (tl / 4096).clamp(2, 8);
             let w_len = tl / n_win;
-            let excess_thresh = (256 + (w_len / 12)) as i32;
+            let excess_thresh = if thorough {
+                (128 + (w_len / 24)) as i32
+            } else {
+                (256 + (w_len / 12)) as i32
+            };
             let mut wins = [LiteralHistogram::default(); 8];
             for (w, wh) in wins.iter_mut().enumerate().take(n_win) {
                 let (s, e) = (w * w_len, if w + 1 == n_win { tl } else { (w + 1) * w_len });
@@ -1476,7 +1481,11 @@ impl MetablockData {
                 min_ins = min_ins.min(sum_ins);
                 max_ins = max_ins.max(sum_ins);
             }
-            if max_ins > 3 * min_ins + 1024 {
+            if if thorough {
+                max_ins * 2 > 3 * min_ins + 1024
+            } else {
+                max_ins > 3 * min_ins + 1024
+            } {
                 return true;
             }
         }
@@ -1493,7 +1502,7 @@ impl MetablockData {
     ) -> bool {
         if !cfg.ctx_block_split
             || self.static_out.is_none()
-            || !self.has_multi_regime_signal(mb_end - mb_start)
+            || !self.has_multi_regime_signal(mb_end - mb_start, cfg.two_step_lazy)
         {
             return false;
         }
@@ -1894,6 +1903,7 @@ struct EncoderInternal<C: MatchConfig> {
     qcfg: QualityCfg,
     wbits: usize,
     large_window: bool,
+    has_dict: bool,
     tiers: [TierParams; 3],
     stream_st: EncoderSliceState,
     stream_init: bool,
@@ -1912,6 +1922,7 @@ impl<C: MatchConfig> EncoderInternal<C> {
             qcfg,
             wbits,
             large_window,
+            has_dict: false,
             tiers,
             stream_st: EncoderSliceState::default(),
             stream_init: false,
@@ -1943,7 +1954,11 @@ impl<C: MatchConfig> EncoderInternal<C> {
 
     #[inline(always)]
     fn flush_cfg(&self) -> FlushCfg {
-        FlushCfg::from_qcfg::<C>(self.qcfg, self.large_window)
+        let mut cfg = FlushCfg::from_qcfg::<C>(self.qcfg, self.large_window);
+        if self.has_dict && self.qcfg.seed_ht_dict {
+            cfg.max_lit_clusters = cfg.max_lit_clusters.max(8);
+        }
+        cfg
     }
 
     fn apply_ctx_cost_update(
@@ -2018,6 +2033,7 @@ impl<C: MatchConfig> EncoderInternal<C> {
         expected_stream_len: usize,
         dict: Option<&PreparedDictionary>,
     ) {
+        self.has_dict = dict.is_some();
         let wsize = window_size(self.wbits);
         let full_dict_len = match dict {
             Some(d) => {
@@ -2288,16 +2304,19 @@ impl<C: MatchConfig> EncoderInternal<C> {
     ) {
         let dict = dict.filter(|d| !d.is_empty());
         let has_dict = dict.is_some();
+        self.has_dict = has_dict;
         let wsize = window_size(self.wbits);
-        let (active_dict, full_dict_len, dict_idx): (
+        let (active_dict, full_dict_len, raw_dict_idx, dict_idx): (
             &[u8],
             usize,
             Option<&crate::hashtable::RawDictIndex>,
-        ) = dict.map_or((&[], 0, None), |d| {
+            Option<&crate::hashtable::Dict5Index>,
+        ) = dict.map_or((&[], 0, None, None), |d| {
             (
                 d.active_slice(wsize),
                 d.raw_len(),
-                (!self.qcfg.seed_ht_dict).then(|| d.raw_index()),
+                C::FAST_MATCHING.then(|| d.raw_index()),
+                (!C::FAST_MATCHING && !self.qcfg.ctx_block_split).then(|| d.dict5_index()),
             )
         });
         let eff_wsize = effective_window_size(wsize, in_buf.len(), full_dict_len);
@@ -2327,7 +2346,7 @@ impl<C: MatchConfig> EncoderInternal<C> {
                     lw,
                     has_dict,
                     (in_buf, target_end, wsize),
-                    (active_dict, full_dict_len, dict_idx),
+                    (active_dict, full_dict_len, raw_dict_idx, dict_idx),
                     &mut st.parse,
                     sink,
                     cost_model,
@@ -2521,14 +2540,14 @@ const fn q0_tiers(lw: bool) -> [(u8, u8); 3] {
 }
 
 const Q1_TIERS: [(u8, u8, u8); 3] = [(4, 13, 12), (5, 15, 13), (6, 16, 14)];
-const Q2_TIERS: [(u8, u8, u8); 3] = [(4, 14, 14), (4, 15, 15), (4, 16, 15)];
 
 #[rustfmt::skip]
-const TWO_PASS_TIERS: [[TierParams; 3]; 7] = [
-    [TierParams(4, 1, 12, 14, 32), TierParams(4, 1, 14, 14, 256), TierParams(4, 1, 16, 14, 256)],
+const TWO_PASS_TIERS: [[TierParams; 3]; 8] = [
     [TierParams(4, 1, 12, 14, 32), TierParams(8, 1, 14, 15, 256), TierParams(8, 1, 15, 15, 256)],
-    [TierParams(8, 1, 12, 14, 32), TierParams(8, 1, 15, 16, 256), TierParams(8, 1, 16, 16, 512)],
-    [TierParams(8, 1, 12, 13, 32), TierParams(8, 4, 15, 14, 256), TierParams(16, 4, 16, 14, 512)],
+    [TierParams(4, 1, 12, 14, 32), TierParams(8, 1, 14, 15, 256), TierParams(8, 1, 15, 15, 256)],
+    [TierParams(4, 1, 12, 14, 32), TierParams(8, 1, 14, 15, 256), TierParams(8, 1, 15, 15, 256)],
+    [TierParams(8, 1, 12, 14, 32), TierParams(8, 4, 15, 15, 256), TierParams(8, 4, 16, 15, 512)],
+    [TierParams(8, 1, 12, 14, 32), TierParams(8, 4, 15, 15, 256), TierParams(16, 4, 16, 15, 512)],
     [TierParams(16, 1, 13, 13, 32), TierParams(16, 4, 16, 15, 256), TierParams(16, 4, 17, 15, 1024)],
     [TierParams(16, 1, 12, 13, 32), TierParams(16, 4, 15, 15, 256), TierParams(32, 4, 16, 15, 1024)],
     [TierParams(16, 1, 12, 13, 32), TierParams(32, 4, 15, 15, 256), TierParams(32, 4, 17, 16, 1024)],
@@ -2546,7 +2565,7 @@ pub(crate) fn canonical_dict_key(
     let raw_wsize = window_size(wbits);
     let d_len = dict_bytes_len.min(raw_wsize);
     let idx = usize::from(d_len > SMALL_STREAM_MAX) + usize::from(d_len > MEDIUM_STREAM_MAX);
-    let TierParams(ways, ht4_ways, log, ht4_log, _) = TWO_PASS_TIERS[quality as usize - 3][idx];
+    let TierParams(ways, ht4_ways, log, ht4_log, _) = TWO_PASS_TIERS[quality as usize - 2][idx];
     let pos_bits = if wbits > STD_MAX_WBITS && d_len > COMPACT_LW_STREAM_MAX {
         31
     } else {
@@ -2578,29 +2597,41 @@ macro_rules! box_two_pass {
     ($q:ident, $wbits:ident, $lw:ident, $fb:expr) => {{
         let q = $q as usize;
         match $q {
-            3 => Box::new(EncoderInternal::<ArchQ3>::new(
+            2 => Box::new(EncoderInternal::<ArchQ3>::new(
+                $wbits,
+                QualityCfg::Q2,
+                $lw,
+                TWO_PASS_TIERS[0],
+            )),
+            3 => Box::new(EncoderInternal::<ArchQ35>::new(
                 $wbits,
                 QualityCfg::Q3,
                 $lw,
-                TWO_PASS_TIERS[0],
+                TWO_PASS_TIERS[1],
             )),
             4 => Box::new(EncoderInternal::<ArchQ4>::new(
                 $wbits,
                 QualityCfg::Q4,
                 $lw,
-                TWO_PASS_TIERS[1],
+                TWO_PASS_TIERS[2],
             )),
-            5..=8 => Box::new(EncoderInternal::<ArchQ5To8>::new(
+            5 | 6 => Box::new(EncoderInternal::<ArchQ56>::new(
                 $wbits,
                 Q5_TO_8_CFGS[q - 5],
                 $lw,
-                TWO_PASS_TIERS[q - 3],
+                TWO_PASS_TIERS[q - 2],
+            )),
+            7 | 8 => Box::new(EncoderInternal::<ArchQ78>::new(
+                $wbits,
+                Q5_TO_8_CFGS[q - 5],
+                $lw,
+                TWO_PASS_TIERS[q - 2],
             )),
             9 => Box::new(EncoderInternal::<ArchQ9>::new(
                 $wbits,
                 QualityCfg::Q9,
                 $lw,
-                TWO_PASS_TIERS[6],
+                TWO_PASS_TIERS[7],
             )),
             _ => $fb,
         }
@@ -2626,14 +2657,6 @@ pub(crate) fn build_stream_engine(
             6,
             16,
             14,
-        )),
-        2 => ChunkStreamBackend::boxed(FastTwoPassEncoder::with_params(
-            2,
-            wbits,
-            FAST_Q2_CHUNK_SIZE,
-            4,
-            16,
-            15,
         )),
         _ => box_two_pass!(
             quality,
@@ -2677,10 +2700,6 @@ impl Encoder {
                 FastTwoPassEncoder::new(1, wbits, FAST_TWOPASS_CHUNK_SIZE),
                 Q1_TIERS,
             )),
-            2 => Box::new((
-                FastTwoPassEncoder::new(2, wbits, FAST_Q2_CHUNK_SIZE),
-                Q2_TIERS,
-            )),
             _ => box_two_pass!(
                 quality,
                 wbits,
@@ -2709,8 +2728,7 @@ impl Encoder {
         match self.quality {
             0 => fast_twopass_checked_max_output_size_for(input_len, ONEPASS_CHUNK_SIZE),
             1 => fast_twopass_checked_max_output_size_for(input_len, FAST_TWOPASS_CHUNK_SIZE),
-            2 | 3 => fast_twopass_checked_max_output_size_for(input_len, FAST_Q2_CHUNK_SIZE),
-            4..=9 => checked_max_two_pass_output_size(input_len),
+            2..=9 => checked_max_two_pass_output_size(input_len),
             _ => input_len.checked_mul(2)?.checked_add(1024 + 64),
         }
     }
@@ -2915,7 +2933,7 @@ mod test {
                     lw,
                     false,
                     (data, end, window_size(wbits)),
-                    (&[], 0, None),
+                    (&[], 0, None, None),
                     &mut st,
                     sink,
                     cost_model,
@@ -2952,7 +2970,7 @@ mod test {
                     lw,
                     false,
                     (data, data.len(), window_size(wbits_v)),
-                    (&[], 0, None),
+                    (&[], 0, None, None),
                     &mut st,
                     sink,
                     cost_model,
@@ -3190,8 +3208,10 @@ mod test {
                 }
             }
         }
-        for &q in miri_or(&[6u32][..], &[4u32, 6, 7][..]) {
-            assert!(compress_vec(q, miri_or(14, 24), short_inputs[6]).len() <= 115);
+        for &q in miri_or(&[7u32][..], &[4u32, 6, 7][..]) {
+            for &lgwin in miri_or(&[14u32][..], &[14u32, 24][..]) {
+                assert!(compress_vec(q, lgwin, short_inputs[6]).len() <= 115);
+            }
         }
 
         let mut interleaved = b"Information about the government of the United States: ".to_vec();
@@ -3284,14 +3304,7 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
         let (pw, plog) = miri_or((12, 12u32), (24, 16u32));
         for c in [
             EncoderInternal::<ArchQ3>::enc_port((25, 4, 1), &pat, pw, QualityCfg::Q3, false, plog),
-            EncoderInternal::<ArchQ5To8>::enc_port(
-                (25, 8, 4),
-                &pat,
-                pw,
-                QualityCfg::Q6,
-                false,
-                plog,
-            ),
+            EncoderInternal::<ArchQ56>::enc_port((25, 8, 4), &pat, pw, QualityCfg::Q6, false, plog),
             EncoderInternal::<ArchQ3>::enc_port(
                 (31, 4, 1),
                 &pat,
@@ -3326,7 +3339,7 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
                 |bi, pos| ends[bi] - pos,
                 |bi, pre, uncomp| assert!(bi != 1 || (pre >= 1 && uncomp)),
             );
-        EncoderInternal::<ArchQ5To8>::with_test_tier((25, 16, 1), bw, QualityCfg::Q5, false, blog)
+        EncoderInternal::<ArchQ56>::with_test_tier((25, 8, 1), bw, QualityCfg::Q5, false, blog)
             .encode_multi(
                 &bdata,
                 |bi, pos| ends[bi] - pos,
@@ -3450,7 +3463,7 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
                 aligned_bin.extend_from_slice(&w.to_le_bytes());
             }
         }
-        let (mut md, _) = EncoderInternal::<ArchQ5To8>::encode(
+        let (mut md, _) = EncoderInternal::<ArchQ56>::encode(
             (25, 16, 4),
             &aligned_bin,
             22,
@@ -3463,7 +3476,7 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
         );
         md.dist_ring = INITIAL_LAST_DISTANCES;
         let (npostfix, ndirect) =
-            md.select_distance_params(FlushCfg::from_qcfg::<ArchQ5To8>(QualityCfg::Q6, false));
+            md.select_distance_params(FlushCfg::from_qcfg::<ArchQ56>(QualityCfg::Q6, false));
         assert!(npostfix == 2 && (ndirect >> npostfix) < 16);
         assert_roundtrip_matrix(&aligned_bin, &[6, 7, 8, 9], &[22, 28]);
 
@@ -3476,7 +3489,7 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
                 }
             });
         });
-        type Q8H = EncoderInternal<ArchQ5To8>;
+        type Q8H = EncoderInternal<ArchQ78>;
         let ((_, fs), (_, fu)) = (
             Q8H::encode(
                 (25, 32, 4),
@@ -3568,7 +3581,7 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
             &cases,
             None,
         );
-        EncoderInternal::<ArchQ5To8>::assert_stream_parity(
+        EncoderInternal::<ArchQ56>::assert_stream_parity(
             (31, 8, 1),
             26,
             QualityCfg::Q5,
@@ -3589,7 +3602,7 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
             );
         }
 
-        type Q6H = EncoderInternal<ArchQ5To8>;
+        type Q6H = EncoderInternal<ArchQ56>;
         let static_and_lz = b"<div class=\"main\">Information about the government of the country and the government of the state!</div>";
         let (md_sd, _) = Q6H::assert_parity(
             (25, 16, 4),
@@ -3618,7 +3631,7 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
         );
         let mb_slice = &utf8_bin[..utf8_bin.len().min(24 * 1024)];
         type Q9H = EncoderInternal<ArchQ9>;
-        EncoderInternal::<ArchQ5To8>::assert_parity(
+        EncoderInternal::<ArchQ78>::assert_parity(
             (25, 32, 4),
             mb_slice,
             pw,
@@ -3688,8 +3701,8 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
             ContextMode::UTF8,
         );
         assert!((md_b6.total_icd as usize) < bulk.len() / 4);
-        let (md_b5, _) = EncoderInternal::<ArchQ5To8>::assert_parity(
-            (25, 16, 1),
+        let (md_b5, _) = EncoderInternal::<ArchQ56>::assert_parity(
+            (25, 8, 1),
             &bulk,
             22,
             QualityCfg::Q5,
@@ -3705,9 +3718,9 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
         let dr = &mr[..8192];
         let (ps, pl) = (
             PreparedDictionary::with_lgwin(dr, 5, 24),
-            PreparedDictionary::with_lgwin(dr, 5, 26),
+            PreparedDictionary::with_lgwin(dr, 6, 26),
         );
-        EncoderInternal::<ArchQ5To8>::assert_stream_parity(
+        EncoderInternal::<ArchQ56>::assert_stream_parity(
             (25, 8, 1),
             24,
             QualityCfg::Q5,
@@ -3716,7 +3729,7 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
             &[&mr],
             Some((&ps, dr)),
         );
-        EncoderInternal::<ArchQ5To8>::assert_stream_parity(
+        EncoderInternal::<ArchQ56>::assert_stream_parity(
             (31, 16, 4),
             26,
             QualityCfg::Q6,
@@ -3852,7 +3865,7 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
             let check_fast = |inp: &[u8]| {
                 let cap = crate::fast_onepass::fast_twopass_max_output_size_for(
                     inp.len(),
-                    FAST_Q2_CHUNK_SIZE,
+                    crate::fast_onepass::FAST_Q2_CHUNK_SIZE,
                 );
                 let run0 = |simd| {
                     let mut out = vec![0u8; cap];
@@ -3869,7 +3882,13 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
                 assert_eq!(run0(tok), run0(None));
                 for (mode, mls, chunk, log, slog) in [
                     (1u8, 6u8, FAST_TWOPASS_CHUNK_SIZE, 16u32, 14u32),
-                    (2u8, 4u8, FAST_Q2_CHUNK_SIZE, 16u32, 15u32),
+                    (
+                        2u8,
+                        4u8,
+                        crate::fast_onepass::FAST_Q2_CHUNK_SIZE,
+                        16u32,
+                        15u32,
+                    ),
                 ] {
                     let run_tp = |simd| {
                         let mut out = vec![0u8; cap];
@@ -3901,9 +3920,18 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
         EncoderInternal::<ArchQ3>::assert_stream_parity(
             (25, 4, 1),
             22,
+            QualityCfg::Q2,
+            false,
+            mlog(15),
+            &cases,
+            Some((&prep_raw, &dict)),
+        );
+        EncoderInternal::<ArchQ35>::assert_stream_parity(
+            (25, 8, 1),
+            22,
             QualityCfg::Q3,
             false,
-            mlog(16),
+            mlog(15),
             &cases,
             Some((&prep_raw, &dict)),
         );
@@ -3920,14 +3948,13 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
             (QualityCfg::Q5, 8, 1, 16),
             (QualityCfg::Q6, 8, 4, 15),
             (QualityCfg::Q6, 16, 4, 16),
-            (QualityCfg::Q7, 16, 4, 17),
         ] {
             let p = if qcfg.seed_ht_dict {
                 &prep_seed
             } else {
                 &prep_raw
             };
-            EncoderInternal::<ArchQ5To8>::assert_stream_parity(
+            EncoderInternal::<ArchQ56>::assert_stream_parity(
                 (25, ways, ht4_ways),
                 22,
                 qcfg,
@@ -3935,6 +3962,19 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
                 mlog(log),
                 &cases,
                 Some((p, &dict)),
+            );
+        }
+        for (qcfg, ways, ht4_ways, log) in
+            [(QualityCfg::Q7, 16, 4, 17), (QualityCfg::Q8, 32, 4, 16)]
+        {
+            EncoderInternal::<ArchQ78>::assert_stream_parity(
+                (25, ways, ht4_ways),
+                22,
+                qcfg,
+                false,
+                mlog(log),
+                &cases,
+                Some((&prep_seed, &dict)),
             );
         }
     }

@@ -49,7 +49,7 @@ const STATIC_MIN_DICT_GAIN: i32 = 48;
 
 pub(crate) const INTERIOR_MARGIN: usize = 16;
 
-const HASH_MUL64: u64 = 0x9E37_79B9_1E35_A7BD;
+pub(crate) const HASH_MUL64: u64 = 0x9E37_79B9_1E35_A7BD;
 const _: () = assert!(HASH_MUL64 as u32 == HASH_MUL32);
 
 /// Scalar quality thresholds parameterized at runtime across `Q3..=Q9` so parser archetypes only
@@ -86,16 +86,17 @@ impl QualityCfg {
             seed_ht_dict,
         }
     }
-    pub(crate) const Q3: Self = Self::new(2, 40, 0, 8, 0, false, false);
+    pub(crate) const Q2: Self = Self::new(2, 32, 0, 4, 0, false, false);
+    pub(crate) const Q3: Self = Self::new(4, 36, 448, 4, 0, false, false);
     pub(crate) const Q4: Self = Self::new(8, 48, 1024, 1, 0, false, false);
-    pub(crate) const Q5: Self = Self::new(40, 96, 2048, 4, 4, false, false);
-    pub(crate) const Q6: Self = Self::new(64, 128, 3072, 4, 6, false, true);
-    pub(crate) const Q7: Self = Self::new(128, 224, i32::MAX, 8, 8, false, true);
-    pub(crate) const Q8: Self = Self::new(192, 256, i32::MAX, 16, 10, true, true);
+    pub(crate) const Q5: Self = Self::new(16, 64, 2048, 1, 8, false, false);
+    pub(crate) const Q6: Self = Self::new(32, 96, 3584, 2, 6, false, true);
+    pub(crate) const Q7: Self = Self::new(64, 160, i32::MAX, 4, 10, false, true);
+    pub(crate) const Q8: Self = Self::new(88, 192, i32::MAX, 4, 12, true, true);
     pub(crate) const Q9: Self = Self::new(512, 512, i32::MAX, 16, 16, true, true);
 }
 
-/// Structural compile-time archetype for `Q3..=Q9` (`MIN_MATCH_LEN == 4` and `USE_LAST_DISTANCES`
+/// Structural compile-time archetype for `Q2..=Q9` (`MIN_MATCH_LEN == 4` and `USE_LAST_DISTANCES`
 /// hold unconditionally across all archetypes).
 pub(crate) trait MatchConfig: Send + Sync + 'static {
     const FAST_MATCHING: bool;
@@ -200,13 +201,31 @@ macro_rules! def_arch {
     };
 }
 
-def_arch!(ArchQ3:    fast=true,  shift=6,  lvl=1, lazy2=false, dctx=false, mctx=false, ht3=false;
-    avx2=[(25, 4, 1, false), (25, 4, 1, true), (31, 4, 1, true)];
-    dict=[(25, 4, 1)]);
-def_arch!(ArchQ4:    fast=false, shift=7,  lvl=1, lazy2=false, dctx=false, mctx=false, ht3=false;
+def_arch!(ArchQ3:  fast=true,  shift=6,  lvl=1, lazy2=false, dctx=false, mctx=false, ht3=false;
+    avx2=[
+        (25, 4, 1, false), (25, 8, 1, false),
+        (25, 4, 1, true), (25, 8, 1, true),
+        (31, 4, 1, true), (31, 8, 1, true),
+    ];
+    dict=[(25, 4, 1), (25, 8, 1)]);
+def_arch!(ArchQ35: fast=false, shift=5,  lvl=1, lazy2=false, dctx=false, mctx=false, ht3=false;
+    avx2=[
+        (25, 4, 1, false), (25, 8, 1, false),
+        (25, 4, 1, true), (25, 8, 1, true),
+        (31, 4, 1, true), (31, 8, 1, true),
+    ];
+    dict=[(25, 4, 1), (25, 8, 1)]);
+def_arch!(ArchQ4:  fast=false, shift=7,  lvl=1, lazy2=false, dctx=false, mctx=false, ht3=false;
     avx2=[(25, 4, 1, false), (25, 8, 1, false), (25, 8, 1, true), (31, 8, 1, true)];
     dict=[(25, 4, 1), (25, 8, 1)]);
-def_arch!(ArchQ5To8: fast=false, shift=99, lvl=2, lazy2=false, dctx=true,  mctx=true,  ht3=true;
+def_arch!(ArchQ56: fast=false, shift=8,  lvl=1, lazy2=false, dctx=true,  mctx=true,  ht3=true;
+    avx2=[
+        (25, 8, 1, false), (25, 8, 4, false), (25, 16, 4, false),
+        (25, 8, 1, true), (25, 8, 4, true), (25, 16, 4, true),
+        (31, 8, 1, true), (31, 8, 4, true), (31, 16, 4, true),
+    ];
+    dict=[(25, 8, 1), (25, 8, 4), (25, 16, 4)]);
+def_arch!(ArchQ78: fast=false, shift=8,  lvl=2, lazy2=false, dctx=true,  mctx=true,  ht3=true;
 avx2=[
     (25, 8, 1, false), (25, 8, 4, false), (25, 16, 1, false), (25, 16, 4, false), (25, 32, 4, false),
     (25, 8, 1, true), (25, 16, 4, true), (25, 32, 4, true),
@@ -215,7 +234,7 @@ avx2=[
 dict=[
     (25, 8, 1), (25, 8, 4), (25, 16, 1), (25, 16, 4), (25, 32, 4),
 ]);
-def_arch!(ArchQ9:    fast=false, shift=99, lvl=3, lazy2=true,  dctx=true,  mctx=true,  ht3=true;
+def_arch!(ArchQ9:  fast=false, shift=99, lvl=3, lazy2=true,  dctx=true,  mctx=true,  ht3=true;
     avx2=[(25, 16, 1, false), (25, 32, 4, false), (25, 32, 4, true), (31, 32, 4, true)];
     dict=[(25, 16, 1), (25, 32, 4)]);
 
@@ -260,7 +279,7 @@ fn build_dict_entries(bytes: &[u8], q: usize) -> Box<[DictEntry]> {
     let q = q.min(9);
     let (lt, cap, n_offs) = (
         [13, 15, 15, 15, 16, 16, 16, 17, 16, 17][q],
-        [1u8, 1, 4, 8, 8, 8, 16, 16, 32, 32][q],
+        [1u8, 1, 8, 8, 8, 8, 16, 16, 32, 32][q],
         bytes.len().saturating_sub(7),
     );
     let mut entries_rev = Vec::with_capacity(n_offs.min((cap as usize) << lt));
@@ -331,15 +350,63 @@ fn raw_dict_search4_scalar(bucket: &[u32; 4], tag8: u32) -> u32 {
     m
 }
 
+struct DictHt4 {
+    tbl: Box<[u32]>,
+    shift: u32,
+    mask: usize,
+}
+
+impl DictHt4 {
+    fn build(idx_bytes: &[u8]) -> Self {
+        let idx_len = idx_bytes.len();
+        if idx_len < 4 {
+            return Self {
+                tbl: Box::default(),
+                shift: 0,
+                mask: 0,
+            };
+        }
+        let win4 = idx_len.min(4 * HT4_DICT_WINDOW);
+        let log4: u32 = if cfg!(miri) {
+            11
+        } else if win4 <= 16_384 {
+            13
+        } else {
+            15
+        };
+        let shift = 32 - log4;
+        let mask = (1usize << log4) - 1;
+        let mut tbl = vec![0u32; 1usize << log4].into_boxed_slice();
+        for off in (idx_len - win4)..=(idx_len - 4) {
+            let p32 = u32::from_le_bytes(*idx_bytes[off..off + 4].first_chunk::<4>().unwrap())
+                .wrapping_mul(HASH_MUL32);
+            tbl[((p32 >> shift) as usize) & mask] = (p32 & 0xFF00_0000) | ((idx_len - off) as u32);
+        }
+        Self { tbl, shift, mask }
+    }
+
+    #[inline(always)]
+    fn probe(&self, p32: u32, max_rem: u32) -> u32 {
+        if self.tbl.is_empty() {
+            return 0;
+        }
+        let e = self.tbl[((p32 >> self.shift) as usize) & self.mask];
+        let rem = e & 0x00FF_FFFF;
+        if ((e ^ p32) >> 24) == 0 && (1..=max_rem).contains(&rem) {
+            rem
+        } else {
+            0
+        }
+    }
+}
+
 /// Immutable, shared read-only hash index over the trailing `<= 16 MiB - 1` bytes of a
-/// [`PreparedDictionary`] for `Q0..=Q5` without per-input table snapshots or FIFO eviction.
+/// [`PreparedDictionary`] for `Q0..=Q1`.
 pub(crate) struct RawDictIndex {
     buckets4: Box<[[u32; 4]]>,
-    ht4: Box<[u32]>,
+    ht4: DictHt4,
     shift8: u32,
     mask8: usize,
-    shift4: u32,
-    mask4: usize,
 }
 
 impl RawDictIndex {
@@ -386,37 +453,11 @@ impl RawDictIndex {
         } else {
             (Box::default(), 0, 0)
         };
-        let (ht4, shift4, mask4) = if idx_len >= 4 {
-            let win4 = idx_len.min(4 * HT4_DICT_WINDOW);
-            let log4: u32 = if cfg!(miri) || win4 <= 16_384 {
-                if cfg!(miri) {
-                    11
-                } else {
-                    13
-                }
-            } else {
-                15
-            };
-            let shift4 = 32 - log4;
-            let mask4 = (1usize << log4) - 1;
-            let mut tbl = vec![0u32; 1usize << log4].into_boxed_slice();
-            for off in (idx_len - win4)..=(idx_len - 4) {
-                let p32 = u32::from_le_bytes(*idx_bytes[off..off + 4].first_chunk::<4>().unwrap())
-                    .wrapping_mul(HASH_MUL32);
-                tbl[((p32 >> shift4) as usize) & mask4] =
-                    (p32 & 0xFF00_0000) | ((idx_len - off) as u32);
-            }
-            (tbl, shift4, mask4)
-        } else {
-            (Box::default(), 0, 0)
-        };
         Self {
             buckets4,
-            ht4,
+            ht4: DictHt4::build(idx_bytes),
             shift8,
             mask8,
-            shift4,
-            mask4,
         }
     }
 
@@ -426,15 +467,6 @@ impl RawDictIndex {
             None
         } else {
             Some(&self.buckets4[((p64 >> self.shift8) as usize) & self.mask8])
-        }
-    }
-
-    #[inline(always)]
-    pub(crate) fn prefetch4<S: SimdBackend>(&self, simd: S, p64: u64) {
-        if const { S::IS_SIMD } {
-            if let Some(b) = self.bucket4(p64) {
-                simd.prefetch_t0(b);
-            }
         }
     }
 
@@ -454,16 +486,7 @@ impl RawDictIndex {
 
     #[inline(always)]
     pub(crate) fn probe_ht4(&self, p32: u32, max_rem: u32) -> u32 {
-        if self.ht4.is_empty() {
-            return 0;
-        }
-        let e = self.ht4[((p32 >> self.shift4) as usize) & self.mask4];
-        let rem = e & 0x00FF_FFFF;
-        if ((e ^ p32) >> 24) == 0 && (1..=max_rem).contains(&rem) {
-            rem
-        } else {
-            0
-        }
+        self.ht4.probe(p32, max_rem)
     }
 
     #[inline(always)]
@@ -485,11 +508,207 @@ impl RawDictIndex {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[simd_entry]
+#[inline]
+#[target_feature(enable = "avx2")]
+fn dict5_search8_avx2(bucket: &[u32; 8], tag8: u32, _tok: impl SimdToken) -> u32 {
+    let v = _mm256_loadu_si256(bucket);
+    let eq = _mm256_cmpeq_epi32(_mm256_srli_epi32::<24>(v), _mm256_set1_epi32(tag8 as i32));
+    _mm256_movemask_ps(_mm256_castsi256_ps(eq)) as u32
+}
+
+#[cfg(target_arch = "aarch64")]
+#[simd_entry]
+#[inline]
+#[target_feature(enable = "neon")]
+fn dict5_search8_neon(bucket: &[u32; 8], tag8: u32, _tok: impl SimdToken) -> u32 {
+    let vt = vdupq_n_u32(tag8);
+    let c0 = vceqq_u32(
+        vshrq_n_u32::<24>(vld1q_u32(bucket.first_chunk::<4>().unwrap())),
+        vt,
+    );
+    let c1 = vceqq_u32(
+        vshrq_n_u32::<24>(vld1q_u32(bucket.last_chunk::<4>().unwrap())),
+        vt,
+    );
+    let w0 = vld1q_u32(&[1u32, 2, 4, 8]);
+    let w1 = vld1q_u32(&[16u32, 32, 64, 128]);
+    vaddvq_u32(vorrq_u32(vandq_u32(c0, w0), vandq_u32(c1, w1)))
+}
+
+#[inline(always)]
+fn dict5_search8_scalar(bucket: &[u32; 8], tag8: u32) -> u32 {
+    let mut m = 0u32;
+    for (i, &e) in bucket.iter().enumerate() {
+        m |= u32::from((e >> 24) == tag8) << i;
+    }
+    m
+}
+
+/// Immutable, shared 32-way CSR 5-byte SIMD hash index with 6th-byte tags over the trailing
+/// `<= 16 MiB - 1` bytes of a [`PreparedDictionary`] for `Q3..=Q9`.
+pub(crate) struct Dict5Index {
+    heads: Box<[u32]>,
+    chunks8: Box<[[u32; 8]]>,
+    ht4: DictHt4,
+    shift5: u32,
+    mask5: usize,
+}
+
+const _: () = assert!((4usize << 18) <= (u32::MAX as usize >> 6));
+
+impl Dict5Index {
+    fn build(bytes: &[u8]) -> Self {
+        let idx_bytes = &bytes[bytes.len().saturating_sub(0x00FF_FFFF)..];
+        let idx_len = idx_bytes.len();
+        let (heads, chunks8, shift5, mask5) = if idx_len >= 5 {
+            let log5: u32 = if cfg!(miri) || idx_len <= 16_384 {
+                11
+            } else if idx_len <= 65_536 {
+                13
+            } else if idx_len <= 262_144 {
+                15
+            } else if idx_len <= 524_288 {
+                16
+            } else if idx_len <= 2_097_152 {
+                17
+            } else {
+                18
+            };
+            let nb = 1usize << log5;
+            let shift5 = 64 - log5;
+            let mask5 = nb - 1;
+            let mut counts = vec![0u8; nb];
+            let mut last_off = vec![u32::MAX; nb];
+            for off in (0..=idx_len - 5).rev() {
+                let w = load_word64_padded(&idx_bytes[off..]);
+                let (p64, _, _) = hash5_p64(w);
+                let b = ((p64 >> shift5) as usize) & mask5;
+                let cnt = counts[b] as usize;
+                if cnt < 32 {
+                    let prev = last_off[b];
+                    if prev != u32::MAX && off + 32 <= idx_len {
+                        let po = prev as usize;
+                        if po + 32 <= idx_len && idx_bytes[off..off + 32] == idx_bytes[po..po + 32]
+                        {
+                            continue;
+                        }
+                    }
+                    counts[b] = (cnt + 1) as u8;
+                    last_off[b] = off as u32;
+                }
+            }
+            let mut heads = vec![0u32; nb].into_boxed_slice();
+            let mut total_chunks = 0usize;
+            for b in 0..nb {
+                let c = counts[b] as usize;
+                if c != 0 {
+                    heads[b] = ((total_chunks as u32) << 6) | (c as u32);
+                    total_chunks += c.div_ceil(8);
+                }
+            }
+            counts.fill(0);
+            last_off.fill(u32::MAX);
+            let mut chunks8 = vec![[0u32; 8]; total_chunks].into_boxed_slice();
+            for off in (0..=idx_len - 5).rev() {
+                let w = load_word64_padded(&idx_bytes[off..]);
+                let (p64, _, _) = hash5_p64(w);
+                let b = ((p64 >> shift5) as usize) & mask5;
+                let hdr = heads[b];
+                let cnt = counts[b] as usize;
+                if cnt < (hdr & 63) as usize {
+                    let prev = last_off[b];
+                    if prev != u32::MAX && off + 32 <= idx_len {
+                        let po = prev as usize;
+                        if po + 32 <= idx_len && idx_bytes[off..off + 32] == idx_bytes[po..po + 32]
+                        {
+                            continue;
+                        }
+                    }
+                    let byte5 = idx_bytes.get(off + 5).copied().unwrap_or(0) as u32;
+                    chunks8[((hdr >> 6) as usize) + (cnt >> 3)][cnt & 7] =
+                        (byte5 << 24) | ((idx_len - off) as u32);
+                    counts[b] = (cnt + 1) as u8;
+                    last_off[b] = off as u32;
+                }
+            }
+            (heads, chunks8, shift5, mask5)
+        } else {
+            (Box::default(), Box::default(), 0, 0)
+        };
+        Self {
+            heads,
+            chunks8,
+            ht4: DictHt4::build(idx_bytes),
+            shift5,
+            mask5,
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn bucket_chunks(&self, p64: u64, max_chunks: usize) -> Option<&[[u32; 8]]> {
+        if self.heads.is_empty() {
+            return None;
+        }
+        let hdr = self.heads[((p64 >> self.shift5) as usize) & self.mask5];
+        if hdr == 0 {
+            return None;
+        }
+        let start = (hdr >> 6) as usize;
+        let n_chunks = ((hdr & 63) as usize).div_ceil(8).min(max_chunks);
+        Some(&self.chunks8[start..start + n_chunks])
+    }
+
+    #[inline(always)]
+    pub(crate) fn prefetch_ahead<S: SimdBackend>(&self, simd: S, p64_head: u64, p64_chunk: u64) {
+        if const { S::IS_SIMD } && !self.heads.is_empty() {
+            simd.prefetch_t0(&self.heads[((p64_head >> self.shift5) as usize) & self.mask5]);
+            let hdr = self.heads[((p64_chunk >> self.shift5) as usize) & self.mask5];
+            if hdr != 0 {
+                simd.prefetch_t0(&self.chunks8[(hdr >> 6) as usize]);
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn probe5_one(&self, p64: u64, target_byte5: Option<u8>, max_rem: u32) -> u32 {
+        let Some(chunks) = self.bucket_chunks(p64, 1) else {
+            return 0;
+        };
+        let e = chunks[0][0];
+        let rem = e & 0x00FF_FFFF;
+        if (1..=max_rem).contains(&rem)
+            && target_byte5.is_none_or(|b5| (e >> 24) == b5 as u32 || rem <= 393_216)
+        {
+            rem
+        } else {
+            0
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn probe_ht4(&self, p32: u32, max_rem: u32) -> u32 {
+        self.ht4.probe(p32, max_rem)
+    }
+
+    #[inline(always)]
+    pub(crate) fn search8_chunk_mask<S: SimdBackend>(simd: S, chunk: &[u32; 8], tag8: u32) -> u32 {
+        dispatch_simd!(
+            simd,
+            S => x64: |tok| dict5_search8_avx2(chunk, tag8, tok),
+            neon: |tok| dict5_search8_neon(chunk, tag8, tok),
+            scalar: dict5_search8_scalar(chunk, tag8),
+        )
+    }
+}
+
 struct PreparedDictInner {
     bytes: Box<[u8]>,
     raw_len: usize,
     quality_hint: u8,
     raw_index: std::sync::OnceLock<RawDictIndex>,
+    dict5_index: std::sync::OnceLock<Dict5Index>,
     entries: std::sync::OnceLock<Box<[DictEntry]>>,
     dict_chain: std::sync::OnceLock<Option<crate::q11::DictChain>>,
     tables_cache: std::sync::RwLock<Vec<std::sync::Arc<PreparedDictTables>>>,
@@ -524,16 +743,24 @@ impl PreparedDictionary {
         let dict = &dict[dict.len().saturating_sub(Self::MAX_RAW_LEN)..];
         let raw_len = dict.len();
         let bytes: Box<[u8]> = dict[raw_len.saturating_sub(window_size(wbits))..].into();
-        let (raw_index, entries, dict_chain) = (
+        let (raw_index, dict5_index, entries, dict_chain) = (
+            std::sync::OnceLock::new(),
             std::sync::OnceLock::new(),
             std::sync::OnceLock::new(),
             std::sync::OnceLock::new(),
         );
-        if quality <= 5 {
+        if quality <= 2 {
             if !bytes.is_empty() {
                 let _ = raw_index.set(RawDictIndex::build(&bytes));
             }
+        } else if quality <= 5 {
+            if !bytes.is_empty() {
+                let _ = dict5_index.set(Dict5Index::build(&bytes));
+            }
         } else if quality <= 9 {
+            if quality <= 7 && !bytes.is_empty() {
+                let _ = dict5_index.set(Dict5Index::build(&bytes));
+            }
             let _ = entries.set(build_dict_entries(&bytes, quality as usize));
         } else {
             let _ = dict_chain.set(crate::q11::DictChain::new(&bytes));
@@ -543,6 +770,7 @@ impl PreparedDictionary {
             raw_len,
             quality_hint: quality.min(12) as u8,
             raw_index,
+            dict5_index,
             entries,
             dict_chain,
             tables_cache: std::sync::RwLock::new(Vec::new()),
@@ -580,6 +808,13 @@ impl PreparedDictionary {
         self.0
             .raw_index
             .get_or_init(|| RawDictIndex::build(&self.0.bytes))
+    }
+
+    #[inline]
+    pub(crate) fn dict5_index(&self) -> &Dict5Index {
+        self.0
+            .dict5_index
+            .get_or_init(|| Dict5Index::build(&self.0.bytes))
     }
 
     #[inline]
@@ -2443,7 +2678,8 @@ fn compute_hash3(word64: u64) -> BoundedUsize<HT3_MASK> {
 pub(crate) struct SliceEnv<'a> {
     data: &'a [u8],
     active_dict: &'a [u8],
-    dict_idx: Option<&'a RawDictIndex>,
+    raw_dict_idx: Option<&'a RawDictIndex>,
+    dict_idx: Option<&'a Dict5Index>,
     model: &'a SliceCostModel,
     ldm_spans: &'a [FastLdmSpan],
     bounds: (usize, usize),
@@ -2927,17 +3163,17 @@ impl<'a> ProbeCtx<'a> {
 
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    fn scan_dict_candidates<S: SimdBackend, C: MatchConfig>(
+    fn scan_raw_dict_candidates<S: SimdBackend, C: MatchConfig>(
         &self,
         simd: S,
-        d_idx: &RawDictIndex,
+        raw_idx: &RawDictIndex,
         p64: u64,
         sec_hash: u32,
         max_rem: u32,
         at_pos: BoundedPrefixCursor<'_, u8, 16>,
         best: &mut BestMatch,
     ) -> bool {
-        let Some((bucket, mut mask)) = d_idx.search4_mask(simd, p64, sec_hash) else {
+        let Some((bucket, mut mask)) = raw_idx.search4_mask(simd, p64, sec_hash) else {
             return false;
         };
         if mask == 0 {
@@ -2957,6 +3193,59 @@ impl<'a> ProbeCtx<'a> {
                     if len >= nice_len {
                         break;
                     }
+                }
+            }
+        }
+        improved
+    }
+
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn scan_dict_candidates<S: SimdBackend, C: MatchConfig>(
+        &self,
+        simd: S,
+        d_idx: &Dict5Index,
+        p64: u64,
+        max_chunks: usize,
+        max_rem: u32,
+        at_pos: BoundedPrefixCursor<'_, u8, 16>,
+        best: &mut BestMatch,
+    ) -> bool {
+        let Some(chunks) = d_idx.bucket_chunks(p64, max_chunks) else {
+            return false;
+        };
+        let acfg = const { arch_cfg::<C>() };
+        let target_byte5 = ((self.word64 >> 40) & 0xFF) as u32;
+        let dict_nice_len = (self.env.qcfg.nice_len as u32).max(128);
+        let mut improved = false;
+        for chunk in chunks {
+            let mut mask = Dict5Index::search8_chunk_mask(simd, chunk, target_byte5);
+            while mask != 0 {
+                let idx = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                let rem = *chunk.bget_masked(idx) & 0x00FF_FFFF;
+                if (1..=max_rem).contains(&rem) {
+                    let dist = (self.pos as u32) + rem;
+                    if dist != best.dist {
+                        let len =
+                            self.cross_dict_rem_at_cursor(simd, at_pos, rem as usize, best.len, 6);
+                        if best.try_lz(len, len, dist, self, acfg) {
+                            improved = true;
+                            if len >= dict_nice_len {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if best.len < 5 {
+            let rem0 = chunks[0][0] & 0x00FF_FFFF;
+            let dist0 = (self.pos as u32) + rem0;
+            if (1..=max_rem).contains(&rem0) && dist0 <= 393_216 && dist0 != best.dist {
+                let len0 = self.cross_dict_rem_at_cursor(simd, at_pos, rem0 as usize, best.len, 5);
+                if best.try_lz(len0, len0, dist0, self, acfg) {
+                    improved = true;
                 }
             }
         }
@@ -3034,7 +3323,7 @@ impl<'a> ProbeCtx<'a> {
                     e.model.lit_mult,
                     e.model.explicit_cmd_off,
                 );
-                let fast = acfg.fast || (!e.qcfg.ctx_block_split && e.qcfg.max_lit_clusters <= 4);
+                let fast = acfg.fast || !e.qcfg.ctx_block_split;
                 if let Some(sm) = static_dict::lookup_simd(
                     simd,
                     fast,
@@ -3217,10 +3506,6 @@ impl TableSlices1<'_> {
 
 trait InteriorOps<S: SimdBackend> {
     #[inline(always)]
-    fn may_use_dict_idx(&self, _: S) -> bool {
-        true
-    }
-    #[inline(always)]
     fn is_ht4_one(&self, _: S) -> bool {
         false
     }
@@ -3370,10 +3655,6 @@ impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize>
 impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize, S: SimdBackend> InteriorOps<S>
     for InteriorTables<'_, POS_BITS, WAYS, HT4_WAYS>
 {
-    #[inline(always)]
-    fn may_use_dict_idx(&self, _: S) -> bool {
-        const { WAYS <= 8 }
-    }
     #[inline(always)]
     fn is_ht4_one(&self, _: S) -> bool {
         const { HT4_WAYS == 1 }
@@ -3771,10 +4052,6 @@ pub(crate) struct HashTable {
 }
 
 impl InteriorOps<Scalar> for HashTable {
-    #[inline(always)]
-    fn may_use_dict_idx(&self, _: Scalar) -> bool {
-        self.ways <= 8
-    }
     #[inline(always)]
     fn step_ht3(&mut self, _: Scalar, word64: u64, vpos: u32) -> u32 {
         let Some(t3) = self.ht3.as_deref_mut() else {
@@ -4344,7 +4621,14 @@ def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| 
         return;
     };
     let acfg = const { arch_cfg::<C>() };
-    let (nice_len, max_insert_len) = (qcfg.nice_len as u32, qcfg.max_insert_len as usize);
+    let (nice_len, max_insert_len) = if has_dict && const { C::TWO_STEP_LAZY } {
+        (
+            (qcfg.nice_len as u32).min(176),
+            (qcfg.max_insert_len as usize).min(80),
+        )
+    } else {
+        (qcfg.nice_len as u32, qcfg.max_insert_len as usize)
+    };
     let (mut anchor, mut last_distances) = (state.anchor, state.last_distances);
     macro_rules! emit {
         ($mp:expr, $el:expr, $cl:expr, $d:expr, $is:expr) => {{
@@ -4363,11 +4647,16 @@ def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| 
         }};
     }
     let sd_pos_limit = if use_sd {
-        (qcfg.static_dict_limit as usize).saturating_sub(stream_base)
+        let lim = (qcfg.static_dict_limit as usize).saturating_sub(stream_base);
+        if has_dict && const { C::TWO_STEP_LAZY } {
+            lim.min(131_072)
+        } else {
+            lim
+        }
     } else {
         0
     };
-    let fast_sd = if !C::MULTI_CONTEXT && slice_start < sd_pos_limit {
+    let fast_sd = if C::COST_MODEL_LEVEL <= 1 && slice_start < sd_pos_limit {
         Some(static_dict::fast_dict())
     } else {
         None
@@ -4384,6 +4673,20 @@ def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| 
         (0, 0, 0)
     };
     let (max_d4, lazy_margin) = (model.max_d4.min(eff_w32), model.lazy_margin);
+    let max_dict_chunks: usize = if const { C::STEP_SHIFT == 5 } || qcfg.seed_ht_dict {
+        2
+    } else {
+        3
+    };
+    let eff_min_gain = if !has_dict || const { C::FAST_MATCHING } {
+        qcfg.min_gain_for_greedy
+    } else if const { C::STEP_SHIFT == 5 } {
+        1536
+    } else if const { !C::MULTI_CONTEXT } {
+        3072
+    } else {
+        qcfg.min_gain_for_greedy.saturating_add(1024).max(4608)
+    };
     let (mut dists, mut dists4) = ([0u32; 32], [0u32; 32]);
     let (mut lazy_pos, mut lazy, mut has_lazy) = (0usize, BestMatch::default(), false);
     let (mut ldm_i, mut pos) = (0usize, slice_start);
@@ -4399,12 +4702,16 @@ def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| 
             PREFETCH_OFFSET
         };
         ht.prefetch_ahead::<C>(simd, pfx16, pos + pf_off);
-        if has_dict && ht.may_use_dict_idx(simd) && !C::FAST_MATCHING && unm >= 2 {
+        if has_dict && const { !C::FAST_MATCHING } {
             if let Some(d_idx) = env.dict_idx {
-                if pos + pf_off < max_dict_pos {
-                    let pf_p64 = u64::from_le_bytes(*pfx16.get_sub_clamped::<8, 0>(pos + pf_off))
-                        .wrapping_mul(HASH_MUL64);
-                    d_idx.prefetch4(simd, pf_p64);
+                if pos + pf_off + 4 < max_dict_pos {
+                    let (pf_h, _, _) = hash5_p64(u64::from_le_bytes(
+                        *pfx16.get_sub_clamped::<8, 0>(pos + pf_off + 4),
+                    ));
+                    let (pf_c, _, _) = hash5_p64(u64::from_le_bytes(
+                        *pfx16.get_sub_clamped::<8, 0>(pos + pf_off),
+                    ));
+                    d_idx.prefetch_ahead(simd, pf_h, pf_c);
                 }
             }
         }
@@ -4425,7 +4732,13 @@ def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| 
                 macro_rules! probe_rep {
                     ($k:literal) => {{
                         let rep_dist = last_distances[$k];
-                        let sub_min = if $k <= 1 && C::USE_3B_TABLE { 2 } else { 3 };
+                        let sub_min = if ($k <= 1 && C::USE_3B_TABLE)
+                            || (has_dict && (rep_dist as usize) > pos)
+                        {
+                            2
+                        } else {
+                            3
+                        };
                         if !($k == 0 && pos == anchor && !hl)
                             && rep_dist != 0
                             && (rep_dist as usize) <= max_valid_dist
@@ -4480,7 +4793,9 @@ def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| 
                 }
                 probe_rep!(0);
                 probe_rep!(1);
-                if const { C::COST_MODEL_LEVEL >= 2 } && !hl {
+                if (const { C::COST_MODEL_LEVEL >= 2 } || (has_dict && const { !C::FAST_MATCHING }))
+                    && !hl
+                {
                     probe_rep!(2);
                     probe_rep!(3);
                 }
@@ -4490,19 +4805,57 @@ def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| 
         if pctx.scan_main_candidates::<S, C>(simd, has_dict, at_pos, &dists, mask, &mut best) {
             best_is_rep = false;
         }
-        let max_local_for_dict = if C::FAST_MATCHING { 8 } else { 16 };
+        let max_local_for_dict = if C::FAST_MATCHING {
+            32
+        } else if qcfg.seed_ht_dict {
+            if C::TWO_DIST_CTX {
+                24
+            } else {
+                20
+            }
+        } else {
+            nice_len
+        };
+        let lazy_dict_cap = if qcfg.seed_ht_dict {
+            if C::TWO_STEP_LAZY {
+                5
+            } else {
+                8
+            }
+        } else {
+            16
+        };
         if has_dict
-            && ht.may_use_dict_idx(simd)
             && best.len < max_local_for_dict
-            && !(hl && lazy.len >= 16)
+            && !(hl && lazy.len >= lazy_dict_cap)
             && pos < max_dict_pos
         {
-            if let Some(d_idx) = env.dict_idx {
+            if const { C::FAST_MATCHING } {
+                if let Some(raw_idx) = env.raw_dict_idx {
+                    if pctx.scan_raw_dict_candidates::<S, C>(
+                        simd,
+                        raw_idx,
+                        p64,
+                        sec_hash,
+                        (max_dict_pos - pos).min(d_len) as u32,
+                        at_pos,
+                        &mut best,
+                    ) {
+                        best_is_rep = false;
+                    }
+                }
+            } else if let Some(d_idx) = env.dict_idx {
+                let chunks = if qcfg.seed_ht_dict && best.len >= 8 {
+                    1
+                } else {
+                    max_dict_chunks
+                };
+                let (dp64, _, _) = hash5_p64(word64);
                 if pctx.scan_dict_candidates::<S, C>(
                     simd,
                     d_idx,
-                    p64,
-                    sec_hash,
+                    dp64,
+                    chunks,
                     (max_dict_pos - pos).min(d_len) as u32,
                     at_pos,
                     &mut best,
@@ -4569,12 +4922,12 @@ def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| 
                     try_fast_ht4(d4, len4, &mut best, &mut best_is_rep);
                 }
                 if has_dict
-                    && ht.may_use_dict_idx(simd)
-                    && best.len < 8
+                    && !qcfg.seed_ht_dict
+                    && best.len < 5
                     && pos < max_dict_pos.min(HT4_DICT_WINDOW)
                 {
-                    if let Some(d_idx) = env.dict_idx {
-                        let rem4 = d_idx.probe_ht4(p32, (max_dict_pos - pos).min(d_len) as u32);
+                    if let Some(raw_idx) = env.raw_dict_idx {
+                        let rem4 = raw_idx.probe_ht4(p32, (max_dict_pos - pos).min(d_len) as u32);
                         if rem4 != 0 {
                             let d4_dict = (pos as u32) + rem4;
                             if d4_dict != best.dist {
@@ -4638,8 +4991,8 @@ def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| 
                 }
             }
             if has_dict
-                && ht.may_use_dict_idx(simd)
-                && best.len < 8
+                && !qcfg.seed_ht_dict
+                && best.len < 5
                 && pos < max_dict_pos.min(HT4_DICT_WINDOW)
             {
                 if let Some(d_idx) = env.dict_idx {
@@ -4662,7 +5015,7 @@ def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| 
                     }
                 }
             }
-        } else if hl || best.gain <= qcfg.min_gain_for_greedy {
+        } else if hl || best.gain <= eff_min_gain {
             ht.insert_ht4(simd, p32, vpos);
         }
 
@@ -4692,13 +5045,13 @@ def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| 
                     }
                 }
             }
-            if best.len == 0 {
+            if const { C::COST_MODEL_LEVEL >= 2 } && best.len == 0 {
                 probe_periodic_2b_stride::<C>(&pctx, &mut best);
             }
         }
 
         if pos < sd_pos_limit {
-            if const { !C::MULTI_CONTEXT } {
+            if const { C::COST_MODEL_LEVEL <= 1 } {
                 if !hl && best.len <= 4 && unm < 4096 {
                     if let Some(sd_tbl) = fast_sd {
                         if let Some(sm) = pctx.lookup_fast_sd(
@@ -4712,7 +5065,7 @@ def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| 
                         }
                     }
                 }
-            } else {
+            } else if C::TWO_STEP_LAZY || !hl {
                 let a4 = C::TWO_STEP_LAZY || pos.saturating_add(stream_base) < 32_768;
                 pctx.probe_sd(simd, acfg, &mut best, a4, large_window, has_dict);
             }
@@ -4735,7 +5088,7 @@ def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| 
                 pos + 1,
                 large_window && lazy.dist > FAST_LDM_MIN_DIST as u32,
             )
-        } else if best.dist != 0 && (C::FAST_MATCHING || best.gain > qcfg.min_gain_for_greedy) {
+        } else if best.dist != 0 && (C::FAST_MATCHING || best.gain > eff_min_gain) {
             let mut next_ins_start = pos + 1;
             if const { C::FAST_MATCHING }
                 && (best.dist & STATIC_DICT_DIST_FLAG) == 0
@@ -4757,15 +5110,11 @@ def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| 
                     };
                     let mut found1 = pctx1
                         .scan_main_candidates::<S, C>(simd, has_dict, at_p1, &dists, m1, &mut b1);
-                    if has_dict
-                        && ht.may_use_dict_idx(simd)
-                        && b1.len < nice_len
-                        && p1 < max_dict_pos
-                    {
-                        if let Some(d_idx) = env.dict_idx {
-                            found1 |= pctx1.scan_dict_candidates::<S, C>(
+                    if has_dict && b1.len < nice_len && p1 < max_dict_pos {
+                        if let Some(raw_idx) = env.raw_dict_idx {
+                            found1 |= pctx1.scan_raw_dict_candidates::<S, C>(
                                 simd,
-                                d_idx,
+                                raw_idx,
                                 p64_1,
                                 sh1,
                                 (max_dict_pos - p1).min(d_len) as u32,
@@ -4781,7 +5130,9 @@ def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| 
             }
             let back = (C::STEP_SHIFT < 32
                 || (large_window && best.dist > FAST_LDM_MIN_DIST as u32)
-                || (has_dict && env.dict_idx.is_some() && (best.dist as usize) > pos))
+                || (has_dict
+                    && (env.dict_idx.is_some() || env.raw_dict_idx.is_some())
+                    && (best.dist as usize) > pos))
                 && !hl
                 && best.len >= 4;
             (pos, best, next_ins_start, back)
@@ -4790,7 +5141,12 @@ def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| 
             pos += 1;
             continue;
         } else {
-            let next_pos = pos + unmatched_step::<C>(unm);
+            let step = if has_dict && const { C::STEP_SHIFT == 5 } {
+                1 + (unm >> 6)
+            } else {
+                unmatched_step::<C>(unm)
+            };
+            let next_pos = pos + step;
             pos = if lw_ldm {
                 clamp_ldm_next_pos(ldm_spans, ldm_i, slice_start, pos, next_pos)
             } else {
@@ -4878,12 +5234,12 @@ impl HashTable {
             } else {
                 0
             };
-            let (dm_dict, dh4_dict) =
-                if hd && self.may_use_dict_idx(Scalar) && env.stream_base == 0 && pos < wsize {
-                    if let Some(d_idx) = env.dict_idx {
-                        let mr = (wsize - pos).min(d_len) as u32;
+            let (dm_dict, dh4_dict) = if hd && env.stream_base == 0 && pos < wsize {
+                let mr = (wsize - pos).min(d_len) as u32;
+                if acfg.fast {
+                    if let Some(raw_idx) = env.raw_dict_idx {
                         let dm = if pos + 8 <= len_data {
-                            let r = d_idx.probe4_one(p64, sec_h, mr);
+                            let r = raw_idx.probe4_one(p64, sec_h, mr);
                             if r != 0 {
                                 (pos as u32) + r
                             } else {
@@ -4893,7 +5249,7 @@ impl HashTable {
                             0
                         };
                         let dh4 = if pos < HT4_DICT_WINDOW {
-                            let r = d_idx.probe_ht4(p32, mr);
+                            let r = raw_idx.probe_ht4(p32, mr);
                             if r != 0 {
                                 (pos as u32) + r
                             } else {
@@ -4906,9 +5262,35 @@ impl HashTable {
                     } else {
                         (0, 0)
                     }
+                } else if let Some(d_idx) = env.dict_idx {
+                    let dm = if pos + 5 <= len_data {
+                        let (dp64, _, _) = hash5_p64(word64);
+                        let r = d_idx.probe5_one(dp64, data.get(pos + 5).copied(), mr);
+                        if r != 0 {
+                            (pos as u32) + r
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
+                    let dh4 = if !env.qcfg.seed_ht_dict && pos < HT4_DICT_WINDOW {
+                        let r = d_idx.probe_ht4(p32, mr);
+                        if r != 0 {
+                            (pos as u32) + r
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
+                    (dm, dh4)
                 } else {
                     (0, 0)
-                };
+                }
+            } else {
+                (0, 0)
+            };
             let max_d = (pos + d_len).min(wsize).min(eff_wsize) as u32;
             for (d, is_h4) in [
                 (if pos > anchor { ld[0] } else { 0 }, false),
@@ -4952,7 +5334,12 @@ impl HashTable {
         large_window: bool,
         has_dict: bool,
         (data, target_end, wsize): (&[u8], usize, usize),
-        (active_dict, full_dict_len, dict_idx): (&[u8], usize, Option<&RawDictIndex>),
+        (active_dict, full_dict_len, raw_dict_idx, dict_idx): (
+            &[u8],
+            usize,
+            Option<&RawDictIndex>,
+            Option<&Dict5Index>,
+        ),
         state: &mut SliceParseState,
         md: &mut MetablockSink<'_>,
         model: &SliceCostModel,
@@ -5000,6 +5387,7 @@ impl HashTable {
         let env = SliceEnv {
             data,
             active_dict,
+            raw_dict_idx,
             dict_idx,
             model,
             ldm_spans: &ldm_spans,
@@ -5339,7 +5727,17 @@ mod test {
                 .wrapping_add(1442695040888963407);
             dict.push((s >> 56) as u8);
         }
+        // Inject > 24 skewed `this.` occurrences with distinct trailing bytes to exercise
+        // multi-chunk CSR (`<= 32` ways) + 6th-byte filtering in `Dict5Index`.
+        let (base, stride) = if cfg!(miri) { (64, 64) } else { (256, 512) };
+        for k in 0..28usize {
+            let off = base + k * stride;
+            dict[off..off + 5].copy_from_slice(b"this.");
+            dict[off + 5] = b'a' + (k as u8 % 10);
+            dict[off + 6] = b'0' + (k as u8);
+        }
         let idx = super::RawDictIndex::build(&dict);
+        let idx5 = super::Dict5Index::build(&dict);
         let simd = crate::constants::try_simd(true);
         for off in (0..dict.len() - 8).step_by(37) {
             let w = u64::from_le_bytes(*dict[off..off + 8].first_chunk::<8>().unwrap());
@@ -5354,6 +5752,43 @@ mod test {
                 );
             }
             let _ = (simd, res_scalar);
+        }
+        let (p_this, _, _) = super::hash5_p64(super::load_word64_padded(b"this.c00"));
+        let chunks = idx5.bucket_chunks(p_this, 4).unwrap();
+        assert!(chunks.len() >= 2);
+        for chunk in chunks {
+            let tag = u32::from(b'c');
+            let m_scalar = super::Dict5Index::search8_chunk_mask(Scalar, chunk, tag);
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            if let Some(tok) = simd {
+                assert_eq!(
+                    super::Dict5Index::search8_chunk_mask(tok, chunk, tag),
+                    m_scalar
+                );
+            }
+            let _ = (simd, m_scalar);
+        }
+
+        // Also verify all 8 lane positions + tag collisions on `dict5_search8_*` directly.
+        let mut b8 = [0u32; 8];
+        for (i, slot) in b8.iter_mut().enumerate() {
+            let tag = if i % 2 == 0 { 0xABu32 } else { 0xCDu32 };
+            *slot = (tag << 24) | ((i as u32) + 100);
+        }
+        let scalar_ab = super::dict5_search8_scalar(&b8, 0xAB);
+        assert_eq!(scalar_ab, 0b0101_0101);
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        if let Some(tok) = simd {
+            #[cfg(target_arch = "x86_64")]
+            {
+                assert_eq!(super::dict5_search8_avx2(&b8, 0xAB, tok), scalar_ab);
+                assert_eq!(super::dict5_search8_avx2(&b8, 0xCD, tok), 0b1010_1010);
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                assert_eq!(super::dict5_search8_neon(&b8, 0xAB, tok), scalar_ab);
+                assert_eq!(super::dict5_search8_neon(&b8, 0xCD, tok), 0b1010_1010);
+            }
         }
     }
 }

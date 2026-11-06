@@ -92,7 +92,8 @@ pub(crate) const fn fast_twopass_stream_pos_bits(wbits: usize) -> u8 {
 /// Maximum metablock size emitted by [`FastTwoPassEncoder`] at `Q1` (`128 KiB`).
 pub(crate) const FAST_TWOPASS_CHUNK_SIZE: usize = 131_072;
 
-/// Maximum metablock size emitted by [`FastTwoPassEncoder`] at `Q2` (`256 KiB`).
+/// Maximum metablock size used when exercising 256 KiB chunking in [`FastTwoPassEncoder`] tests.
+#[cfg(test)]
 pub(crate) const FAST_Q2_CHUNK_SIZE: usize = 262_144;
 
 /// Chunks shorter than this threshold in [`OnePassEncoder`] use baked static literal presets.
