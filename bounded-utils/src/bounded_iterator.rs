@@ -72,6 +72,19 @@ impl<T: BoundedIterable> ExactSizeIterator for BoundedIterator<T> {
     }
 }
 
+#[inline(always)]
+fn checked_end_state(start: usize, n: usize, step: usize, bound: usize) -> usize {
+    if n == 0 {
+        0
+    } else {
+        let end = start
+            .checked_add((n - 1).checked_mul(step).unwrap())
+            .unwrap();
+        assert!(end <= bound);
+        end
+    }
+}
+
 macro_rules! replace {
     ($i: ident, $repl: ty) => {
         $repl
@@ -91,10 +104,11 @@ macro_rules! impl_bounded_iterable {
                 #[inline(always)]
                 fn iter(($([< start_ $bound:lower >]),*): Self::State, n: usize, ($([< step_ $bound:lower >]),*): Self::Step) -> BoundedIterator<Self> {
                     $(
-                        assert!(
-                            [< start_ $bound:lower >].checked_add(
-                                n.checked_mul([< step_ $bound:lower >]).unwrap()
-                            ).unwrap() <= [< BOUND_ $bound >].checked_add([< step_ $bound:lower >]).unwrap()
+                        let _ = checked_end_state(
+                            [< start_ $bound:lower >],
+                            n,
+                            [< step_ $bound:lower >],
+                            [< BOUND_ $bound >],
                         );
                     )*
                     BoundedIterator {
@@ -106,15 +120,15 @@ macro_rules! impl_bounded_iterable {
 
                 #[inline(always)]
                 fn riter(($([< start_ $bound:lower >]),*): Self::State, n: usize, ($([< step_ $bound:lower >]),*): Self::Step) -> BoundedIterator<Self> {
-                    $(
-                        assert!(
-                            [< start_ $bound:lower >].checked_add(
-                                n.checked_mul([< step_ $bound:lower >]).unwrap()
-                            ).unwrap() <= [< BOUND_ $bound >].checked_add([< step_ $bound:lower >]).unwrap()
-                        );
-                    )*
                     BoundedIterator {
-                        state: ($([< start_ $bound:lower >] + n.saturating_sub(1) * [< step_ $bound:lower >]),*),
+                        state: ($(
+                            checked_end_state(
+                                [< start_ $bound:lower >],
+                                n,
+                                [< step_ $bound:lower >],
+                                [< BOUND_ $bound >],
+                            )
+                        ),*),
                         step: ($(0usize.wrapping_sub([< step_ $bound:lower >])),*),
                         remaining_steps: n,
                     }

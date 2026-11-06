@@ -27,7 +27,7 @@ use rbrotli_enc_lib::Encoder;
 fn bench_impl(c: &mut BenchmarkGroup<WallTime>, files: &[&str], quality: u32) {
     let mut encoder = Encoder::new(quality);
     for file in files {
-        let f = fs::read(&format!("data/{}", file)).unwrap();
+        let f = fs::read(format!("data/{}", file)).unwrap();
         let outbuf = Arc::new(Mutex::new(vec![
             MaybeUninit::uninit();
             encoder.max_required_size(f.len())

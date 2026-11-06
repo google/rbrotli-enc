@@ -2,12 +2,16 @@
 name = "bounded-utils"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 paste = "1.0.14"
 zerocopy = { version = "0.7.32", features = ["derive"] }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+simd_tokens = "0.2.0"
 
 [lints]
 workspace = true

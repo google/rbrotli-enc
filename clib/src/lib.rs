@@ -45,7 +45,6 @@ pub extern "C" fn RBrotliEncMakeEncoder(quality: u32) -> *mut RBrotliEncoder {
 /// `out_data` must not be a null pointer.
 /// If `*out_data` is not a null pointer, the `*out_len` bytes of memory starting at `*out_data`
 /// must be accessible.
-
 #[no_mangle]
 pub unsafe extern "C" fn RBrotliEncCompress(
     encoder: *mut RBrotliEncoder,
