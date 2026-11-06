@@ -15,8 +15,9 @@
 use crate::compress::MetablockData;
 use crate::constants::*;
 use bounded_utils::safe_x86_64;
-use bounded_utils::{BoundedIterable, BoundedSlice, BoundedU32, BoundedU8, BoundedUsize};
+use bounded_utils::{BoundedIterable, BoundedSlice, BoundedU8, BoundedUsize};
 use hugepage_buffer::BoxedHugePageArray;
+use safe_unaligned_simd::x86_64::{_mm256_loadu_si256, _mm256_storeu_si256};
 use std::arch::x86_64::*;
 use zerocopy::FromZeroes;
 
@@ -80,10 +81,10 @@ fn longest_match(data: &[u8], pos1: u32, pos2: usize) -> usize {
         let slice1 = BoundedSlice::<_, 64>::new(&data[pos1 + i..]).unwrap();
         let slice2 = BoundedSlice::<_, 64>::new(&data[pos2 + i..]).unwrap();
 
-        let data1a = safe_x86_64::_mm256_load(slice1, BoundedUsize::<0>::MAX);
-        let data2a = safe_x86_64::_mm256_load(slice2, BoundedUsize::<0>::MAX);
-        let data1b = safe_x86_64::_mm256_load(slice1, BoundedUsize::<32>::MAX);
-        let data2b = safe_x86_64::_mm256_load(slice2, BoundedUsize::<32>::MAX);
+        let data1a = _mm256_loadu_si256(slice1.get_array::<32, 0>(BoundedUsize::<0>::MAX));
+        let data2a = _mm256_loadu_si256(slice2.get_array::<32, 0>(BoundedUsize::<0>::MAX));
+        let data1b = _mm256_loadu_si256(slice1.get_array::<32, 32>(BoundedUsize::<32>::MAX));
+        let data2b = _mm256_loadu_si256(slice2.get_array::<32, 32>(BoundedUsize::<32>::MAX));
 
         let maska = !(_mm256_movemask_epi8(_mm256_cmpeq_epi8(data1a, data2a)) as u32);
         let maskb = !(_mm256_movemask_epi8(_mm256_cmpeq_epi8(data1b, data2b)) as u32);
@@ -228,13 +229,22 @@ fn table_search<
     let mut len12p_mask = 0u64;
 
     for i in BoundedUsize::<ENTRY_SIZE_MINUS_EIGHT>::riter(0, ENTRY_SIZE / 8, 8) {
-        let hpos = safe_x86_64::_mm256_load(BoundedSlice::new_from_equal_array(&table.pos), i);
-        let hchunk1 =
-            safe_x86_64::_mm256_load(BoundedSlice::new_from_equal_array(&table.chunk1), i);
-        let hchunk2 =
-            safe_x86_64::_mm256_load(BoundedSlice::new_from_equal_array(&table.chunk2), i);
-        let hchunk3 =
-            safe_x86_64::_mm256_load(BoundedSlice::new_from_equal_array(&table.chunk3), i);
+        let hpos = _mm256_loadu_si256(
+            BoundedSlice::new_from_equal_array(&table.pos)
+                .get_array::<8, ENTRY_SIZE_MINUS_EIGHT>(i),
+        );
+        let hchunk1 = _mm256_loadu_si256(
+            BoundedSlice::new_from_equal_array(&table.chunk1)
+                .get_array::<8, ENTRY_SIZE_MINUS_EIGHT>(i),
+        );
+        let hchunk2 = _mm256_loadu_si256(
+            BoundedSlice::new_from_equal_array(&table.chunk2)
+                .get_array::<8, ENTRY_SIZE_MINUS_EIGHT>(i),
+        );
+        let hchunk3 = _mm256_loadu_si256(
+            BoundedSlice::new_from_equal_array(&table.chunk3)
+                .get_array::<8, ENTRY_SIZE_MINUS_EIGHT>(i),
+        );
 
         let dist = _mm256_sub_epi32(vpos, hpos);
         let valid_mask = _mm256_andnot_si256(
@@ -301,11 +311,11 @@ const PRECOMPUTE_SIZE: usize = 16;
 #[target_feature(enable = "sse2,ssse3,sse4.1,avx,avx2")]
 fn compute_hash_at(
     data_slice: &BoundedSlice<u8, INTERIOR_MARGIN>,
-    hashes: &mut [BoundedU32<{ TABLE_SIZE - 1 }>; PRECOMPUTE_SIZE],
+    hashes: &mut [u32; PRECOMPUTE_SIZE],
 ) {
     const _: () = assert!(PRECOMPUTE_SIZE == 16);
     let hash_mul = _mm256_set1_epi32(0x1E35A7BD);
-    let d08 = safe_x86_64::_mm256_load(data_slice, BoundedUsize::<0>::MAX);
+    let d08 = _mm256_loadu_si256(data_slice.get_array::<32, 0>(BoundedUsize::<0>::MAX));
     let d0 = _mm256_permute4x64_epi64::<0b01000100>(d08);
     let d8 = _mm256_permute4x64_epi64::<0b10011001>(d08);
 
@@ -327,13 +337,13 @@ fn compute_hash_at(
 
     {
         let hashes = BoundedSlice::new_from_equal_array_mut(hashes);
-        safe_x86_64::_mm256_store_masked_u32(hashes, BoundedUsize::<0>::MAX, data0);
-        safe_x86_64::_mm256_store_masked_u32(hashes, BoundedUsize::<8>::MAX, data1);
+        _mm256_storeu_si256(hashes.get_array_mut::<8, 0>(BoundedUsize::<0>::MAX), data0);
+        _mm256_storeu_si256(hashes.get_array_mut::<8, 8>(BoundedUsize::<8>::MAX), data1);
     }
 
-    for (i, h) in hashes.iter().enumerate() {
+    for (i, &h) in hashes.iter().enumerate() {
         debug_assert_eq!(
-            h.get(),
+            h,
             hash(u32::from_le_bytes(
                 *data_slice.get_array(BoundedUsize::<PRECOMPUTE_SIZE>::new(i).unwrap()),
             ))
@@ -403,7 +413,7 @@ impl<
             return 0;
         }
 
-        let mut hashes = [BoundedU32::constant::<0>(); PRECOMPUTE_SIZE];
+        let mut hashes = [0u32; PRECOMPUTE_SIZE];
 
         let mut last_dist = 0;
         let mut last_len = 0;
@@ -423,14 +433,16 @@ impl<
                 compute_hash_at(data_slice, &mut hashes);
             }
 
-            self.prefetch_pos(
-                (*BoundedSlice::new_from_equal_array(&hashes)
-                    .get(po.add::<{ PRECOMPUTE_SIZE - 1 }, PREFETCH_OFFSET>()))
-                .into(),
-            );
+            self.prefetch_pos(BoundedUsize::<{ TABLE_SIZE - 1 }>::new_masked(
+                *BoundedSlice::new_from_equal_array(&hashes)
+                    .get(po.add::<{ PRECOMPUTE_SIZE - 1 }, PREFETCH_OFFSET>())
+                    as usize,
+            ));
 
             let (chunk1, chunk2, chunk3) = get_chunks(data_slice);
-            let hash = (*BoundedSlice::new_from_equal_array(&hashes).get(po)).into();
+            let hash = BoundedUsize::<{ TABLE_SIZE - 1 }>::new_masked(
+                *BoundedSlice::new_from_equal_array(&hashes).get(po) as usize,
+            );
             let table = BoundedSlice::new_from_equal_array_mut(&mut self.table).get_mut(hash);
             let replacement_idx =
                 BoundedSlice::new_from_equal_array_mut(&mut self.replacement_idx).get_mut(hash);
@@ -521,14 +533,16 @@ impl<
                 compute_hash_at(data_slice, &mut hashes);
             }
 
-            self.prefetch_pos(
-                (*BoundedSlice::new_from_equal_array(&hashes)
-                    .get(po.add::<{ PRECOMPUTE_SIZE - 1 }, PREFETCH_OFFSET>()))
-                .into(),
-            );
+            self.prefetch_pos(BoundedUsize::<{ TABLE_SIZE - 1 }>::new_masked(
+                *BoundedSlice::new_from_equal_array(&hashes)
+                    .get(po.add::<{ PRECOMPUTE_SIZE - 1 }, PREFETCH_OFFSET>())
+                    as usize,
+            ));
 
             let (chunk1, chunk2, chunk3) = get_chunks(data_slice);
-            let hash = (*BoundedSlice::new_from_equal_array(&hashes).get(po)).into();
+            let hash = BoundedUsize::<{ TABLE_SIZE - 1 }>::new_masked(
+                *BoundedSlice::new_from_equal_array(&hashes).get(po) as usize,
+            );
             let table = BoundedSlice::new_from_equal_array_mut(&mut self.table).get_mut(hash);
             let replacement_idx =
                 BoundedSlice::new_from_equal_array_mut(&mut self.replacement_idx).get_mut(hash);
@@ -545,7 +559,7 @@ impl<
     }
 
     #[target_feature(enable = "sse,sse2,ssse3,sse4.1,avx,avx2")]
-    pub fn parse_and_emit_metablock<
+    pub(crate) fn parse_and_emit_metablock<
         const FAST_MATCHING: bool,
         const MIN_GAIN_FOR_GREEDY: i32,
         const USE_LAST_DISTANCES: bool,
@@ -599,7 +613,7 @@ impl<
             return 0;
         }
 
-        let mut hashes = [BoundedU32::constant::<0>(); PRECOMPUTE_SIZE];
+        let mut hashes = [0u32; PRECOMPUTE_SIZE];
 
         let mut last_pc = 1;
 
@@ -621,14 +635,16 @@ impl<
             let data_slice = BoundedSlice::<_, INTERIOR_MARGIN>::new_at_offset(data, pos).unwrap();
 
             let po = BoundedUsize::<{ PRECOMPUTE_SIZE / 2 - 1 }>::new_masked(pos - start);
-            self.prefetch_pos(
-                (*BoundedSlice::new_from_equal_array(&hashes)
-                    .get(po.add::<{ PRECOMPUTE_SIZE - 1 }, PREFETCH_OFFSET>()))
-                .into(),
-            );
+            self.prefetch_pos(BoundedUsize::<{ TABLE_SIZE - 1 }>::new_masked(
+                *BoundedSlice::new_from_equal_array(&hashes)
+                    .get(po.add::<{ PRECOMPUTE_SIZE - 1 }, PREFETCH_OFFSET>())
+                    as usize,
+            ));
 
             let (chunk1, chunk2, chunk3) = get_chunks(data_slice);
-            let hash = (*BoundedSlice::new_from_equal_array(&hashes).get(po)).into();
+            let hash = BoundedUsize::<{ TABLE_SIZE - 1 }>::new_masked(
+                *BoundedSlice::new_from_equal_array(&hashes).get(po) as usize,
+            );
             let table = BoundedSlice::new_from_equal_array_mut(&mut self.table).get_mut(hash);
             let replacement_idx =
                 BoundedSlice::new_from_equal_array_mut(&mut self.replacement_idx).get_mut(hash);
@@ -670,7 +686,9 @@ impl<
                 for i in 1..PREFETCH_OFFSET {
                     let (chunk1, chunk2, chunk3) =
                         get_chunks(data_slice.varoffset::<12, 7>(BoundedUsize::new_masked(i)));
-                    let hash = hashes[po.get() + i].into();
+                    let hash = BoundedUsize::<{ TABLE_SIZE - 1 }>::new_masked(
+                        hashes[po.get() + i] as usize,
+                    );
                     let table =
                         BoundedSlice::new_from_equal_array_mut(&mut self.table).get_mut(hash);
                     let replacement_idx =
@@ -706,7 +724,7 @@ impl<
     }
 
     #[target_feature(enable = "sse,sse2,ssse3,sse4.1,avx,avx2")]
-    pub fn parse_and_emit_metablock_fast<const USE_LAST_DISTANCES: bool>(
+    pub(crate) fn parse_and_emit_metablock_fast<const USE_LAST_DISTANCES: bool>(
         &mut self,
         data: &[u8],
         start: usize,
@@ -734,12 +752,12 @@ impl<
 mod test {
     use super::{_mm256_ilog2_epi32, gain_from_len_and_dist, gain_from_len_and_dist_simd};
     use crate::constants::*;
-    use safe_arch_macro::safe_arch_entrypoint;
+    use simd_tokens::{simd_entry, Avx2Token, SimdToken};
     use std::arch::x86_64::{_mm256_extract_epi32, _mm256_set1_epi32};
 
-    #[test]
-    #[safe_arch_entrypoint("avx", "avx2")]
-    fn test_ilog2() {
+    #[simd_entry]
+    #[target_feature(enable = "avx2")]
+    fn run_test_ilog2(_token: impl SimdToken) {
         let step = if cfg!(miri) { 1_000_000 } else { 1 };
 
         for i in (1..WSIZE).step_by(step) {
@@ -750,8 +768,15 @@ mod test {
     }
 
     #[test]
-    #[safe_arch_entrypoint("avx", "avx2")]
-    fn test_gain() {
+    fn test_ilog2() {
+        if let Some(token) = Avx2Token::try_new() {
+            run_test_ilog2(token);
+        }
+    }
+
+    #[simd_entry]
+    #[target_feature(enable = "avx2")]
+    fn run_test_gain(_token: impl SimdToken) {
         let step = if cfg!(miri) { 100 } else { 1 };
 
         for dist in (1u32..1024).step_by(step) {
@@ -768,6 +793,13 @@ mod test {
                 let gain = gain_from_len_and_dist::<true>(len, dist, last_distances);
                 assert_eq!(_mm256_extract_epi32::<0>(vgain), gain);
             }
+        }
+    }
+
+    #[test]
+    fn test_gain() {
+        if let Some(token) = Avx2Token::try_new() {
+            run_test_gain(token);
         }
     }
 }

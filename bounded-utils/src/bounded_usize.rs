@@ -50,7 +50,7 @@ macro_rules! make_bounded_type {
             }
 
             pub const fn new_masked(val: $ty) -> $BoundedType<MAX> {
-                const { assert!((MAX as u128 + 1).is_power_of_two()) };
+                const { assert!((MAX as u128).saturating_add(1).is_power_of_two()) };
                 $BoundedType(val & (MAX as $ty))
             }
 
@@ -104,7 +104,7 @@ macro_rules! make_bounded_type {
         impl<const MAX: usize> BitOr for $BoundedType<MAX> {
             type Output = $BoundedType<MAX>;
             fn bitor(self, rhs: Self) -> Self::Output {
-                const { assert!((MAX as u128 + 1).is_power_of_two()) };
+                const { assert!((MAX as u128).saturating_add(1).is_power_of_two()) };
                 $BoundedType(self.0 | rhs.0)
             }
         }

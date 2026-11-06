@@ -40,8 +40,8 @@ unsafe fn allocate<T>(layout: Layout, zeroed: bool) -> *mut T {
     {
         let _ = zeroed;
         use libc::{
-            sysconf, MADV_HUGEPAGE, MAP_ANONYMOUS, MAP_FAILED, MAP_PRIVATE, PROT_READ, PROT_WRITE,
-            _SC_PAGE_SIZE,
+            sysconf, _SC_PAGE_SIZE, MADV_HUGEPAGE, MAP_ANONYMOUS, MAP_FAILED, MAP_PRIVATE,
+            PROT_READ, PROT_WRITE,
         };
         // SAFETY: `sysconf` is always safe.
         let page_size = unsafe { sysconf(_SC_PAGE_SIZE) };

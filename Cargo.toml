@@ -4,7 +4,6 @@ members = [
   "bounded-utils",
   "hugepage-buffer",
   "lsb-bitwriter",
-  "safe-arch-macro",
   # brotli-specific
   "lib",
   "bin",
@@ -13,7 +12,8 @@ members = [
 resolver = "2"
 
 [profile.release]
-debug = true
+debug = "line-tables-only"
+codegen-units = 1
 
 [workspace.lints.clippy]
 missing_safety_doc = "deny"
