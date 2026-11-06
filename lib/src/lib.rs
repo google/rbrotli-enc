@@ -32,6 +32,8 @@ mod map_to_sym;
 #[allow(dead_code)]
 mod metablock;
 #[allow(dead_code)]
+mod q11;
+#[allow(dead_code)]
 mod static_dict;
 
 pub use compress::Encoder;
