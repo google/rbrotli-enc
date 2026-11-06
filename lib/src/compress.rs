@@ -24,7 +24,8 @@ use crate::{
     context::{self, LiteralHistogram},
     fast_onepass::{
         compress_fast_with_tok, fast_twopass_checked_max_output_size_for, ChunkStreamEncoder,
-        OnePassEncoder, ONEPASS_CHUNK_SIZE,
+        FastTwoPassEncoder, OnePassEncoder, FAST_Q2_CHUNK_SIZE, FAST_TWOPASS_CHUNK_SIZE,
+        ONEPASS_CHUNK_SIZE,
     },
     hashtable::{
         ArchQ3, ArchQ4, ArchQ5To8, ArchQ9, HashTable, MatchConfig, PreparedDictionary, QualityCfg,
@@ -2226,6 +2227,15 @@ impl EncoderImpl for (OnePassEncoder, [(u8, u8); 3]) {
     }
 }
 
+impl EncoderImpl for (FastTwoPassEncoder, [(u8, u8, u8); 3]) {
+    fn compress_into(&mut self, data: &[u8], dict: OptDict<'_>, bw: &mut BitWriter<'_>) {
+        let (eff_len, (mls, log, slog)) = select_tier(self.0.wbits(), data.len(), dict, self.1);
+        self.0
+            .configure_tiered(eff_len, mls, log as u32, slog as u32);
+        compress_fast_with_tok(&mut self.0, data, dict, bw, try_avx2(true));
+    }
+}
+
 impl<C: MatchConfig> EncoderImpl for EncoderInternal<C> {
     fn compress_into(&mut self, data: &[u8], dict: OptDict<'_>, bw: &mut BitWriter<'_>) {
         let (eff_len, TierParams(ways, ht4_ways, log, ht4_log, mb_kib)) =
@@ -2252,6 +2262,9 @@ const fn q0_tiers(lw: bool) -> [(u8, u8); 3] {
     [(4, 13), (5, 14), (5, if lw { 15 } else { 14 })]
 }
 
+const Q1_TIERS: [(u8, u8, u8); 3] = [(4, 13, 12), (5, 15, 13), (6, 16, 14)];
+const Q2_TIERS: [(u8, u8, u8); 3] = [(4, 14, 14), (4, 15, 15), (4, 16, 15)];
+
 #[rustfmt::skip]
 const TWO_PASS_TIERS: [[TierParams; 3]; 7] = [
     [TierParams(4, 1, 12, 14, 32), TierParams(4, 1, 14, 14, 256), TierParams(4, 1, 16, 14, 256)],
@@ -2262,6 +2275,101 @@ const TWO_PASS_TIERS: [[TierParams; 3]; 7] = [
     [TierParams(16, 1, 12, 13, 32), TierParams(16, 4, 15, 15, 256), TierParams(32, 4, 16, 15, 1024)],
     [TierParams(16, 1, 12, 13, 32), TierParams(32, 4, 15, 15, 256), TierParams(32, 4, 17, 16, 1024)],
 ];
+
+pub(crate) fn canonical_dict_key(
+    quality: u32,
+    wbits: usize,
+    dict_bytes_len: usize,
+) -> Option<crate::hashtable::DictTableKey> {
+    use crate::fast_onepass::{fast_twopass_stream_pos_bits, onepass_max_window, onepass_pos_bits};
+    use crate::hashtable::DictTableKey;
+    if dict_bytes_len == 0 || quality > 9 {
+        return None;
+    }
+    let raw_wsize = window_size(wbits);
+    match quality {
+        0 => {
+            let pos_bits = onepass_pos_bits(wbits);
+            let max_win = onepass_max_window(pos_bits);
+            let d_len = dict_bytes_len.min(raw_wsize.min(max_win));
+            if d_len == 0 || d_len > max_win {
+                return None;
+            }
+            let idx =
+                usize::from(d_len > SMALL_STREAM_MAX) + usize::from(d_len > MEDIUM_STREAM_MAX);
+            let (_, log) = q0_tiers(wbits > STD_MAX_WBITS)[idx];
+            Some(DictTableKey {
+                d_len,
+                pos_bits,
+                ways: 1,
+                ht4_ways: 1,
+                log,
+                ht4_log: log,
+                seed_ht4_win: (1u32 << log) * 2,
+                seed_ht3: false,
+            })
+        }
+        1 | 2 => {
+            let d_len = dict_bytes_len.min(raw_wsize);
+            let idx =
+                usize::from(d_len > SMALL_STREAM_MAX) + usize::from(d_len > MEDIUM_STREAM_MAX);
+            let (_, log, slog) = if quality == 1 {
+                Q1_TIERS[idx]
+            } else {
+                Q2_TIERS[idx]
+            };
+            let pos_bits = if d_len <= COMPACT_LW_STREAM_MAX {
+                25
+            } else {
+                fast_twopass_stream_pos_bits(wbits)
+            };
+            if d_len == 0 || d_len > (1usize << (pos_bits - 1)) {
+                return None;
+            }
+            Some(DictTableKey {
+                d_len,
+                pos_bits,
+                ways: 1,
+                ht4_ways: 1,
+                log,
+                ht4_log: slog,
+                seed_ht4_win: (1u32 << slog) * 2,
+                seed_ht3: false,
+            })
+        }
+        3..=9 => {
+            let d_len = dict_bytes_len.min(raw_wsize);
+            let idx =
+                usize::from(d_len > SMALL_STREAM_MAX) + usize::from(d_len > MEDIUM_STREAM_MAX);
+            let TierParams(ways, ht4_ways, log, ht4_log, _) =
+                TWO_PASS_TIERS[quality as usize - 3][idx];
+            let pos_bits = if wbits > STD_MAX_WBITS && d_len > COMPACT_LW_STREAM_MAX {
+                31
+            } else {
+                25
+            };
+            if d_len == 0 || d_len > (1usize << (pos_bits - 1)) {
+                return None;
+            }
+            let seed_ht4_win = if quality == 3 {
+                HT4_DICT_WINDOW as u32
+            } else {
+                (4 * HT4_DICT_WINDOW) as u32
+            };
+            Some(DictTableKey {
+                d_len,
+                pos_bits,
+                ways,
+                ht4_ways,
+                log,
+                ht4_log,
+                seed_ht4_win,
+                seed_ht3: quality >= 5,
+            })
+        }
+        _ => None,
+    }
+}
 
 const Q5_TO_8_CFGS: [QualityCfg; 4] = [
     QualityCfg::Q5,
@@ -2274,7 +2382,7 @@ macro_rules! box_two_pass {
     ($q:ident, $wbits:ident, $lw:ident, $fb:expr) => {{
         let q = $q as usize;
         match $q {
-            1..=3 => Box::new(EncoderInternal::<ArchQ3>::new(
+            3 => Box::new(EncoderInternal::<ArchQ3>::new(
                 $wbits,
                 QualityCfg::Q3,
                 $lw,
@@ -2332,6 +2440,14 @@ impl Encoder {
         let lw = wbits > STD_MAX_WBITS;
         let inner: Box<dyn EncoderImpl> = match quality {
             0 => Box::new((OnePassEncoder::new(wbits), q0_tiers(lw))),
+            1 => Box::new((
+                FastTwoPassEncoder::new(1, wbits, FAST_TWOPASS_CHUNK_SIZE),
+                Q1_TIERS,
+            )),
+            2 => Box::new((
+                FastTwoPassEncoder::new(2, wbits, FAST_Q2_CHUNK_SIZE),
+                Q2_TIERS,
+            )),
             _ => box_two_pass!(
                 quality,
                 wbits,
@@ -2364,7 +2480,9 @@ impl Encoder {
     fn raw_max_required_size(&self, input_len: usize) -> Option<usize> {
         match self.quality {
             0 => fast_twopass_checked_max_output_size_for(input_len, ONEPASS_CHUNK_SIZE),
-            1..=9 => checked_max_two_pass_output_size(input_len),
+            1 => fast_twopass_checked_max_output_size_for(input_len, FAST_TWOPASS_CHUNK_SIZE),
+            2 | 3 => fast_twopass_checked_max_output_size_for(input_len, FAST_Q2_CHUNK_SIZE),
+            4..=9 => checked_max_two_pass_output_size(input_len),
             _ => checked_max_two_pass_output_size(input_len),
         }
     }
@@ -3381,6 +3499,24 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
             &[&mr],
             Some((&pl, dr)),
         );
+
+        let mut p_dict = tagged_bytes(4096, b"shared-dict-reuse-key-", 0);
+        p_dict.extend_from_slice(&mr[..8192]);
+        let mut p_in1 = p_dict[p_dict.len() - 4096..].to_vec();
+        p_in1.extend_from_slice(&bulk[..4096]);
+        let p_in2 = tagged_bytes(400, b"shared-dict-reuse-key-", 0);
+        for q in 0..=9 {
+            let prep = PreparedDictionary::with_lgwin(&p_dict, q, 24);
+            let mut enc = Encoder::with_lgwin(q, 24);
+            for inp in [&p_in1[..], &p_in2[..], &p_in1[..512]] {
+                let c = enc.compress_with_dict(inp, &prep, None).unwrap();
+                assert_eq!(decompress_brotli_with_dict(c, &p_dict), inp);
+            }
+            let c_nodict = enc.compress(&p_in2, None).unwrap();
+            assert_eq!(decompress_brotli(c_nodict), p_in2);
+            let c_after = enc.compress_with_dict(&p_in1, &prep, None).unwrap();
+            assert_eq!(decompress_brotli_with_dict(c_after, &p_dict), p_in1);
+        }
     }
 
     #[test]

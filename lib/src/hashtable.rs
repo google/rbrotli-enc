@@ -322,13 +322,21 @@ impl PreparedDictionary {
         if quality <= 9 {
             let _ = entries.set(build_dict_entries(&bytes, quality as usize));
         }
-        Self(std::sync::Arc::new(PreparedDictInner {
+        let prep = Self(std::sync::Arc::new(PreparedDictInner {
             bytes,
             raw_len,
             quality_hint: quality.min(9) as u8,
             entries,
             tables_cache: std::sync::RwLock::new(Vec::new()),
-        }))
+        }));
+        if !cfg!(miri) && quality <= 9 && !prep.0.bytes.is_empty() {
+            if let Some(key) =
+                crate::compress::canonical_dict_key(quality, wbits, prep.0.bytes.len())
+            {
+                let _ = prep.get_or_build_tables(key);
+            }
+        }
+        prep
     }
 
     /// Full byte length of the attached raw dictionary (used as `compound_dictionary_size` by Brotli decoders).
