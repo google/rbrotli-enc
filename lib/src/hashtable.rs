@@ -415,7 +415,7 @@ impl SliceCostModel {
 
     pub(crate) fn update_ctx_lit_table(
         &mut self,
-        (ctx_flat, ctx_tots): (&[u32; 64 * MAX_LIT], &[u32; 64]),
+        ctx_hists: &crate::compress::CtxHists,
         marg: &[u32; MAX_LIT],
         marg_tot: u32,
     ) {
@@ -430,8 +430,8 @@ impl SliceCostModel {
         let psum: u64 = pq4.iter().sum();
         for ((row, hist), &tot) in ctx_tbl
             .iter_mut()
-            .zip(ctx_flat.as_chunks::<MAX_LIT>().0)
-            .zip(ctx_tots)
+            .zip(ctx_hists.flat.as_chunks::<MAX_LIT>().0)
+            .zip(&ctx_hists.tots)
         {
             if tot == 0 {
                 *row = self.lit_cost;
@@ -3515,7 +3515,7 @@ mod test {
 
 pub(crate) mod legacy {
 
-    use crate::compress::MetablockData;
+    use crate::compress::legacy_enc::MetablockData;
     use crate::constants::*;
     use bounded_utils::safe_x86_64;
     use bounded_utils::{BoundedIterable, BoundedSlice, BoundedU8, BoundedUsize};
