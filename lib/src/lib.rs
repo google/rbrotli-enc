@@ -13,28 +13,23 @@
 // limitations under the License.
 #![deny(unsafe_code)]
 
-#[allow(dead_code)]
 mod block_split;
-#[allow(dead_code)]
 mod compress;
-#[allow(dead_code)]
 mod constants;
-#[allow(dead_code)]
 mod context;
 #[allow(dead_code)]
 mod fast_onepass;
-#[allow(dead_code)]
 mod hashtable;
-#[allow(dead_code)]
 mod huffman;
-#[allow(dead_code)]
 mod map_to_sym;
-#[allow(dead_code)]
 mod metablock;
 #[allow(dead_code)]
 mod q11;
-#[allow(dead_code)]
 mod static_dict;
+mod stream;
 
 pub use compress::Encoder;
 pub use hashtable::PreparedDictionary;
+pub use stream::{
+    StreamError, StreamOp, StreamResult, StreamStatus, StreamingEncoder, StreamingWriter,
+};
