@@ -25,7 +25,7 @@ use crate::constants::{MAX_IAC, MAX_LIT};
 use crate::context;
 use crate::huffman::{ContextMap, HuffmanCode, HuffmanCodeEntry, MAX_HUFFMAN_ALPHABET};
 use crate::map_to_sym::{
-    copy_code_only, dist_alphabet_size, encode_raw_distance_params, max_dist_symbol,
+    copy_code_only, dist_alphabet_size, encode_iac, encode_raw_distance_params, max_dist_symbol,
 };
 use crate::metablock::{
     block_count_to_sym_and_bits, header_count_bit_cost, step_block_type_mtf, ContextMode,
@@ -894,6 +894,631 @@ fn select_optimal_distance_params(
     best_pair
 }
 
+#[derive(Clone, Copy)]
+struct LitStream<'a> {
+    data: &'a [u8],
+    syms: &'a [u16],
+    pos: &'a [u32],
+}
+
+fn unpack_lit_and_iac_streams(
+    data: &[u8],
+    mb_start: usize,
+    mb_end: usize,
+    commands: &[OptimalCommand],
+    trailing_literals: u32,
+) -> (Vec<u16>, Vec<u32>, Vec<u16>, u64) {
+    let total_lits = commands
+        .iter()
+        .map(|c| c.insert_len as usize)
+        .sum::<usize>()
+        + (trailing_literals as usize);
+    let mut lit_syms = Vec::with_capacity(total_lits);
+    let mut lit_stream_pos = Vec::with_capacity(total_lits);
+    let mut iac_syms = Vec::with_capacity(commands.len() + usize::from(trailing_literals > 0));
+    let (mut iac_extra_bits_total, mut stream_pos) = (0u64, mb_start);
+
+    let mut push_cmd = |ins_len: u32, copy_len: u32, implicit_d0: bool, adv_len: usize| {
+        let ins_end = stream_pos + (ins_len as usize);
+        if stream_pos < ins_end {
+            lit_syms.extend(data[stream_pos..ins_end].iter().map(|&b| b as u16));
+            lit_stream_pos.extend(stream_pos as u32..ins_end as u32);
+        }
+        let (iac_sym, iac_eb, _) = encode_iac(ins_len, copy_len, implicit_d0);
+        iac_syms.push(iac_sym);
+        iac_extra_bits_total += iac_eb as u64;
+        stream_pos = ins_end + adv_len;
+    };
+    for &c in commands {
+        push_cmd(
+            c.insert_len,
+            c.copy_len,
+            c.is_implicit_d0(),
+            c.out_len() as usize,
+        );
+    }
+    if trailing_literals > 0 {
+        push_cmd(trailing_literals, 4, false, 0);
+    }
+    debug_assert_eq!(stream_pos, mb_end);
+    (lit_syms, lit_stream_pos, iac_syms, iac_extra_bits_total)
+}
+
+fn unpack_dist_streams(
+    commands: &[OptimalCommand],
+    npostfix: u8,
+    ndirect: u8,
+) -> (Vec<u16>, Vec<u8>, u64) {
+    let mut dist_syms = Vec::with_capacity(commands.len());
+    let mut dist_ctxs = Vec::with_capacity(commands.len());
+    let mut dist_extra_bits_total = 0u64;
+    for &cmd in commands {
+        if cmd.emits_dist_sym() {
+            let d_ctx = copy_code_only(cmd.copy_len).min(3) as u8;
+            dist_ctxs.push(d_ctx);
+            dist_syms.push(if cmd.dist_mode < 16 {
+                cmd.dist_mode as u16
+            } else {
+                let (s, eb, _) = encode_raw_distance_params(cmd.dist, npostfix, ndirect);
+                dist_extra_bits_total += eb as u64;
+                s
+            });
+        }
+    }
+    (dist_syms, dist_ctxs, dist_extra_bits_total)
+}
+
+fn encode_iac_split(
+    split: &BlockSplit,
+    iac_syms: &[u16],
+    hb: &mut [HuffmanCodeEntry],
+) -> (Vec<[u32; MAX_IAC]>, u64) {
+    let mut flat = vec![0u32; split.num_types * MAX_IAC];
+    count_split_syms_flat(split, iac_syms, MAX_IAC, &mut flat);
+    let bits = price_flat_trees(&flat, MAX_IAC, hb);
+    (flat.as_chunks::<MAX_IAC>().0.to_vec(), bits)
+}
+
+fn encode_dist_split(
+    split: &BlockSplit,
+    dist_syms: &[u16],
+    dist_ctxs: &[u8],
+    dist_alpha: usize,
+    max_dist_trees: usize,
+    hb: &mut [HuffmanCodeEntry],
+) -> ((Vec<u8>, Vec<Vec<u32>>), u64) {
+    if dist_syms.is_empty() {
+        let mut dummy = vec![0u32; dist_alpha];
+        dummy[0] = 1;
+        let bits = price_cmap_and_flat(&[0], &dummy, dist_alpha, hb);
+        return ((vec![0u8; 4], vec![dummy]), bits);
+    }
+    let n_slots = split.num_types * 4;
+    let (mut d_flat, mut d_tots, mut idx) =
+        (vec![0u32; n_slots * dist_alpha], vec![0u32; n_slots], 0);
+    for (&bt, &blen) in split.types.iter().zip(split.lengths.iter()) {
+        for k in idx..(idx + blen) {
+            let slot = (bt as usize) * 4 + (dist_ctxs[k] as usize);
+            d_flat[slot * dist_alpha + (dist_syms[k] as usize)] += 1;
+            d_tots[slot] += 1;
+        }
+        idx += blen;
+    }
+    let (best_flat, cmap, bits) =
+        optimize_flat_clustering(&d_flat, &d_tots, dist_alpha, max_dist_trees, 10, false, hb);
+    let trees = best_flat
+        .chunks_exact(dist_alpha)
+        .map(<[u32]>::to_vec)
+        .collect();
+    ((cmap, trees), bits)
+}
+
+struct LitEnc {
+    context_modes: Vec<ContextMode>,
+    cmap: Vec<u8>,
+    tree_counts: Vec<[u32; MAX_LIT]>,
+}
+
+fn encode_lit_split(
+    lits: LitStream<'_>,
+    split: &BlockSplit,
+    max_lit_trees: usize,
+    effort: u8,
+    hb: &mut [HuffmanCodeEntry],
+) -> (LitEnc, u64) {
+    if lits.syms.is_empty() {
+        let mut dummy = [0u32; MAX_LIT];
+        dummy[0] = 1;
+        return (
+            LitEnc {
+                context_modes: vec![ContextMode::UTF8],
+                cmap: vec![0u8; 64],
+                tree_counts: vec![dummy],
+            },
+            2 + price_cmap_and_flat(&[0], &dummy, MAX_LIT, hb),
+        );
+    }
+
+    let num_bt = split.num_types;
+    let (mut pos_by_bt, mut idx) = (vec![Vec::new(); num_bt], 0usize);
+    for (&bt, &blen) in split.types.iter().zip(split.lengths.iter()) {
+        pos_by_bt[bt as usize].extend_from_slice(&lits.pos[idx..idx + blen]);
+        idx += blen;
+    }
+
+    let mut cmodes = Vec::with_capacity(num_bt);
+    let mut ranked_by_bt = Vec::with_capacity(if effort >= 10 { num_bt } else { 0 });
+    let mut ctx_flat = vec![0u32; num_bt * 64 * MAX_LIT];
+    let mut ctx_tots = vec![0u32; num_bt * 64];
+    for (bt, pos) in pos_by_bt.iter().enumerate() {
+        let ranked = rank_pos_ctx_modes(lits.data, pos);
+        if effort >= 10 {
+            ranked_by_bt.push(ranked);
+        }
+        cmodes.push(ranked[0].0);
+        fill_block_ctx_histograms_flat(
+            lits.data,
+            pos,
+            ranked[0].0,
+            &mut ctx_flat[bt * 64 * MAX_LIT..(bt + 1) * MAX_LIT * 64],
+            &mut ctx_tots[bt * 64..(bt + 1) * 64],
+        );
+    }
+
+    let (mut best_flat, mut best_cmap, mut best_cbits) = optimize_flat_clustering(
+        &ctx_flat,
+        &ctx_tots,
+        MAX_LIT,
+        max_lit_trees,
+        effort,
+        true,
+        hb,
+    );
+
+    if effort >= 10 {
+        let is_q12 = effort >= 12;
+        let pct = if is_q12 { 14 } else { 7 };
+        let mut probes: Vec<(usize, ContextMode, u8)> = Vec::new();
+        if num_bt == 1 && pos_by_bt[0].len() >= 128 {
+            let r = &ranked_by_bt[0];
+            let lim = r[0]
+                .1
+                .saturating_add((r[0].1 / 100).saturating_mul(pct))
+                .saturating_add(64 << 16);
+            let n_alt = if is_q12 { 4 } else { 2 };
+            for &(m, sc) in r.iter().take(n_alt).skip(1) {
+                if sc <= lim {
+                    probes.push((0, m, effort));
+                }
+            }
+        } else if num_bt > 1 && effort >= 11 {
+            let mut bts: Vec<usize> = (0..num_bt)
+                .filter(|&bt| {
+                    let r = &ranked_by_bt[bt];
+                    pos_by_bt[bt].len() >= 160
+                        && r[1].1
+                            <= r[0]
+                                .1
+                                .saturating_add((r[0].1 / 100).saturating_mul(pct))
+                                .saturating_add(48 << 16)
+                })
+                .collect();
+            bts.sort_by_key(|&bt| Reverse(pos_by_bt[bt].len()));
+            let p_eff = if is_q12 { 11 } else { 9 };
+            for &bt in bts.iter().take(if is_q12 { 6 } else { 3 }) {
+                probes.push((bt, ranked_by_bt[bt][1].0, p_eff));
+            }
+        }
+        if !probes.is_empty() {
+            let (mut saved_h, mut saved_t) = (vec![0u32; 64 * MAX_LIT], [0u32; 64]);
+            for (bt, alt_mode, p_eff) in probes {
+                let (hr, tr) = (
+                    bt * 64 * MAX_LIT..(bt + 1) * 64 * MAX_LIT,
+                    bt * 64..(bt + 1) * 64,
+                );
+                saved_h.copy_from_slice(&ctx_flat[hr.clone()]);
+                saved_t.copy_from_slice(&ctx_tots[tr.clone()]);
+                fill_block_ctx_histograms_flat(
+                    lits.data,
+                    &pos_by_bt[bt],
+                    alt_mode,
+                    &mut ctx_flat[hr.clone()],
+                    &mut ctx_tots[tr.clone()],
+                );
+                let (f, cm, cb) = optimize_flat_clustering(
+                    &ctx_flat,
+                    &ctx_tots,
+                    MAX_LIT,
+                    max_lit_trees,
+                    p_eff,
+                    true,
+                    hb,
+                );
+                if cb < best_cbits {
+                    (best_cbits, best_flat, best_cmap, cmodes[bt]) = (cb, f, cm, alt_mode);
+                } else {
+                    ctx_flat[hr].copy_from_slice(&saved_h);
+                    ctx_tots[tr].copy_from_slice(&saved_t);
+                }
+            }
+        }
+    }
+
+    (
+        LitEnc {
+            context_modes: cmodes,
+            cmap: best_cmap,
+            tree_counts: best_flat.as_chunks::<MAX_LIT>().0.to_vec(),
+        },
+        (2 * num_bt as u64) + best_cbits,
+    )
+}
+
+struct StreamPlan<E> {
+    split: BlockSplit,
+    switch_bits: u64,
+    content_bits: u64,
+    enc: E,
+}
+
+impl<E> StreamPlan<E> {
+    fn from_split(
+        mut split: BlockSplit,
+        hb: &mut [HuffmanCodeEntry],
+        encode: impl FnOnce(&BlockSplit, &mut [HuffmanCodeEntry]) -> (E, u64),
+    ) -> Self {
+        let switch_bits = populate_and_price_block_switches(&mut split, hb);
+        let (enc, content_bits) = encode(&split, hb);
+        Self {
+            split,
+            switch_bits,
+            content_bits,
+            enc,
+        }
+    }
+
+    fn eval_multi(
+        cand: BlockSplit,
+        hb: &mut [HuffmanCodeEntry],
+        encode: impl FnOnce(&BlockSplit, &mut [HuffmanCodeEntry]) -> (E, u64),
+    ) -> Option<Self> {
+        (cand.num_types >= 2).then(|| Self::from_split(cand, hb, encode))
+    }
+
+    #[inline]
+    fn total_bits(&self) -> u64 {
+        self.switch_bits + self.content_bits
+    }
+
+    fn try_replace(&mut self, cand: Option<Self>) {
+        if let Some(c) = cand.filter(|c| c.total_bits() < self.total_bits()) {
+            *self = c;
+        }
+    }
+
+    fn plan_aux(
+        syms: &[u16],
+        pre: Option<BlockSplit>,
+        spec: SplitSpec,
+        hb: &mut [HuffmanCodeEntry],
+        mut encode: impl FnMut(&BlockSplit, &mut [HuffmanCodeEntry]) -> (E, u64),
+    ) -> (Self, u64) {
+        let mut plan = Self::from_split(BlockSplit::single_block(syms.len()), hb, &mut encode);
+        let b1 = plan.total_bits();
+        let c1 = pre.unwrap_or_else(|| split_symbol_stream(syms, spec, hb));
+        plan.try_replace(Self::eval_multi(c1, hb, encode));
+        (plan, b1)
+    }
+}
+
+fn maybe_par4<A: Send, B: Send, C: Send, D: Send>(
+    parallel: bool,
+    hb: &mut [HuffmanCodeEntry],
+    fa: impl FnOnce(&mut [HuffmanCodeEntry]) -> A,
+    fb: impl FnOnce(&mut [HuffmanCodeEntry]) -> B + Send,
+    fc: impl FnOnce(&mut [HuffmanCodeEntry]) -> C + Send,
+    fd: impl FnOnce(&mut [HuffmanCodeEntry]) -> D + Send,
+) -> (A, B, C, D) {
+    if parallel && !cfg!(target_family = "wasm") {
+        std::thread::scope(|s| {
+            let hb_b = s.spawn(|| fb(&mut vec![HuffmanCodeEntry::default(); MAX_HUFFMAN_ALPHABET]));
+            let hb_c = s.spawn(|| fc(&mut vec![HuffmanCodeEntry::default(); MAX_HUFFMAN_ALPHABET]));
+            let hb_d = s.spawn(|| fd(&mut vec![HuffmanCodeEntry::default(); MAX_HUFFMAN_ALPHABET]));
+            (
+                fa(hb),
+                hb_b.join().unwrap(),
+                hb_c.join().unwrap(),
+                hb_d.join().unwrap(),
+            )
+        })
+    } else {
+        (fa(hb), fb(hb), fc(hb), fd(hb))
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PlanOpts {
+    pub(crate) large_window: bool,
+    pub(crate) fixed_dist: Option<(u8, u8)>,
+    pub(crate) base_max_lit_trees: usize,
+    pub(crate) effort: u8,
+    pub(crate) num_threads: usize,
+}
+
+impl PlanOpts {
+    #[inline]
+    pub(crate) const fn q11(large_window: bool, effort: u8, num_threads: usize) -> Self {
+        Self {
+            large_window,
+            fixed_dist: None,
+            base_max_lit_trees: 0,
+            effort,
+            num_threads,
+        }
+    }
+}
+
+/// Unified `MetablockPlan` engine for both `Q8–Q9` (`fixed_dist = Some(..)`) and `Q10–Q12`
+/// (`fixed_dist = None`, `1T == MT` deterministic).
+pub(crate) fn try_plan_metablock(
+    data: &[u8],
+    mb_start: usize,
+    mb_end: usize,
+    commands: &[OptimalCommand],
+    trailing_literals: u32,
+    opts: PlanOpts,
+) -> Option<MetablockPlan> {
+    let PlanOpts {
+        large_window,
+        fixed_dist,
+        base_max_lit_trees,
+        effort,
+        num_threads,
+    } = opts;
+    let mb_len = mb_end - mb_start;
+    let fast_only = fixed_dist.is_some();
+    if fast_only && mb_len < 32_768 {
+        return None;
+    }
+    assert!(mb_len >= 1);
+
+    let (is_q11, is_q12) = (effort >= 11, effort >= 12);
+    let mut hbuf = vec![HuffmanCodeEntry::default(); MAX_HUFFMAN_ALPHABET];
+
+    // Rebase `data` to `mb_start.saturating_sub(2)` so literal positions fit in `u32`
+    // (`<= 16 MiB + 2 << u32::MAX`) while preserving the 2-byte literal context lookbehind
+    // `(p1, p2)` across arbitrary 64-bit `>= 4 GiB` stream offsets.
+    let ctx_base = mb_start.saturating_sub(2);
+    let mb_data = &data[ctx_base..mb_end];
+    let (lit_syms, lit_stream_pos, iac_syms, iac_extra_bits) = unpack_lit_and_iac_streams(
+        mb_data,
+        mb_start - ctx_base,
+        mb_end - ctx_base,
+        commands,
+        trailing_literals,
+    );
+    let lits = LitStream {
+        data: mb_data,
+        syms: &lit_syms,
+        pos: &lit_stream_pos,
+    };
+    let (npostfix, ndirect) = fixed_dist.unwrap_or_else(|| {
+        select_optimal_distance_params(commands, large_window, effort, &mut hbuf)
+    });
+    let dist_alpha = dist_alphabet_size(npostfix, ndirect, large_window);
+    let (dist_syms, dist_ctxs, dist_extra_bits) = unpack_dist_streams(commands, npostfix, ndirect);
+
+    let (lit_max_t, lit_micro, lit_gain) = if fast_only {
+        let s = (lit_syms.len() / 16_384).clamp(6, 36);
+        (
+            if effort == 9 { s.max(8) } else { s.min(32) },
+            1024,
+            if effort == 9 { 96 } else { 112 },
+        )
+    } else if is_q11 {
+        (
+            (lit_syms.len() / 2048).clamp(2, if is_q12 { 36 } else { 24 }),
+            256,
+            68,
+        )
+    } else {
+        (8, 256, 72)
+    };
+    let lit_spec = SplitSpec(MAX_LIT, lit_max_t, lit_micro, lit_gain);
+    let (iac_max_t, iac_micro, iac_gain) = if fast_only {
+        (if effort == 9 { 6 } else { 4 }, 512, 144)
+    } else if is_q11 {
+        (if is_q12 { 32 } else { 24 }, 128, 112)
+    } else {
+        (6, 128, 112)
+    };
+    let iac_spec = SplitSpec(MAX_IAC, iac_max_t, iac_micro, iac_gain);
+    let dist_fine_cap = if is_q12 {
+        24
+    } else if is_q11 {
+        16
+    } else {
+        4
+    };
+    let dist_spec = if fast_only {
+        SplitSpec(dist_alpha, 4, 512, 112)
+    } else {
+        SplitSpec(dist_alpha, dist_fine_cap, 128, 68)
+    };
+
+    let (pre_lf, pre_ic, pre_dc) = if fast_only {
+        let lf = split_symbol_stream(&lit_syms, lit_spec, &mut hbuf);
+        let ic = split_symbol_stream(&iac_syms, iac_spec, &mut hbuf);
+        let dc = split_symbol_stream(&dist_syms, dist_spec, &mut hbuf);
+        if lf.num_types == 1 && ic.num_types == 1 && dc.num_types == 1 {
+            return None;
+        }
+        (Some(lf), Some(ic), Some(dc))
+    } else {
+        (None, None, None)
+    };
+
+    let enc_lit = |sp: &BlockSplit, hb: &mut [HuffmanCodeEntry]| {
+        let max_t = if fast_only {
+            (base_max_lit_trees * sp.num_types).min(if effort == 9 { 224 } else { 144 })
+        } else if is_q11 {
+            64
+        } else {
+            16
+        };
+        encode_lit_split(lits, sp, max_t, if fast_only { 8 } else { effort }, hb)
+    };
+    let eval_lit_cand =
+        |cand: BlockSplit, hb: &mut [HuffmanCodeEntry]| StreamPlan::eval_multi(cand, hb, enc_lit);
+
+    let (mut lit_plan, fine_eval, ctx_eval, ((iac_plan, iac_1b), (dist_plan, dist_1b))) =
+        maybe_par4(
+            !fast_only && num_threads >= 2 && iac_syms.len() >= 512,
+            &mut hbuf,
+            |hb| StreamPlan::from_split(BlockSplit::single_block(lit_syms.len()), hb, enc_lit),
+            |hb| {
+                let cand = pre_lf.unwrap_or_else(|| split_symbol_stream(&lit_syms, lit_spec, hb));
+                eval_lit_cand(cand, hb)
+            },
+            |hb| {
+                if !fast_only && is_q11 && lit_syms.len() >= 1024 {
+                    let mode = rank_pos_ctx_modes(lits.data, &lit_stream_pos)[0].0;
+                    let (lut0, lut1) = context::context_luts(mode);
+                    let ctx_syms: Vec<u16> = lits
+                        .pos
+                        .iter()
+                        .zip(lits.syms)
+                        .map(|(&sp, &b)| {
+                            ((context::stream_byte_ctx(lut0, lut1, lits.data, sp as usize) >> 4)
+                                as u16)
+                                << 8
+                                | b
+                        })
+                        .collect();
+                    let max_t = (lit_syms.len() / 2048).clamp(2, if is_q12 { 24 } else { 16 });
+                    let cand = split_symbol_stream(&ctx_syms, SplitSpec(1024, max_t, 512, 136), hb);
+                    eval_lit_cand(cand, hb)
+                } else {
+                    None
+                }
+            },
+            |hb| {
+                let enc_iac =
+                    |s: &BlockSplit, h: &mut [HuffmanCodeEntry]| encode_iac_split(s, &iac_syms, h);
+                let iac = StreamPlan::plan_aux(&iac_syms, pre_ic, iac_spec, hb, enc_iac);
+
+                let enc_dist = |s: &BlockSplit, h: &mut [HuffmanCodeEntry]| {
+                    let nt = s.num_types;
+                    let d_cap = if fast_only {
+                        if nt == 1 {
+                            2
+                        } else {
+                            (2 * nt).clamp(2, 6)
+                        }
+                    } else if is_q12 {
+                        32
+                    } else if is_q11 {
+                        16
+                    } else {
+                        8
+                    };
+                    encode_dist_split(s, &dist_syms, &dist_ctxs, dist_alpha, d_cap, h)
+                };
+                let dist = StreamPlan::plan_aux(&dist_syms, pre_dc, dist_spec, hb, enc_dist);
+                (iac, dist)
+            },
+        );
+
+    let single_total = lit_plan.total_bits() + iac_1b + dist_1b;
+    lit_plan.try_replace(fine_eval);
+    lit_plan.try_replace(ctx_eval);
+
+    if !fast_only && is_q11 {
+        let win = if is_q12 { 16 } else { 32 };
+        for _ in 0..if is_q12 { 2 } else { 1 } {
+            let num_bt = lit_plan.split.num_types;
+            if num_bt < 2 || lit_syms.len() < win * 2 || lit_plan.enc.tree_counts.is_empty() {
+                break;
+            }
+            let tcost =
+                build_cost_tables_q4(lit_plan.enc.tree_counts.as_flattened(), MAX_LIT, &mut hbuf);
+            use ContextMode::{Signed, LSB6, MSB6, UTF8};
+            let luts = [LSB6, MSB6, UTF8, Signed].map(context::context_luts);
+            let mode_mask = lit_plan.enc.context_modes[..num_bt]
+                .iter()
+                .fold(0u8, |m, &cm| m | (1 << (cm as u8)));
+            let ctx_pos: Vec<[u8; 4]> = lits
+                .pos
+                .iter()
+                .map(|&sp| {
+                    std::array::from_fn(|m| {
+                        if (mode_mask & (1 << m)) != 0 {
+                            context::stream_byte_ctx(luts[m].0, luts[m].1, lits.data, sp as usize)
+                                as u8
+                        } else {
+                            0
+                        }
+                    })
+                })
+                .collect();
+            let (modes, cmap) = (&lit_plan.enc.context_modes, &lit_plan.enc.cmap);
+            let (p_sp, p_sw) =
+                viterbi_and_polish(lit_syms.len(), num_bt, win, &mut hbuf, |bt, i| {
+                    let tid = cmap[bt * 64 + (ctx_pos[i][modes[bt] as usize] as usize)] as usize;
+                    tcost[tid][lit_syms[i] as usize]
+                });
+            if p_sp.num_types < 2 {
+                break;
+            }
+            let (p_enc, p_cbits) = enc_lit(&p_sp, &mut hbuf);
+            if p_sw + p_cbits < lit_plan.total_bits() {
+                lit_plan = StreamPlan {
+                    split: p_sp,
+                    switch_bits: p_sw,
+                    content_bits: p_cbits,
+                    enc: p_enc,
+                };
+            } else {
+                break;
+            }
+        }
+    }
+
+    if fast_only {
+        let multi_total = lit_plan.total_bits() + iac_plan.total_bits() + dist_plan.total_bits();
+        if (lit_plan.split.num_types == 1
+            && iac_plan.split.num_types == 1
+            && dist_plan.split.num_types == 1)
+            || multi_total + 128 >= single_total
+        {
+            return None;
+        }
+    }
+
+    let mnibbles = u64::from(mb_len > (1 << 16)) + u64::from(mb_len > (1 << 20));
+    let exact_compressed_bits = (26 + 4 * mnibbles)
+        + lit_plan.total_bits()
+        + iac_plan.total_bits()
+        + iac_extra_bits
+        + dist_plan.total_bits()
+        + dist_extra_bits;
+    Some(MetablockPlan {
+        npostfix,
+        ndirect,
+        lit_split: lit_plan.split,
+        iac_split: iac_plan.split,
+        dist_split: dist_plan.split,
+        context_modes: lit_plan.enc.context_modes,
+        lit_cmap: lit_plan.enc.cmap,
+        lit_tree_counts: lit_plan.enc.tree_counts,
+        iac_tree_counts: iac_plan.enc,
+        dist_cmap: dist_plan.enc.0,
+        dist_alpha,
+        dist_tree_counts: dist_plan.enc.1,
+        exact_compressed_bits,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1003,6 +1628,62 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
+    #[test]
+    fn test_metablock_plan_and_emit_across_4gib_boundary() {
+        use crate::metablock::{self, test_helpers::decompress_brotli, write_compressed_metablock};
+        use lsb_bitwriter::BitWriter;
+
+        const TWO_32: usize = 1usize << 32;
+        // Demand-zeroed virtual mapping (`calloc` / `MAP_ANONYMOUS`) faults only the touched 16 KiB
+        // around `2^32` while exercising true 64-bit `mb_start..mb_end` straddling and `>= 2^32`.
+        let mut data = vec![0u8; TWO_32 + 8192];
+        for (i, slot) in data[(TWO_32 - 4096)..(TWO_32 + 8192)]
+            .iter_mut()
+            .enumerate()
+        {
+            let idx = (TWO_32 - 4096) + i;
+            *slot =
+                b"High64BitOffsetBrotliMetablockContextTest! "[idx % 43] ^ ((idx >> 8) as u8 & 7);
+        }
+
+        for (mb_start, mb_end) in [(TWO_32 - 2048, TWO_32 + 2048), (TWO_32, TWO_32 + 4096)] {
+            let mb_len = (mb_end - mb_start) as u32;
+            let plan = try_plan_metablock(
+                &data,
+                mb_start,
+                mb_end,
+                &[],
+                mb_len,
+                PlanOpts::q11(false, 12, 2),
+            )
+            .unwrap();
+            // Compare against an identical metablock placed at low offset `2..2 + mb_len` with the
+            // same 2-byte literal context prefix `(data[mb_start - 2], data[mb_start - 1])`.
+            let low_slice = &data[mb_start - 2..mb_end];
+            let low_plan = try_plan_metablock(
+                low_slice,
+                2,
+                2 + mb_len as usize,
+                &[],
+                mb_len,
+                PlanOpts::q11(false, 12, 1),
+            )
+            .unwrap();
+            assert_eq!(plan.exact_compressed_bits, low_plan.exact_compressed_bits);
+
+            let mut out = vec![0u8; 16_384];
+            let mut bw = BitWriter::new(&mut out);
+            metablock::write_window_bits(24, false, &mut bw);
+            // Prepend a 2-byte uncompressed metablock carrying the exact 2-byte context prefix so
+            // standalone decompression verifies every literal tree & context ID at `>= 2^32`.
+            metablock::write_uncompressed_metablock(&data[mb_start - 2..mb_start], &mut bw);
+            write_compressed_metablock(&data, mb_start, mb_end, &[], mb_len, &plan, true, &mut bw);
+            let encoded = bw.finalize();
+            assert_eq!(decompress_brotli(encoded), &data[mb_start - 2..mb_end]);
         }
     }
 }
