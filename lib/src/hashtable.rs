@@ -1244,6 +1244,376 @@ const HT3_MAX_DIST: u32 = 4096;
 
 pub(crate) const HT4_DICT_WINDOW: usize = 32_768;
 
+const FAST_LDM_LOG: usize = 17;
+const FAST_LDM_SIZE: usize = 1 << FAST_LDM_LOG;
+const FAST_LDM_COEFF0: i16 = -24939;
+const FAST_LDM_COEFF1: i16 = 29797;
+#[cfg(target_arch = "x86_64")]
+const FAST_LDM_COEFF_PACKED: i32 =
+    (((FAST_LDM_COEFF1 as u16 as u32) << 16) | (FAST_LDM_COEFF0 as u16 as u32)) as i32;
+const FAST_LDM_MIN_DIST: usize = 32_768;
+pub(crate) const FAST_LDM_MIN_LEN: usize = 16;
+
+#[inline(always)]
+fn fast_ldm_params(density: u8) -> (u32, u32) {
+    match density {
+        0 => (0x7F00, 0x5300),
+        1 => (0xFF00, 0xA700),
+        _ => (0x01FF00, 0x01A700),
+    }
+}
+
+#[inline(always)]
+fn fast_ldm_is_anchor(w4: u32, (mask32, tag32): (u32, u32)) -> bool {
+    let lo = (w4 as u16 as i16) as i32;
+    let hi = ((w4 >> 16) as u16 as i16) as i32;
+    let m = (lo * (FAST_LDM_COEFF0 as i32) + hi * (FAST_LDM_COEFF1 as i32)) as u32;
+    (m & mask32) == tag32
+}
+
+/// Chunk/slice-relative LDM span (`start` and `end` are offsets relative to `chunk_start` /
+/// `slice_start`), keeping the struct 12 bytes while supporting buffers `>= 4 GiB`.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct FastLdmSpan {
+    pub(crate) start: u32,
+    pub(crate) end: u32,
+    pub(crate) dist: u32,
+}
+
+#[inline(always)]
+pub(crate) fn probe_ldm_span(
+    spans: &[FastLdmSpan],
+    ldm_i: &mut usize,
+    base: usize,
+    pos: usize,
+) -> Option<(usize, usize, u32)> {
+    let rel = pos - base;
+    let mut i = *ldm_i;
+    while let Some(&sp) = spans.get(i) {
+        if (sp.end as usize) >= rel + FAST_LDM_MIN_LEN {
+            *ldm_i = i;
+            return (rel >= sp.start as usize).then_some((
+                base + sp.start as usize,
+                base + sp.end as usize,
+                sp.dist,
+            ));
+        }
+        i += 1;
+    }
+    *ldm_i = i;
+    None
+}
+
+#[inline(always)]
+pub(crate) fn clamp_ldm_next_pos(
+    spans: &[FastLdmSpan],
+    ldm_i: usize,
+    base: usize,
+    pos: usize,
+    next_pos: usize,
+) -> usize {
+    match spans.get(ldm_i) {
+        Some(sp) if pos < base + sp.start as usize => next_pos.min(base + sp.start as usize),
+        _ => next_pos,
+    }
+}
+
+#[derive(Clone, Copy, FromZeroes)]
+#[repr(transparent)]
+struct FastLdmBucket([u32; 4]);
+
+/// `2 MiB` (`131,072 × 16 B`, 4-way = `524,288` slots) shift-invariant content-defined LDM
+/// scanner (`1-in-128` / `1-in-256` `VPMADDWD` anchors) for `lgwin >= 25` (`Q0..=Q9`).
+pub(crate) struct FastLdmTable {
+    buckets: HugePageBuf<FastLdmBucket>,
+    pub(crate) scanned_vpos: usize,
+    pub(crate) spans: Vec<FastLdmSpan>,
+}
+
+struct LdmScanner<'a> {
+    buckets: Pow2SliceMut<'a, FastLdmBucket>,
+    data: &'a [u8],
+    pfx8: BoundedPrefix<'a, u8, 8>,
+    chunk_start: usize,
+    eff_wsize: usize,
+    vpos_base: usize,
+    prev_w64: u64,
+    probe_resume: usize,
+    out: &'a mut Vec<FastLdmSpan>,
+}
+
+impl<'a> LdmScanner<'a> {
+    #[inline(always)]
+    fn new(
+        buckets: &'a mut [FastLdmBucket],
+        data: &'a [u8],
+        scan_end: usize,
+        chunk_start: usize,
+        eff_wsize: usize,
+        vpos_base: usize,
+        out: &'a mut Vec<FastLdmSpan>,
+    ) -> Option<Self> {
+        Some(Self {
+            buckets: Pow2SliceMut::new(buckets)?,
+            data,
+            pfx8: BoundedPrefix::<u8, 8>::from_prefix(data, scan_end + 7)?,
+            chunk_start,
+            eff_wsize,
+            vpos_base,
+            prev_w64: u64::MAX,
+            probe_resume: chunk_start,
+            out,
+        })
+    }
+
+    #[inline(always)]
+    fn step_anchor<S: SimdBackend>(&mut self, simd: S, pos: usize) {
+        let Some(at_pos) = self.pfx8.cursor_at(pos) else {
+            return;
+        };
+        let w64 = at_pos.load_u64_le::<0>();
+        if w64 == self.prev_w64 {
+            return;
+        }
+        self.prev_w64 = w64;
+        let vpos = self.vpos_base.wrapping_add(pos) as u32;
+        let h = w64.rotate_right(17).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let tag_bit = ((h >> 31) as u32) << 31;
+        let b = self.buckets.get_hash64_mut(h);
+
+        if pos >= self.probe_resume && pos > FAST_LDM_MIN_DIST {
+            let (mut best_start, mut best_end, mut best_dist) = (pos, pos, 0u32);
+            for slot in b.0 {
+                if slot != 0 && (slot & 0x8000_0000) == tag_bit {
+                    let d = vpos.wrapping_sub(slot & 0x7FFF_FFFF);
+                    let du = d as usize;
+                    if du > FAST_LDM_MIN_DIST && du <= self.eff_wsize {
+                        if let Some(c8) = at_pos.lookback(du) {
+                            let cand = pos - du;
+                            if u64::from_le_bytes(*c8) == w64
+                                && (best_dist == 0
+                                    || (self.data.get(cand + (best_end - pos))
+                                        == self.data.get(best_end)
+                                        && best_end < self.data.len()))
+                            {
+                                let max_back = (pos - self.probe_resume).min(cand);
+                                let back = common_suffix_len(
+                                    &self.data[cand - max_back..cand],
+                                    &self.data[pos - max_back..pos],
+                                );
+                                let (m_start, c_start) = (pos - back, cand - back);
+                                let eq_hi = matches!(
+                                    (self.pfx8.get_at(c_start + 8), self.pfx8.get_at(m_start + 8)),
+                                    (Some(a), Some(b)) if a == b
+                                );
+                                let m_len = if eq_hi {
+                                    longest_match_from_16(simd, self.data, c_start, m_start)
+                                } else {
+                                    common_prefix_len(
+                                        &self.data[c_start..],
+                                        &self.data[m_start..],
+                                        MAX_COPY_LEN,
+                                    )
+                                };
+                                let m_end = m_start + m_len;
+                                if m_end - m_start > best_end - best_start
+                                    || (m_end - m_start == best_end - best_start && d < best_dist)
+                                {
+                                    (best_start, best_end, best_dist) = (m_start, m_end, d);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if best_dist != 0 && best_end - best_start >= FAST_LDM_MIN_LEN {
+                self.out.push(FastLdmSpan {
+                    start: (best_start - self.chunk_start) as u32,
+                    end: (best_end - self.chunk_start) as u32,
+                    dist: best_dist,
+                });
+                self.probe_resume = best_end;
+            }
+        }
+
+        let prev0_vp = b.0[0] & 0x7FFF_FFFF;
+        if prev0_vp != vpos {
+            if (b.0[0] & 0x8000_0000) != tag_bit || vpos.wrapping_sub(prev0_vp) >= 64 {
+                b.0 = [tag_bit | vpos, b.0[0], b.0[1], b.0[2]];
+            } else {
+                b.0[0] = tag_bit | vpos;
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn scan_scalar<S: SimdBackend>(
+        &mut self,
+        simd: S,
+        params: (u32, u32),
+        mut p: usize,
+        scan_end: usize,
+    ) {
+        while p < scan_end {
+            let Some(c4) = self.pfx8.get_sub_at::<4, 0>(p) else {
+                break;
+            };
+            if fast_ldm_is_anchor(u32::from_le_bytes(*c4), params) {
+                self.step_anchor(simd, p);
+                if self.probe_resume > p + 64 {
+                    p = (self.probe_resume - 16).min(scan_end);
+                    self.prev_w64 = u64::MAX;
+                    continue;
+                }
+            }
+            p += 1;
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[simd_entry]
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
+    #[inline(never)]
+    fn scan_avx2(
+        &mut self,
+        params @ (mask32, tag32): (u32, u32),
+        mut p: usize,
+        scan_end: usize,
+        simd: X64V3,
+        _tok: impl SimdToken,
+    ) {
+        let coeff = _mm256_set1_epi32(FAST_LDM_COEFF_PACKED);
+        let mask_v = _mm256_set1_epi32(mask32 as i32);
+        let tag_v = _mm256_set1_epi32(tag32 as i32);
+        if let Some(pfx36) = BoundedPrefix::<u8, 36>::from_prefix(self.data, scan_end + 4) {
+            while let Some(bs) = pfx36.cursor_at(p) {
+                macro_rules! eq {
+                    ($off:literal) => {
+                        _mm256_cmpeq_epi32(
+                            _mm256_and_si256(
+                                _mm256_madd_epi16(
+                                    _mm256_loadu_si256(bs.sub_array::<32, $off>()),
+                                    coeff,
+                                ),
+                                mask_v,
+                            ),
+                            tag_v,
+                        )
+                    };
+                }
+                let (eq0, eq1, eq2, eq3) = (eq!(0), eq!(1), eq!(2), eq!(3));
+                let any = _mm256_or_si256(_mm256_or_si256(eq0, eq1), _mm256_or_si256(eq2, eq3));
+                let mut jumped = false;
+                if _mm256_testz_si256(any, any) == 0 {
+                    let m01 = _mm256_or_si256(
+                        _mm256_srli_epi32::<24>(eq0),
+                        _mm256_slli_epi32::<8>(_mm256_srli_epi32::<24>(eq1)),
+                    );
+                    let m23 = _mm256_or_si256(
+                        _mm256_slli_epi32::<16>(_mm256_srli_epi32::<24>(eq2)),
+                        _mm256_slli_epi32::<24>(eq3),
+                    );
+                    let mut mask = _mm256_movemask_epi8(_mm256_or_si256(m01, m23)) as u32;
+                    while mask != 0 {
+                        let pos = p + (mask.trailing_zeros() as usize);
+                        mask &= mask - 1;
+                        self.step_anchor(simd, pos);
+                        if self.probe_resume > pos + 64 {
+                            p = (self.probe_resume - 16).min(scan_end);
+                            self.prev_w64 = u64::MAX;
+                            jumped = true;
+                            break;
+                        }
+                    }
+                }
+                if !jumped {
+                    p += 32;
+                }
+            }
+        }
+        self.scan_scalar(simd, params, p, scan_end);
+    }
+
+    #[cfg_attr(target_arch = "x86_64", cold)]
+    #[inline(never)]
+    fn scan_portable(&mut self, params: (u32, u32), p: usize, scan_end: usize) {
+        self.scan_scalar(Scalar, params, p, scan_end);
+    }
+}
+
+impl FastLdmTable {
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn new() -> Self {
+        Self {
+            buckets: HugePageBuf::new_zeroed(FAST_LDM_SIZE),
+            scanned_vpos: 0,
+            spans: Vec::new(),
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.buckets[..].fill(FastLdmBucket([0; 4]));
+        self.scanned_vpos = 0;
+        self.spans.clear();
+    }
+
+    pub(crate) fn shift_back(&mut self, s32: u32) {
+        for b in &mut self.buckets[..] {
+            for e in &mut b.0 {
+                let vp = *e & 0x7FFF_FFFF;
+                *e = if vp > s32 { *e - s32 } else { 0 };
+            }
+        }
+        self.scanned_vpos = self.scanned_vpos.saturating_sub(s32 as usize);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_into(
+        &mut self,
+        density: u8,
+        data: &[u8],
+        chunk_start: usize,
+        chunk_end: usize,
+        eff_wsize: usize,
+        vpos_base: usize,
+        out: &mut Vec<FastLdmSpan>,
+        use_avx2: bool,
+    ) {
+        out.clear();
+        let scan_end = chunk_end.min(data.len().saturating_sub(8));
+        if scan_end == 0 || eff_wsize <= 262_144 {
+            return;
+        }
+        let catchup = vpos_base
+            .wrapping_add(chunk_start)
+            .saturating_sub(self.scanned_vpos)
+            .min(chunk_start)
+            .min(eff_wsize);
+        let scan_start = chunk_start - catchup;
+        if scan_end <= scan_start {
+            return;
+        }
+        if let Some(mut sc) = LdmScanner::new(
+            &mut self.buckets[..],
+            data,
+            scan_end,
+            chunk_start,
+            eff_wsize,
+            vpos_base,
+            out,
+        ) {
+            let params = fast_ldm_params(density);
+            match try_avx2(use_avx2) {
+                #[cfg(target_arch = "x86_64")]
+                Some(tok) => sc.scan_avx2(params, scan_start, scan_end, tok, tok),
+                _ => sc.scan_portable(params, scan_start, scan_end),
+            }
+        }
+        self.scanned_vpos = self.scanned_vpos.max(vpos_base.wrapping_add(scan_end));
+    }
+}
+
 #[inline(always)]
 fn compute_hash3(word64: u64) -> BoundedUsize<HT3_MASK> {
     BoundedUsize::new_masked(
