@@ -42,6 +42,7 @@ use crate::{
         write_window_bits, ContextMode, OptimalCommand, DIST_MODE_IMPLICIT_D0, DIST_MODE_RAW,
         DIST_MODE_STATIC_DICT,
     },
+    q11::Q11Encoder,
 };
 use bounded_utils::Pow2SliceMut;
 #[cfg(target_arch = "x86_64")]
@@ -2186,6 +2187,12 @@ impl<C: MatchConfig> EncoderImpl for EncoderInternal<C> {
     }
 }
 
+impl EncoderImpl for Q11Encoder {
+    fn compress_into(&mut self, data: &[u8], dict: OptDict<'_>, bw: &mut BitWriter<'_>) {
+        Q11Encoder::compress_into(self, data, dict, bw);
+    }
+}
+
 const fn q0_tiers(lw: bool) -> [(u8, u8); 3] {
     [(4, 13), (5, 14), (5, if lw { 15 } else { 14 })]
 }
@@ -2268,7 +2275,7 @@ impl Encoder {
     }
 
     /// Creates an encoder configured for `(quality, lgwin, num_threads)`.
-    pub fn with_threads(quality: u32, lgwin: u32, _num_threads: usize) -> Encoder {
+    pub fn with_threads(quality: u32, lgwin: u32, num_threads: usize) -> Encoder {
         let wbits = (lgwin as usize).clamp(MIN_WBITS, LARGE_MAX_WBITS);
         let lw = wbits > STD_MAX_WBITS;
         let inner: Box<dyn EncoderImpl> = match quality {
@@ -2285,12 +2292,7 @@ impl Encoder {
                 quality,
                 wbits,
                 lw,
-                Box::new(EncoderInternal::<ArchQ9>::new(
-                    wbits,
-                    QualityCfg::Q9,
-                    lw,
-                    TWO_PASS_TIERS[6]
-                ))
+                Box::new(Q11Encoder::new(quality, wbits, num_threads))
             ),
         };
         Encoder {
@@ -2316,7 +2318,7 @@ impl Encoder {
             1 => fast_twopass_checked_max_output_size_for(input_len, FAST_TWOPASS_CHUNK_SIZE),
             2 | 3 => fast_twopass_checked_max_output_size_for(input_len, FAST_Q2_CHUNK_SIZE),
             4..=9 => checked_max_two_pass_output_size(input_len),
-            _ => checked_max_two_pass_output_size(input_len),
+            _ => input_len.checked_mul(2)?.checked_add(1024 + 64),
         }
     }
 

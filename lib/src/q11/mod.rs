@@ -1,4 +1,3 @@
-#![allow(unused_imports)]
 // Copyright 2024 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -136,6 +135,79 @@ const DP_TAIL_MERGE: usize = if cfg!(all(test, debug_assertions)) {
 } else {
     1 << 18
 };
+
+#[derive(Default)]
+struct ParallelPools {
+    mg_workers: Vec<MatchGenScratch>,
+    dp_workers: Vec<(OptimalParseScratch, ChunkCostModel)>,
+    wave_cm: Vec<ChunkMatches>,
+    wave_ldm: Vec<ChunkLdmMatches>,
+}
+
+type RbPair = ([u32; 4], u8);
+const INIT_RB: RbPair = (INITIAL_LAST_DISTANCES, 0x0F);
+
+pub(crate) struct Q11Encoder {
+    effort: u8,
+    wbits: usize,
+    large_window: bool,
+    num_threads: usize,
+    ldm: SparseLdm,
+    mg_scratch: MatchGenScratch,
+    dp_scratch: (OptimalParseScratch, ChunkCostModel),
+    pools: ParallelPools,
+    wave_state: (RbPair, RbPair),
+    unemitted_pos: usize,
+}
+
+impl Q11Encoder {
+    pub(crate) fn new(quality: u32, wbits: usize, num_threads: usize) -> Self {
+        let (effort, large_window) = (quality.clamp(10, 12) as u8, wbits > STD_MAX_WBITS);
+        if effort >= 11 && !large_window {
+            crate::static_dict::warm_dict121();
+        }
+        Self {
+            effort,
+            wbits,
+            large_window,
+            num_threads,
+            ldm: SparseLdm::default(),
+            mg_scratch: MatchGenScratch::default(),
+            dp_scratch: Default::default(),
+            pools: ParallelPools::default(),
+            wave_state: (INIT_RB, INIT_RB),
+            unemitted_pos: 0,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn max_output_size(&self, input_len: usize) -> usize {
+        input_len.saturating_mul(2).saturating_add(1024 + 64)
+    }
+
+    #[inline]
+    fn effective_threads(&self) -> usize {
+        if cfg!(target_family = "wasm") {
+            return 1;
+        }
+        let n = if self.num_threads == 0 {
+            std::thread::available_parallelism().map_or(1, |n| n.get())
+        } else {
+            self.num_threads
+        };
+        n.clamp(1, 256)
+    }
+
+    #[inline]
+    fn sa_window_cap(&self) -> usize {
+        match self.effort {
+            12.. => 3 << 20,
+            11 if self.large_window => 2 << 20,
+            11 => 1 << 20,
+            _ => (1 << 20) - 1,
+        }
+    }
+}
 
 fn push_chopped_range(ranges: &mut Vec<(usize, usize)>, mut pos: usize, end: usize) {
     while pos < end {
@@ -648,23 +720,308 @@ fn ensure_len<T: Default>(v: &mut Vec<T>, n: usize) {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod test_helpers {
-    #[inline]
-    pub(crate) fn dbg_or<T>(dbg: T, rel: T) -> T {
-        if cfg!(debug_assertions) {
-            dbg
+impl Q11Encoder {
+    #[allow(clippy::too_many_arguments)]
+    fn encode_chunks_pipeline<'a>(
+        &mut self,
+        base_env: ChunkEnv<'a>,
+        chunks: &[(usize, usize)],
+        full_dict_len: usize,
+        dc_ref: Option<&DictChain>,
+        eff_win: usize,
+        is_eof: bool,
+        bw: &mut BitWriter<'_>,
+    ) -> bool {
+        let (effort, is_q12) = (self.effort, self.effort >= 12);
+        let (sa_window_cap, large_window) = (self.sa_window_cap(), self.large_window);
+        let eff_threads = self.effective_threads().max(1);
+
+        let merge_group_chunks: usize = if is_q12 { 8 } else { 4 };
+        let wave_cap = if eff_threads <= 1 {
+            merge_group_chunks
         } else {
-            rel
+            (eff_threads
+                .saturating_mul(2)
+                .saturating_add(merge_group_chunks - 1)
+                & !(merge_group_chunks - 1))
+                .clamp(8, 32)
+        };
+        ensure_len(&mut self.pools.wave_cm, wave_cap);
+        ensure_len(&mut self.pools.wave_ldm, wave_cap);
+
+        let mut ended_with_last_mb = false;
+        let num_waves = chunks.len().div_ceil(wave_cap);
+
+        for (wave_idx, wave_chunks) in chunks.chunks(wave_cap).enumerate() {
+            let is_last_wave = wave_idx + 1 == num_waves;
+            let w_len = wave_chunks.len();
+            let mut kinds = Vec::with_capacity(w_len);
+
+            for (i, &(c_start, c_end)) in wave_chunks.iter().enumerate() {
+                let cenv = base_env.sub(c_start, c_end);
+                let kind = classify_chunk(cenv, large_window);
+                kinds.push(kind);
+                if kind == PreChunkKind::Normal {
+                    self.ldm.extract(
+                        cenv,
+                        eff_win,
+                        sa_window_cap,
+                        effort,
+                        &mut self.pools.wave_ldm[i],
+                    );
+                } else {
+                    self.pools.wave_ldm[i].clear();
+                }
+            }
+
+            {
+                let ldm_slice = &self.pools.wave_ldm[..w_len];
+                let mg_tasks: Vec<(usize, &mut ChunkMatches)> = self.pools.wave_cm[..w_len]
+                    .iter_mut()
+                    .enumerate()
+                    .filter(|&(i, _)| kinds[i] == PreChunkKind::Normal)
+                    .collect();
+                let mg_workers = eff_threads.min(16).min(mg_tasks.len());
+                map_vec_with_scratch(
+                    mg_tasks,
+                    mg_workers,
+                    &mut self.mg_scratch,
+                    &mut self.pools.mg_workers,
+                    MatchGenScratch::default,
+                    |_, (i, cm_out), mg_s| {
+                        let (c_start, c_end) = wave_chunks[i];
+                        mg_s.reset_h10();
+                        build_chunk_matches(
+                            MatchGenCfg {
+                                env: base_env.sub(c_start, c_end),
+                                local_window_cap: sa_window_cap,
+                                large_window,
+                                effort,
+                                full_dict_len,
+                                dict_chain: dc_ref,
+                                ldm: &ldm_slice[i],
+                            },
+                            mg_s,
+                            cm_out,
+                        );
+                    },
+                );
+            }
+
+            let cm_slice = &self.pools.wave_cm[..w_len];
+            let mut assumed = Vec::with_capacity(w_len);
+            let mut dp_tasks: Vec<(usize, Option<ChunkParseResult>)> = Vec::with_capacity(w_len);
+            for i in 0..w_len {
+                assumed.push(self.wave_state.0);
+                match kinds[i] {
+                    PreChunkKind::UncompressedRaw => {}
+                    PreChunkKind::PureLiterals => dp_tasks.push((i, None)),
+                    PreChunkKind::Normal => {
+                        let seed = (w_len > 1).then(|| {
+                            let (s, e) = wave_chunks[i];
+                            let res0 = parse_chunk_greedy_seed(
+                                base_env.sub(s, e),
+                                &cm_slice[i],
+                                self.wave_state.0,
+                                effort >= 11,
+                            );
+                            self.wave_state.0 = (res0.final_rb, res0.final_valid_mask);
+                            res0
+                        });
+                        dp_tasks.push((i, seed));
+                    }
+                }
+            }
+
+            let dp_workers = eff_threads.min(dp_tasks.len());
+            let intra_dp_plan = (eff_threads / dp_workers.max(1)).max(1);
+            let mut dp_results = map_vec_with_scratch(
+                dp_tasks,
+                dp_workers,
+                &mut self.dp_scratch,
+                &mut self.pools.dp_workers,
+                Default::default,
+                |_, (i, pre_res0), (op_s, model_s)| {
+                    let (s, e) = wave_chunks[i];
+                    let cenv = base_env.sub(s, e);
+                    if kinds[i] == PreChunkKind::PureLiterals {
+                        let len32 = cenv.len() as u32;
+                        let plan = MergeCfg(large_window, effort, intra_dp_plan).build_plan(
+                            cenv,
+                            &[],
+                            len32,
+                        );
+                        (ChunkParseResult::empty(assumed[i], len32), plan)
+                    } else {
+                        ChunkDpCtx {
+                            env: cenv,
+                            large_window,
+                            effort,
+                            init: assumed[i],
+                            intra_threads: intra_dp_plan,
+                            cm: &cm_slice[i],
+                            op_scratch: op_s,
+                            cost_model: model_s,
+                        }
+                        .run(pre_res0)
+                    }
+                },
+            )
+            .into_iter();
+
+            let mut emit_jobs: Vec<MbJob<'_>> = Vec::with_capacity(w_len);
+            for i in 0..w_len {
+                let (c_start, c_end) = wave_chunks[i];
+                let chunk_len = c_end - c_start;
+                if kinds[i] == PreChunkKind::UncompressedRaw {
+                    emit_jobs.push(MbJob::Uncompressed(&base_env.data[c_start..c_end]));
+                    continue;
+                }
+                let (mut res, mut plan) = dp_results.next().unwrap();
+                if should_emit_uncompressed_plan(chunk_len, &plan) {
+                    emit_jobs.push(MbJob::Uncompressed(&base_env.data[c_start..c_end]));
+                    continue;
+                }
+                let (next_actual, mut dirty) =
+                    reconcile_chunk_dist_rb(&mut res, assumed[i], self.wave_state.1);
+                if dirty
+                    && plan.exact_compressed_bits.saturating_add(65_536)
+                        > (chunk_len as u64) * 8 + 40
+                {
+                    plan = MergeCfg(large_window, effort, eff_threads).build_plan(
+                        base_env.sub(c_start, c_end),
+                        &res.commands,
+                        res.trailing_literals,
+                    );
+                    if should_emit_uncompressed_plan(chunk_len, &plan) {
+                        emit_jobs.push(MbJob::Uncompressed(&base_env.data[c_start..c_end]));
+                        continue;
+                    }
+                    dirty = false;
+                }
+                self.wave_state.1 = next_actual;
+                emit_jobs.push(MbJob::Compressed(PendingMb {
+                    start: c_start,
+                    end: c_end,
+                    cmds: res.commands,
+                    trailing: res.trailing_literals,
+                    plan,
+                    dirty,
+                }));
+            }
+
+            let num_groups = w_len.div_ceil(merge_group_chunks);
+            let group_workers = eff_threads.min(num_groups);
+            let mcfg = MergeCfg(
+                large_window,
+                effort,
+                (eff_threads / num_groups.max(1)).max(1),
+            );
+            let mut job_iter = emit_jobs.into_iter();
+            let groups: Vec<Vec<MbJob<'_>>> = (0..num_groups)
+                .map(|_| job_iter.by_ref().take(merge_group_chunks).collect())
+                .collect();
+            let group_results = map_vec_with_scratch(
+                groups,
+                group_workers,
+                &mut (),
+                &mut Vec::new(),
+                || (),
+                |_, g_jobs, ()| process_merge_group(base_env.data, g_jobs, mcfg),
+            );
+            for (g, mbs) in group_results.into_iter().enumerate() {
+                let is_final = is_eof && is_last_wave && (g + 1 == num_groups);
+                let n_mbs = mbs.len();
+                for (idx, mb) in mbs.into_iter().enumerate() {
+                    match mb {
+                        MbJob::Uncompressed(s) => write_uncompressed_metablock(s, bw),
+                        MbJob::Compressed(p) => {
+                            let last = is_final && idx + 1 == n_mbs;
+                            write_compressed_metablock(
+                                base_env.data,
+                                p.start,
+                                p.end,
+                                &p.cmds,
+                                p.trailing,
+                                &p.plan,
+                                last,
+                                bw,
+                            );
+                            ended_with_last_mb |= last;
+                        }
+                    }
+                }
+            }
         }
+
+        self.wave_state.0 = self.wave_state.1;
+        ended_with_last_mb
     }
 
+    fn encode_range_with_dict(
+        &mut self,
+        data: &[u8],
+        (r_start, r_end): (usize, usize),
+        dict: Option<&PreparedDictionary>,
+        (streaming, is_eof): (bool, bool),
+        bw: &mut BitWriter<'_>,
+    ) -> bool {
+        let wsize = window_size(self.wbits);
+        let eff_win = if streaming {
+            wsize
+        } else {
+            wsize.min(data.len())
+        };
+        let dict = dict.filter(|d| !d.is_empty());
+        let (dict_active, full_dict_len) =
+            dict.map_or((&[][..], 0), |d| (d.active_slice(wsize), d.raw_len()));
+        let dc = dict.and_then(|d| d.dict_chain());
+        let range_env = ChunkEnv::new(data, r_start, r_end, wsize, dict_active);
+        let chunks =
+            compute_stream_chunks_in_range(range_env, self.large_window, self.effort >= 11);
+        self.encode_chunks_pipeline(range_env, &chunks, full_dict_len, dc, eff_win, is_eof, bw)
+    }
+
+    fn reset_stream(&mut self) {
+        self.mg_scratch.reset_h10();
+        self.ldm.reset_stream();
+        self.wave_state = (INIT_RB, INIT_RB);
+        self.unemitted_pos = 0;
+    }
+
+    pub(crate) fn compress_into(
+        &mut self,
+        data: &[u8],
+        dict: Option<&PreparedDictionary>,
+        bw: &mut BitWriter<'_>,
+    ) {
+        self.reset_stream();
+        write_window_bits(self.wbits, self.large_window, bw);
+        if data.is_empty()
+            || !self.encode_range_with_dict(data, (0, data.len()), dict, (false, true), bw)
+        {
+            write_empty_last_metablock(bw);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_helpers {
     #[inline]
     pub(crate) fn miri_or<T>(miri: T, normal: T) -> T {
         if cfg!(miri) {
             miri
         } else {
             normal
+        }
+    }
+
+    #[inline]
+    pub(crate) fn dbg_or<T>(dbg: T, rel: T) -> T {
+        if cfg!(debug_assertions) {
+            dbg
+        } else {
+            rel
         }
     }
 
@@ -679,6 +1036,173 @@ pub(crate) mod test_helpers {
 
 #[cfg(test)]
 mod tests {
+    use std::mem::MaybeUninit;
+
+    use super::test_helpers::{append_lcg_bytes, dbg_or, miri_or};
+    use super::ChunkEnv;
+    use crate::metablock::test_helpers::{decompress_brotli, decompress_brotli_with_dict};
+    use crate::{Encoder, PreparedDictionary};
+
+    fn comp_verified(
+        q: u32,
+        lgwin: u32,
+        data: &[u8],
+        dict: Option<(&PreparedDictionary, &[u8])>,
+    ) -> Vec<u8> {
+        let mut enc = Encoder::with_lgwin(q, lgwin);
+        match dict {
+            Some((prep, raw)) => {
+                let c = enc.compress_with_dict(data, prep, None).unwrap().to_vec();
+                assert_eq!(decompress_brotli_with_dict(&c, raw), data);
+                c
+            }
+            None => {
+                let c = enc.compress(data, None).unwrap().to_vec();
+                assert_eq!(decompress_brotli(&c), data);
+                c
+            }
+        }
+    }
+
+    fn assert_1t_mt_bit_exact(data: &[u8], q: u32, lgwin: u32, mt_threads: &[usize]) -> Vec<u8> {
+        let comp_mt = |t| {
+            Encoder::with_threads(q, lgwin, t)
+                .compress(data, None)
+                .unwrap()
+                .to_vec()
+        };
+        let comp_1t = comp_mt(1);
+        assert_eq!(decompress_brotli(&comp_1t), data);
+        for &t in mt_threads {
+            assert_eq!(comp_mt(t), comp_1t);
+        }
+        comp_1t
+    }
+
+    fn build_mixed_regime_buf(target_len: usize) -> Vec<u8> {
+        let (mut buf, mut i) = (Vec::with_capacity(target_len + 256), 0u32);
+        while buf.len() < target_len {
+            match (i / 32) % 3 {
+                0 => buf.extend_from_slice(
+                    format!("Information about international government policy and university research: section-{i}\n").as_bytes(),
+                ),
+                1 => (0..8u32).for_each(|k| {
+                    let v = i * 8 + k;
+                    buf.extend_from_slice(&v.wrapping_mul(2654435761).to_le_bytes());
+                    buf.extend_from_slice(&(0x0102_0300u32 | (v & 0xFF)).to_le_bytes());
+                }),
+                _ => buf.extend_from_slice(
+                    format!("{{\"id\":{i},\"active\":true,\"kind\":\"storage#object\"}}\n").as_bytes(),
+                ),
+            }
+            i += 1;
+        }
+        buf.truncate(target_len);
+        buf
+    }
+
+    #[test]
+    fn test_q10_q11_roundtrip_edge_cases_windows_and_multi_regime() {
+        let (mut prng, rle_q) = (Vec::new(), vec![b'Q'; miri_or(256, dbg_or(4096, 16_384))]);
+        append_lcg_bytes(
+            &mut prng,
+            miri_or(128, dbg_or(2048, 8192)),
+            0xDEAD_BEEF_CAFE_BABE,
+            1,
+        );
+        let multi = build_mixed_regime_buf(miri_or(128, dbg_or(6 * 1024, 96 * 1024)));
+        #[rustfmt::skip]
+        let all_cases = [&b""[..], b"z", b"ab", b"abc", b"abcd", b"timing the government of the United States", &rle_q, &prng, &multi];
+        let miri_cases = [
+            &b""[..],
+            b"z",
+            b"abcd",
+            b"timing the government of the United States",
+            &multi,
+        ];
+        let cases: &[&[u8]] = miri_or(&miri_cases[..], &all_cases[..]);
+        let lws: &[u32] = miri_or(
+            &[10u32, 26][..],
+            dbg_or(&[10u32, 22, 26][..], &[10, 16, 22, 24, 26, 30][..]),
+        );
+        for &q in miri_or(&[10u32][..], &[10u32, 11][..]) {
+            for &lgwin in lws {
+                let mut enc = Encoder::with_lgwin(q, lgwin);
+                for &inp in cases {
+                    let mut buf = vec![MaybeUninit::uninit(); enc.max_required_size(inp.len())];
+                    assert_eq!(
+                        decompress_brotli(enc.compress(inp, Some(&mut buf)).unwrap()),
+                        inp
+                    );
+                }
+                assert!(enc
+                    .compress(&multi, Some(&mut [MaybeUninit::uninit(); 4]))
+                    .is_none());
+            }
+        }
+        if cfg!(miri) {
+            comp_verified(11, 12, b"timing the government of the United States", None);
+        }
+    }
+
+    #[test]
+    fn test_q10_q11_custom_dict_and_multithreaded_multi_chunk() {
+        let dict_raw = b"HTTP/1.1 200 OK\nContent-Type: application/json; charset=utf-8\n{\"service\":\"rbrotli-optimal\",\"region\":\"europe-west4\",\"permissions\":[\"read\",\"write\",\"list\"]}";
+        let payload = b"HTTP/1.1 200 OK\nContent-Type: application/json; charset=utf-8\n{\"service\":\"rbrotli-optimal\",\"region\":\"europe-west4\",\"permissions\":[\"read\",\"write\",\"list\"],\"id\":99}";
+        let mut big_dict = vec![b'X'; miri_or(1100, 3000)];
+        big_dict.extend_from_slice(dict_raw);
+
+        let dw = miri_or(14, 22);
+        for &q in miri_or(&[10u32][..], &[10u32, 11][..]) {
+            let prep = PreparedDictionary::with_lgwin(dict_raw, q, dw);
+            let c_no = comp_verified(q, dw, payload, None);
+            let c_dict = comp_verified(q, dw, payload, Some((&prep, dict_raw)));
+            assert!(c_dict.len() * 2 < c_no.len());
+
+            let prep10 = PreparedDictionary::with_lgwin(&big_dict, q, 10);
+            if !cfg!(miri) {
+                comp_verified(q, 10, payload, Some((&prep10, &big_dict)));
+            }
+        }
+
+        if cfg!(miri) {
+            // Exercise 2-thread `Q10` Rayon pipeline under Miri without multi-minute >8 KiB DP.
+            let mt_buf = b"Cross-thread Q10 optimal pipeline verification! ".repeat(3);
+            assert_1t_mt_bit_exact(&mt_buf, 10, 12, &[2]);
+            return;
+        }
+
+        let (c0_end, c1_end, tail_rep) =
+            dbg_or((17_000, 25_000, 9_000), (1_100_000, 2_100_000, 300_000));
+        let mut big = Vec::with_capacity(c1_end + tail_rep);
+        while big.len() < c0_end {
+            big.extend_from_slice(
+                b"Cross-chunk long-distance repeat anchor for optimal parser verification! ",
+            );
+            big.extend_from_slice(&(big.len() as u32 & 63).to_le_bytes());
+        }
+        let rlen = c1_end - big.len();
+        append_lcg_bytes(&mut big, rlen, 0x1234_5678_9ABC_DEF0, 1);
+        big.extend_from_within(..tail_rep);
+        for q in [10, 11] {
+            assert_1t_mt_bit_exact(&big, q, 24, &[2, 5, 0]);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_p3_single_chunk_intra_parallel_bit_exact() {
+        let buf = build_mixed_regime_buf(dbg_or(9_500, 220_000));
+        let env = ChunkEnv::new(&buf, 0, buf.len(), 1 << 22, &[]);
+        assert_eq!(
+            super::compute_stream_chunks_in_range(env, false, false).len(),
+            1
+        );
+        for q in [10, 11] {
+            assert_1t_mt_bit_exact(&buf, q, 22, &[4]);
+        }
+    }
+
     #[test]
     fn test_p2_reconcile_chunk_dist_rb() {
         use super::{
@@ -717,6 +1241,156 @@ mod tests {
                 (DIST_MODE_IMPLICIT_D0, 5)
             );
             assert_eq!(fin, ([120, 88, 77, 41], 0x0F));
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_p1_lw2_multithreaded_large_window_pipeline() {
+        let (anchor_len, gap_len) = dbg_or((12_000usize, 36_000usize), (262_144, 4_500_000));
+        let (mut data, mut s) = (
+            Vec::with_capacity(anchor_len * 2 + gap_len),
+            0x9E37_79B9_7F4A_7C15u64,
+        );
+        for i in 0..anchor_len {
+            if (i & 15) == 0 {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            }
+            data.push(b'A' + (((s >> ((i & 7) * 8)) as u8) & 31));
+        }
+        append_lcg_bytes(&mut data, gap_len, s, 3037000493);
+        data.extend_from_within(..anchor_len);
+        for q in [10, 11] {
+            let comp_1t = assert_1t_mt_bit_exact(&data, q, 28, &[3, 6]);
+            assert!(comp_1t.len() < gap_len + (anchor_len * 6) / 5);
+        }
+    }
+
+    #[test]
+    fn test_q12_archival_subchunk_raw_dag_dp_and_mt_bit_exact() {
+        let dict_raw = br#"{"protocol":"rbrotli-q12","capabilities":["sais-3mib","beam8","mtf-viterbi","dag-dp"]}"#;
+        let dict_msg = br#"{"protocol":"rbrotli-q12","capabilities":["sais-3mib","beam8","mtf-viterbi","dag-dp"],"ok":true}"#;
+        let dw = miri_or(14, 22);
+        let prep = PreparedDictionary::with_lgwin(dict_raw, 12, dw);
+        comp_verified(12, dw, dict_msg, Some((&prep, dict_raw)));
+
+        if cfg!(miri) {
+            comp_verified(12, 10, b"", None);
+            assert_1t_mt_bit_exact(&build_mixed_regime_buf(80), 12, 12, &[2]);
+            return;
+        }
+
+        for lgwin in [10, 22, 28] {
+            for inp in [&b""[..], b"x", b"xy", b"xyz", dict_msg] {
+                comp_verified(12, lgwin, inp, None);
+            }
+        }
+
+        let (prose_a, raw_len, tail_prose) =
+            dbg_or((9_500usize, 24_576, 12_000), (160_000, 98_304, 1_200_000));
+        let mut mixed = build_mixed_regime_buf(prose_a);
+        let raw_s = mixed.len();
+        append_lcg_bytes(&mut mixed, raw_len, 0xDEAD_BEEF_1357_2468, 1);
+        let raw_e = mixed.len();
+        mixed.extend_from_slice(&build_mixed_regime_buf(tail_prose));
+        mixed.extend_from_within(..(prose_a / 2));
+
+        let env = ChunkEnv::new(&mixed, 0, mixed.len(), super::window_size(24), &[]);
+        assert!(super::compute_stream_chunks_in_range(env, false, true)
+            .iter()
+            .any(|&(s, e)| {
+                s >= raw_s.saturating_sub(16_384)
+                    && e <= raw_e + 16_384
+                    && super::classify_chunk(env.sub(s, e), false)
+                        == super::PreChunkKind::UncompressedRaw
+            }));
+
+        let c10 = comp_verified(10, 24, &mixed, None);
+        let c12_1t =
+            assert_1t_mt_bit_exact(&mixed, 12, 24, dbg_or(&[3usize][..], &[2, 4, 8, 0][..]));
+        assert!(c12_1t.len() < c10.len());
+    }
+
+    #[test]
+    fn test_usize_max_threads_expired_dict_classify_and_h10_4gib() {
+        // `num_threads = usize::MAX` must clamp cleanly without overflowing `eff_threads * 2`.
+        let sample = build_mixed_regime_buf(miri_or(80, 32_768));
+        let (tq, tw) = miri_or((10, 12), (11, 20));
+        let c1 = Encoder::with_threads(tq, tw, 1)
+            .compress(&sample, None)
+            .unwrap()
+            .to_vec();
+        let c_max = Encoder::with_threads(tq, tw, usize::MAX)
+            .compress(&sample, None)
+            .unwrap()
+            .to_vec();
+        assert_eq!(c_max, c1);
+
+        // Once `env.start >= env.wsize`, `env.dict` has expired out of the sliding window and
+        // must not force an incompressible LCG chunk to `PreChunkKind::Normal`.
+        let wsize = super::window_size(miri_or(10, 14));
+        let dslice = miri_or(512, 4096);
+        let mut raw_stream = Vec::new();
+        append_lcg_bytes(&mut raw_stream, wsize + 16_384, 0xA5A5_5A5A_F00D_CAFE, 3);
+        let expired_dict = raw_stream[wsize..wsize + dslice].to_vec();
+        let in_win_env = ChunkEnv::new(&raw_stream, 0, 16_384, wsize, &raw_stream[..dslice]);
+        assert_eq!(
+            super::classify_chunk(in_win_env, false),
+            super::PreChunkKind::Normal
+        );
+        let expired_env = ChunkEnv::new(&raw_stream, wsize, wsize + 16_384, wsize, &expired_dict);
+        assert_eq!(
+            super::classify_chunk(expired_env, false),
+            super::PreChunkKind::UncompressedRaw
+        );
+
+        // On 64-bit Linux, verify H10 BST/3B/2B match generation straddling `2^32 - 1` produces
+        // identical intervals to low stream offsets instead of wrapping `(pos + 1) as u32` to `0`.
+        #[cfg(all(target_os = "linux", target_pointer_width = "64", not(miri)))]
+        {
+            use super::match_gen::{
+                build_chunk_matches, ChunkLdmMatches, ChunkMatches, MatchGenCfg, MatchGenScratch,
+            };
+            const TWO_32: usize = 1usize << 32;
+            let mut big = vec![0u8; TWO_32 + 4096];
+            for i in (TWO_32 - 4096)..(TWO_32 + 4096) {
+                big[i] = sample[i % sample.len()];
+            }
+            let empty_ldm = ChunkLdmMatches::default();
+            let (mut mg_hi, mut cm_hi) = (MatchGenScratch::default(), ChunkMatches::default());
+            build_chunk_matches(
+                MatchGenCfg {
+                    env: ChunkEnv::new(&big, TWO_32 - 2048, TWO_32 + 2048, 1 << 20, &[]),
+                    local_window_cap: 1 << 20,
+                    large_window: false,
+                    effort: 11,
+                    full_dict_len: 0,
+                    dict_chain: None,
+                    ldm: &empty_ldm,
+                },
+                &mut mg_hi,
+                &mut cm_hi,
+            );
+            assert!(!cm_hi.intervals.is_empty());
+            let low = &big[TWO_32 - 4096..TWO_32 + 4096];
+            let (mut mg_lo, mut cm_lo) = (MatchGenScratch::default(), ChunkMatches::default());
+            build_chunk_matches(
+                MatchGenCfg {
+                    env: ChunkEnv::new(low, 2048, 6144, 1 << 20, &[]),
+                    local_window_cap: 1 << 20,
+                    large_window: false,
+                    effort: 11,
+                    full_dict_len: 0,
+                    dict_chain: None,
+                    ldm: &empty_ldm,
+                },
+                &mut mg_lo,
+                &mut cm_lo,
+            );
+            assert_eq!(cm_hi.intervals.len(), cm_lo.intervals.len());
+            for (a, b) in cm_hi.intervals.iter().zip(cm_lo.intervals.iter()) {
+                assert_eq!((a.l_lo, a.l_hi, a.dist), (b.l_lo, b.l_hi, b.dist));
+            }
         }
     }
 }
