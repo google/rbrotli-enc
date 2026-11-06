@@ -2021,20 +2021,24 @@ impl<C: MatchConfig> EncoderInternal<C> {
         let wsize = window_size(self.wbits);
         let full_dict_len = match dict {
             Some(d) => {
-                let seed_ht4_win = if self.qcfg.max_insert_len == 0 {
-                    0
-                } else if C::FAST_MATCHING {
-                    HT4_DICT_WINDOW
+                if self.qcfg.seed_ht_dict {
+                    let seed_ht4_win = if self.qcfg.max_insert_len == 0 {
+                        0
+                    } else if C::FAST_MATCHING {
+                        HT4_DICT_WINDOW
+                    } else {
+                        4 * HT4_DICT_WINDOW
+                    };
+                    self.ht.prepare_for_input_with_dict(
+                        wsize,
+                        expected_stream_len,
+                        d,
+                        seed_ht4_win,
+                        C::USE_3B_TABLE,
+                    );
                 } else {
-                    4 * HT4_DICT_WINDOW
-                };
-                self.ht.prepare_for_input_with_dict(
-                    wsize,
-                    expected_stream_len,
-                    d,
-                    seed_ht4_win,
-                    C::USE_3B_TABLE,
-                );
+                    self.ht.prepare_for_input(wsize, expected_stream_len);
+                }
                 d.raw_len()
             }
             None => {
@@ -2285,8 +2289,17 @@ impl<C: MatchConfig> EncoderInternal<C> {
         let dict = dict.filter(|d| !d.is_empty());
         let has_dict = dict.is_some();
         let wsize = window_size(self.wbits);
-        let (active_dict, full_dict_len): (&[u8], usize) =
-            dict.map_or((&[], 0), |d| (d.active_slice(wsize), d.raw_len()));
+        let (active_dict, full_dict_len, dict_idx): (
+            &[u8],
+            usize,
+            Option<&crate::hashtable::RawDictIndex>,
+        ) = dict.map_or((&[], 0, None), |d| {
+            (
+                d.active_slice(wsize),
+                d.raw_len(),
+                (!self.qcfg.seed_ht_dict).then(|| d.raw_index()),
+            )
+        });
         let eff_wsize = effective_window_size(wsize, in_buf.len(), full_dict_len);
         let max_mb = self.md.max_mb;
 
@@ -2314,7 +2327,7 @@ impl<C: MatchConfig> EncoderInternal<C> {
                     lw,
                     has_dict,
                     (in_buf, target_end, wsize),
-                    (active_dict, full_dict_len),
+                    (active_dict, full_dict_len, dict_idx),
                     &mut st.parse,
                     sink,
                     cost_model,
@@ -2391,7 +2404,7 @@ fn select_tier<T: Copy>(
 
 impl EncoderImpl for (OnePassEncoder, [(u8, u8); 3]) {
     fn compress_into(&mut self, data: &[u8], dict: OptDict<'_>, bw: &mut BitWriter<'_>) {
-        let (_, (mls, log)) = select_tier(self.0.wbits(), data.len(), dict, self.1);
+        let (_, (mls, log)) = select_tier(self.0.wbits(), data.len(), None, self.1);
         self.0.configure(mls, log as u32);
         compress_fast_with_tok(&mut self.0, data, dict, bw, try_simd(true));
     }
@@ -2399,7 +2412,7 @@ impl EncoderImpl for (OnePassEncoder, [(u8, u8); 3]) {
 
 impl EncoderImpl for (FastTwoPassEncoder, [(u8, u8, u8); 3]) {
     fn compress_into(&mut self, data: &[u8], dict: OptDict<'_>, bw: &mut BitWriter<'_>) {
-        let (eff_len, (mls, log, slog)) = select_tier(self.0.wbits(), data.len(), dict, self.1);
+        let (eff_len, (mls, log, slog)) = select_tier(self.0.wbits(), data.len(), None, self.1);
         self.0
             .configure_tiered(eff_len, mls, log as u32, slog as u32);
         compress_fast_with_tok(&mut self.0, data, dict, bw, try_simd(true));
@@ -2408,8 +2421,12 @@ impl EncoderImpl for (FastTwoPassEncoder, [(u8, u8, u8); 3]) {
 
 impl<C: MatchConfig> EncoderImpl for EncoderInternal<C> {
     fn compress_into(&mut self, data: &[u8], dict: OptDict<'_>, bw: &mut BitWriter<'_>) {
-        let (eff_len, TierParams(ways, ht4_ways, log, ht4_log, mb_kib)) =
-            select_tier(self.wbits, data.len(), dict, self.tiers);
+        let (eff_len, TierParams(ways, ht4_ways, log, ht4_log, mb_kib)) = select_tier(
+            self.wbits,
+            data.len(),
+            self.qcfg.seed_ht_dict.then_some(dict).flatten(),
+            self.tiers,
+        );
         let pos_bits = if self.large_window && eff_len > COMPACT_LW_STREAM_MAX {
             31
         } else {
@@ -2522,94 +2539,32 @@ pub(crate) fn canonical_dict_key(
     wbits: usize,
     dict_bytes_len: usize,
 ) -> Option<crate::hashtable::DictTableKey> {
-    use crate::fast_onepass::{fast_twopass_stream_pos_bits, onepass_max_window, onepass_pos_bits};
     use crate::hashtable::DictTableKey;
-    if dict_bytes_len == 0 || quality > 9 {
+    if dict_bytes_len == 0 || !(6..=9).contains(&quality) {
         return None;
     }
     let raw_wsize = window_size(wbits);
-    match quality {
-        0 => {
-            let pos_bits = onepass_pos_bits(wbits);
-            let max_win = onepass_max_window(pos_bits);
-            let d_len = dict_bytes_len.min(raw_wsize.min(max_win));
-            if d_len == 0 || d_len > max_win {
-                return None;
-            }
-            let idx =
-                usize::from(d_len > SMALL_STREAM_MAX) + usize::from(d_len > MEDIUM_STREAM_MAX);
-            let (_, log) = q0_tiers(wbits > STD_MAX_WBITS)[idx];
-            Some(DictTableKey {
-                d_len,
-                pos_bits,
-                ways: 1,
-                ht4_ways: 1,
-                log,
-                ht4_log: log,
-                seed_ht4_win: (1u32 << log) * 2,
-                seed_ht3: false,
-            })
-        }
-        1 | 2 => {
-            let d_len = dict_bytes_len.min(raw_wsize);
-            let idx =
-                usize::from(d_len > SMALL_STREAM_MAX) + usize::from(d_len > MEDIUM_STREAM_MAX);
-            let (_, log, slog) = if quality == 1 {
-                Q1_TIERS[idx]
-            } else {
-                Q2_TIERS[idx]
-            };
-            let pos_bits = if d_len <= COMPACT_LW_STREAM_MAX {
-                25
-            } else {
-                fast_twopass_stream_pos_bits(wbits)
-            };
-            if d_len == 0 || d_len > (1usize << (pos_bits - 1)) {
-                return None;
-            }
-            Some(DictTableKey {
-                d_len,
-                pos_bits,
-                ways: 1,
-                ht4_ways: 1,
-                log,
-                ht4_log: slog,
-                seed_ht4_win: (1u32 << slog) * 2,
-                seed_ht3: false,
-            })
-        }
-        3..=9 => {
-            let d_len = dict_bytes_len.min(raw_wsize);
-            let idx =
-                usize::from(d_len > SMALL_STREAM_MAX) + usize::from(d_len > MEDIUM_STREAM_MAX);
-            let TierParams(ways, ht4_ways, log, ht4_log, _) =
-                TWO_PASS_TIERS[quality as usize - 3][idx];
-            let pos_bits = if wbits > STD_MAX_WBITS && d_len > COMPACT_LW_STREAM_MAX {
-                31
-            } else {
-                25
-            };
-            if d_len == 0 || d_len > (1usize << (pos_bits - 1)) {
-                return None;
-            }
-            let seed_ht4_win = if quality == 3 {
-                HT4_DICT_WINDOW as u32
-            } else {
-                (4 * HT4_DICT_WINDOW) as u32
-            };
-            Some(DictTableKey {
-                d_len,
-                pos_bits,
-                ways,
-                ht4_ways,
-                log,
-                ht4_log,
-                seed_ht4_win,
-                seed_ht3: quality >= 5,
-            })
-        }
-        _ => None,
+    let d_len = dict_bytes_len.min(raw_wsize);
+    let idx = usize::from(d_len > SMALL_STREAM_MAX) + usize::from(d_len > MEDIUM_STREAM_MAX);
+    let TierParams(ways, ht4_ways, log, ht4_log, _) = TWO_PASS_TIERS[quality as usize - 3][idx];
+    let pos_bits = if wbits > STD_MAX_WBITS && d_len > COMPACT_LW_STREAM_MAX {
+        31
+    } else {
+        25
+    };
+    if d_len == 0 || d_len > (1usize << (pos_bits - 1)) {
+        return None;
     }
+    Some(DictTableKey {
+        d_len,
+        pos_bits,
+        ways,
+        ht4_ways,
+        log,
+        ht4_log,
+        seed_ht4_win: (4 * HT4_DICT_WINDOW) as u32,
+        seed_ht3: true,
+    })
 }
 
 const Q5_TO_8_CFGS: [QualityCfg; 4] = [
@@ -2960,7 +2915,7 @@ mod test {
                     lw,
                     false,
                     (data, end, window_size(wbits)),
-                    (&[], 0),
+                    (&[], 0, None),
                     &mut st,
                     sink,
                     cost_model,
@@ -2997,7 +2952,7 @@ mod test {
                     lw,
                     false,
                     (data, data.len(), window_size(wbits_v)),
-                    (&[], 0),
+                    (&[], 0, None),
                     &mut st,
                     sink,
                     cost_model,
@@ -3753,7 +3708,7 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
             PreparedDictionary::with_lgwin(dr, 5, 26),
         );
         EncoderInternal::<ArchQ5To8>::assert_stream_parity(
-            (25, 16, 1),
+            (25, 8, 1),
             24,
             QualityCfg::Q5,
             false,
@@ -3870,5 +3825,271 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
                 );
             }
         }
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn test_dict_simd_scalar_parity() {
+        let mut dict = tagged_bytes(miri_or(40, 1400), b"dict_shared_js_prefix_record_", 0);
+        dict.extend_from_slice(b"__TAIL4_ANCHOR__");
+        let mut cases = Vec::new();
+        let mut big = Vec::new();
+        for i in 0..miri_or(8, 32) {
+            big.extend_from_slice(
+                &dict[(i * 73) % (dict.len() / 2)..(i * 73) % (dict.len() / 2) + 256],
+            );
+            big.extend_from_slice(format!(";call({i});").as_bytes());
+        }
+        big.extend_from_slice(&dict[dict.len() - 64..]);
+        cases.push(big);
+        cases.push(b"TAIL4_ANCHOR____".to_vec());
+        let prep_raw = PreparedDictionary::with_lgwin(&dict, 5, 22);
+        let prep_seed = PreparedDictionary::with_lgwin(&dict, 7, 22);
+        let mlog = |l: u32| miri_or(12, l);
+
+        let tok = try_simd(true);
+        if tok.is_some() {
+            let check_fast = |inp: &[u8]| {
+                let cap = crate::fast_onepass::fast_twopass_max_output_size_for(
+                    inp.len(),
+                    FAST_Q2_CHUNK_SIZE,
+                );
+                let run0 = |simd| {
+                    let mut out = vec![0u8; cap];
+                    let mut bw = BitWriter::new(&mut out);
+                    crate::fast_onepass::compress_fast_with_tok(
+                        &mut crate::fast_onepass::OnePassEncoder::with_params(22, 5, mlog(14)),
+                        inp,
+                        Some(&prep_raw),
+                        &mut bw,
+                        simd,
+                    );
+                    bw.finalize().to_vec()
+                };
+                assert_eq!(run0(tok), run0(None));
+                for (mode, mls, chunk, log, slog) in [
+                    (1u8, 6u8, FAST_TWOPASS_CHUNK_SIZE, 16u32, 14u32),
+                    (2u8, 4u8, FAST_Q2_CHUNK_SIZE, 16u32, 15u32),
+                ] {
+                    let run_tp = |simd| {
+                        let mut out = vec![0u8; cap];
+                        let mut bw = BitWriter::new(&mut out);
+                        crate::fast_onepass::compress_fast_with_tok(
+                            &mut crate::fast_onepass::FastTwoPassEncoder::with_params(
+                                mode,
+                                22,
+                                chunk,
+                                mls,
+                                mlog(log),
+                                miri_or(11, slog),
+                            ),
+                            inp,
+                            Some(&prep_raw),
+                            &mut bw,
+                            simd,
+                        );
+                        bw.finalize().to_vec()
+                    };
+                    assert_eq!(run_tp(tok), run_tp(None));
+                }
+            };
+            for c in &cases {
+                check_fast(c);
+            }
+        }
+
+        EncoderInternal::<ArchQ3>::assert_stream_parity(
+            (25, 4, 1),
+            22,
+            QualityCfg::Q3,
+            false,
+            mlog(16),
+            &cases,
+            Some((&prep_raw, &dict)),
+        );
+        EncoderInternal::<ArchQ4>::assert_stream_parity(
+            (25, 8, 1),
+            22,
+            QualityCfg::Q4,
+            false,
+            mlog(15),
+            &cases,
+            Some((&prep_raw, &dict)),
+        );
+        for (qcfg, ways, ht4_ways, log) in [
+            (QualityCfg::Q5, 8, 1, 16),
+            (QualityCfg::Q6, 8, 4, 15),
+            (QualityCfg::Q6, 16, 4, 16),
+            (QualityCfg::Q7, 16, 4, 17),
+        ] {
+            let p = if qcfg.seed_ht_dict {
+                &prep_seed
+            } else {
+                &prep_raw
+            };
+            EncoderInternal::<ArchQ5To8>::assert_stream_parity(
+                (25, ways, ht4_ways),
+                22,
+                qcfg,
+                false,
+                mlog(log),
+                &cases,
+                Some((p, &dict)),
+            );
+        }
+    }
+
+    #[test]
+    fn test_large_dict_q0_q9_monotonic_and_roundtrip() {
+        if cfg!(miri) {
+            return;
+        }
+        use std::fmt::Write as _;
+        const STEMS: [&str; 64] = [
+            "auth", "bind", "calc", "data", "edge", "find", "grid", "hash", "init", "join", "keys",
+            "load", "mark", "node", "open", "pack", "quad", "read", "save", "tree", "unit", "view",
+            "wait", "xform", "yield", "zone", "acct", "blob", "cell", "diff", "elem", "flag",
+            "glob", "heap", "idxr", "json", "keep", "link", "memo", "next", "opts", "page", "qstr",
+            "root", "sort", "task", "user", "vdom", "walk", "xmit", "yaml", "zero", "area", "base",
+            "clip", "drag", "emit", "fold", "gain", "host", "info", "jump", "knob", "list",
+        ];
+        const PROPS: [&str; 32] = [
+            "apply", "build", "check", "decode", "encode", "filter", "getter", "handle", "insert",
+            "juggle", "keyOf", "lookup", "merge", "notify", "offset", "parse", "query", "reduce",
+            "select", "target", "update", "verify", "widget", "xScale", "yAxis", "zipmap", "abort",
+            "batch", "clone", "drain", "enter", "flush",
+        ];
+
+        let mut dict = Vec::with_capacity((1 << 20) + 256);
+        let mut state = 0x1234_5678_9ABC_DEF0u64;
+        let mut next_u32 = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 32) as u32
+        };
+        let mut snip = String::new();
+        while dict.len() < (1 << 20) {
+            snip.clear();
+            let a = next_u32();
+            let b = next_u32();
+            let s0 = STEMS[(a as usize) & 63];
+            let s1 = STEMS[((a >> 6) as usize) & 63];
+            let p0 = PROPS[((a >> 12) as usize) & 31];
+            let p1 = PROPS[((a >> 17) as usize) & 31];
+            let id = b & 0xFFFF;
+            let val = (b >> 16) ^ (a >> 20);
+            let _ = match (a >> 28) & 15 {
+                0 => writeln!(snip, "const {s0}_{id:x}={s1}.{p0}({val});"),
+                1 => writeln!(snip, "let {p0}_{id:x}=({s0})=>{s0}.{p1}({s1});"),
+                2 => writeln!(snip, "return {s1}.{p1}({id},{val:x});"),
+                3 => writeln!(snip, "if({s0}.{p0}({val})){{{s1}.{p1}({id});}}"),
+                4 => writeln!(snip, "export function {p0}{s0}(a){{return a.{p1}({id});}}"),
+                5 => writeln!(snip, "{s0}[{val}]=this.{p0}({s1},{id:x});"),
+                6 => writeln!(snip, "case {id}:{s0}.{p0}({val:x});break;"),
+                7 => writeln!(snip, "while({s1}.{p1}()){{{s0}+={val};}}"),
+                8 => writeln!(snip, "try{{{s0}.{p0}({val});}}catch(e){{{p1}(e);}}"),
+                9 => writeln!(snip, "{{\"{s0}\":{id},\"{p0}\":{val:x},\"{s1}\":1}}"),
+                10 => writeln!(snip, "{s0}.{p0}.{p1}=({id},{val:x});"),
+                11 => writeln!(snip, "await {s0}.{p0}({s1}.{p1}({id}));"),
+                12 => writeln!(snip, "throw new Error(\"{s0}:{p0}:{id:x}\");"),
+                13 => writeln!(snip, "for(let i=0;i<{val};++i){p0}({s0}[i]);"),
+                14 => writeln!(snip, "switch({s0}.{p0}){{default:return {id:x};}}"),
+                _ => writeln!(snip, "[\"{s0}_{p0}\",{id},\"{s1}_{p1}\",{val}];"),
+            };
+            dict.extend_from_slice(snip.as_bytes());
+        }
+        dict.truncate(1 << 20);
+
+        let mut payload = Vec::with_capacity(1_280 * 1024);
+        let mut local_i = 0usize;
+        while payload.len() < 1_200 * 1024 {
+            let r = next_u32();
+            let second_regime = payload.len() >= 600 * 1024;
+            if (r & 7) < 5 {
+                let span = 48 + ((r >> 3) as usize % 96);
+                let off = (next_u32() as usize) % (dict.len() - span);
+                payload.extend_from_slice(&dict[off..off + span]);
+            } else {
+                snip.clear();
+                let v0 = next_u32();
+                let v1 = next_u32();
+                let s = STEMS[(v0 as usize) & 63];
+                let s2 = STEMS[((v0 >> 16) as usize) & 31];
+                let p = PROPS[((v0 >> 6) as usize) & 31];
+                let id_lo = v0 & 0xFF;
+                let tag_lo = v1 & 0xFF;
+                let n_lo = local_i & 0xFF;
+                let _ = if !second_regime {
+                    match (v1 >> 30) & 3 {
+                        0 => writeln!(snip, "{s}_{p}({s2}.{p}({id_lo:x}),{n_lo});"),
+                        1 => writeln!(snip, "const r_{id_lo:x}={s}[{id_lo:x}]^{s2}[{tag_lo:x}];"),
+                        2 => writeln!(snip, "if({s}.{p}({tag_lo})){{return {s2}.{p}({id_lo});}}"),
+                        _ => writeln!(snip, "{s}({s2},{id_lo:x},{tag_lo:x},{n_lo});"),
+                    }
+                } else {
+                    match (v1 >> 30) & 3 {
+                        0 => writeln!(snip, "{{\"k\":\"{s}_{p}\",\"s\":\"{s2}\",\"v\":{tag_lo}}}"),
+                        1 => writeln!(snip, "{{\"id\":{id_lo},\"n\":\"{s}\",\"f\":{tag_lo:x}}}"),
+                        2 => writeln!(
+                            snip,
+                            "{{\"p\":\"{p}\",\"x\":{n_lo},\"h\":\"{s2}_{id_lo:x}\"}}"
+                        ),
+                        _ => writeln!(snip, "[\"{s}\",\"{p}\",\"{s2}\",{id_lo},{tag_lo}]"),
+                    }
+                };
+                payload.extend_from_slice(snip.as_bytes());
+                local_i += 1;
+            }
+        }
+
+        let nodict_q3 = compress_vec(3, 22, &payload);
+        let mut sizes = [0usize; 10];
+        for q in 0..=9 {
+            let prep = PreparedDictionary::with_lgwin(&dict, q, 22);
+            let mut enc = Encoder::with_lgwin(q, 22);
+            let comp = enc.compress_with_dict(&payload, &prep, None).unwrap();
+            assert_eq!(decompress_brotli_with_dict(comp, &dict), payload);
+            sizes[q as usize] = comp.len();
+        }
+        assert!(
+            sizes[3] * 2 < nodict_q3.len(),
+            "Q3 failed to achieve >2x dict savings: dcb={} nodict={}",
+            sizes[3],
+            nodict_q3.len()
+        );
+        for q in 1..=9usize {
+            assert!(
+                sizes[q] <= sizes[q - 1],
+                "non-monotonic dict size Q{}={} > Q{}={} (all: {:?})",
+                q,
+                sizes[q],
+                q - 1,
+                sizes[q - 1],
+                sizes
+            );
+        }
+
+        let prep_q4 = PreparedDictionary::with_lgwin(&dict, 4, 22);
+        let mut enc_q7 = Encoder::with_lgwin(7, 22);
+        let comp_4to7 = enc_q7.compress_with_dict(&payload, &prep_q4, None).unwrap();
+        assert_eq!(decompress_brotli_with_dict(comp_4to7, &dict), payload);
+        assert!(
+            comp_4to7.len() * 2 < nodict_q3.len(),
+            "cross-quality reuse prep=Q4->enc=Q7 failed >2x savings: dcb={} nodict={}",
+            comp_4to7.len(),
+            nodict_q3.len()
+        );
+
+        let prep_q7 = PreparedDictionary::with_lgwin(&dict, 7, 22);
+        let mut enc_q3 = Encoder::with_lgwin(3, 22);
+        let comp_7to3 = enc_q3.compress_with_dict(&payload, &prep_q7, None).unwrap();
+        assert_eq!(decompress_brotli_with_dict(comp_7to3, &dict), payload);
+        assert!(
+            comp_7to3.len() * 2 < nodict_q3.len(),
+            "cross-quality reuse prep=Q7->enc=Q3 failed >2x savings: dcb={} nodict={}",
+            comp_7to3.len(),
+            nodict_q3.len()
+        );
     }
 }

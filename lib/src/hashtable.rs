@@ -62,9 +62,11 @@ pub(crate) struct QualityCfg {
     pub(crate) nice_len: u16,
     pub(crate) max_lit_clusters: u8,
     pub(crate) ctx_block_split: bool,
+    pub(crate) seed_ht_dict: bool,
 }
 
 impl QualityCfg {
+    #[allow(clippy::too_many_arguments)]
     const fn new(
         max_insert_len: u16,
         nice_len: u16,
@@ -72,6 +74,7 @@ impl QualityCfg {
         sd_mult: usize,
         max_lit_clusters: u8,
         ctx_block_split: bool,
+        seed_ht_dict: bool,
     ) -> Self {
         Self {
             min_gain_for_greedy,
@@ -80,15 +83,16 @@ impl QualityCfg {
             nice_len,
             max_lit_clusters,
             ctx_block_split,
+            seed_ht_dict,
         }
     }
-    pub(crate) const Q3: Self = Self::new(2, 40, 0, 8, 0, false);
-    pub(crate) const Q4: Self = Self::new(8, 48, 1024, 1, 0, false);
-    pub(crate) const Q5: Self = Self::new(40, 96, 2048, 4, 4, false);
-    pub(crate) const Q6: Self = Self::new(64, 128, 3072, 4, 6, false);
-    pub(crate) const Q7: Self = Self::new(128, 224, i32::MAX, 8, 8, false);
-    pub(crate) const Q8: Self = Self::new(192, 256, i32::MAX, 16, 10, true);
-    pub(crate) const Q9: Self = Self::new(512, 512, i32::MAX, 16, 16, true);
+    pub(crate) const Q3: Self = Self::new(2, 40, 0, 8, 0, false, false);
+    pub(crate) const Q4: Self = Self::new(8, 48, 1024, 1, 0, false, false);
+    pub(crate) const Q5: Self = Self::new(40, 96, 2048, 4, 4, false, false);
+    pub(crate) const Q6: Self = Self::new(64, 128, 3072, 4, 6, false, true);
+    pub(crate) const Q7: Self = Self::new(128, 224, i32::MAX, 8, 8, false, true);
+    pub(crate) const Q8: Self = Self::new(192, 256, i32::MAX, 16, 10, true, true);
+    pub(crate) const Q9: Self = Self::new(512, 512, i32::MAX, 16, 16, true, true);
 }
 
 /// Structural compile-time archetype for `Q3..=Q9` (`MIN_MATCH_LEN == 4` and `USE_LAST_DISTANCES`
@@ -297,10 +301,195 @@ struct PreparedDictTables {
     end_vpos: usize,
 }
 
+#[cfg(target_arch = "x86_64")]
+#[simd_entry]
+#[inline]
+#[target_feature(enable = "avx2")]
+fn raw_dict_search4_avx2(bucket: &[u32; 4], tag8: u32, _tok: impl SimdToken) -> u32 {
+    let v = _mm_loadu_si128(bucket);
+    let eq = _mm_cmpeq_epi32(_mm_srli_epi32::<24>(v), _mm_set1_epi32(tag8 as i32));
+    _mm_movemask_ps(_mm_castsi128_ps(eq)) as u32
+}
+
+#[cfg(target_arch = "aarch64")]
+#[simd_entry]
+#[inline]
+#[target_feature(enable = "neon")]
+fn raw_dict_search4_neon(bucket: &[u32; 4], tag8: u32, _tok: impl SimdToken) -> u32 {
+    let vt = vdupq_n_u32(tag8);
+    let c0 = vceqq_u32(vshrq_n_u32::<24>(vld1q_u32(bucket)), vt);
+    let w0 = vld1q_u32(&[1u32, 2, 4, 8]);
+    vaddvq_u32(vandq_u32(c0, w0))
+}
+
+#[inline(always)]
+fn raw_dict_search4_scalar(bucket: &[u32; 4], tag8: u32) -> u32 {
+    let mut m = 0u32;
+    for (i, &e) in bucket.iter().enumerate() {
+        m |= u32::from((e >> 24) == tag8) << i;
+    }
+    m
+}
+
+/// Immutable, shared read-only hash index over the trailing `<= 16 MiB - 1` bytes of a
+/// [`PreparedDictionary`] for `Q0..=Q5` without per-input table snapshots or FIFO eviction.
+pub(crate) struct RawDictIndex {
+    buckets4: Box<[[u32; 4]]>,
+    ht4: Box<[u32]>,
+    shift8: u32,
+    mask8: usize,
+    shift4: u32,
+    mask4: usize,
+}
+
+impl RawDictIndex {
+    fn build(bytes: &[u8]) -> Self {
+        let idx_bytes = &bytes[bytes.len().saturating_sub(0x00FF_FFFF)..];
+        let idx_len = idx_bytes.len();
+        let (buckets4, shift8, mask8) = if idx_len >= 8 {
+            let log8: u32 = if cfg!(miri) || idx_len <= 16_384 {
+                11
+            } else if idx_len <= 65_536 {
+                13
+            } else if idx_len <= 262_144 {
+                15
+            } else if idx_len <= 524_288 {
+                16
+            } else {
+                17
+            };
+            let nb = 1usize << log8;
+            let shift8 = 64 - log8;
+            let mask8 = nb - 1;
+            let mut buckets = vec![[0u32; 4]; nb].into_boxed_slice();
+            let mut counts = vec![0u8; nb];
+            for off in (0..=idx_len - 8).rev() {
+                let w = u64::from_le_bytes(*idx_bytes[off..off + 8].first_chunk::<8>().unwrap());
+                let (p64, sec_h, _) = hash8_p64(w);
+                let b = ((p64 >> shift8) as usize) & mask8;
+                let cnt = counts[b] as usize;
+                if cnt < 4 {
+                    if cnt > 0 && off + 16 <= idx_len {
+                        let prev_rem = (buckets[b][cnt - 1] & 0x00FF_FFFF) as usize;
+                        let prev_off = idx_len - prev_rem;
+                        if prev_off + 16 <= idx_len
+                            && idx_bytes[off..off + 16] == idx_bytes[prev_off..prev_off + 16]
+                        {
+                            continue;
+                        }
+                    }
+                    buckets[b][cnt] = (sec_h & 0xFF00_0000) | ((idx_len - off) as u32);
+                    counts[b] = (cnt + 1) as u8;
+                }
+            }
+            (buckets, shift8, mask8)
+        } else {
+            (Box::default(), 0, 0)
+        };
+        let (ht4, shift4, mask4) = if idx_len >= 4 {
+            let win4 = idx_len.min(4 * HT4_DICT_WINDOW);
+            let log4: u32 = if cfg!(miri) || win4 <= 16_384 {
+                if cfg!(miri) {
+                    11
+                } else {
+                    13
+                }
+            } else {
+                15
+            };
+            let shift4 = 32 - log4;
+            let mask4 = (1usize << log4) - 1;
+            let mut tbl = vec![0u32; 1usize << log4].into_boxed_slice();
+            for off in (idx_len - win4)..=(idx_len - 4) {
+                let p32 = u32::from_le_bytes(*idx_bytes[off..off + 4].first_chunk::<4>().unwrap())
+                    .wrapping_mul(HASH_MUL32);
+                tbl[((p32 >> shift4) as usize) & mask4] =
+                    (p32 & 0xFF00_0000) | ((idx_len - off) as u32);
+            }
+            (tbl, shift4, mask4)
+        } else {
+            (Box::default(), 0, 0)
+        };
+        Self {
+            buckets4,
+            ht4,
+            shift8,
+            mask8,
+            shift4,
+            mask4,
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn bucket4(&self, p64: u64) -> Option<&[u32; 4]> {
+        if self.buckets4.is_empty() {
+            None
+        } else {
+            Some(&self.buckets4[((p64 >> self.shift8) as usize) & self.mask8])
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn prefetch4<S: SimdBackend>(&self, simd: S, p64: u64) {
+        if const { S::IS_SIMD } {
+            if let Some(b) = self.bucket4(p64) {
+                simd.prefetch_t0(b);
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn probe4_one(&self, p64: u64, sec_hash: u32, max_rem: u32) -> u32 {
+        let Some(b) = self.bucket4(p64) else {
+            return 0;
+        };
+        let e = b[0];
+        let rem = e & 0x00FF_FFFF;
+        if ((e ^ sec_hash) >> 24) == 0 && (1..=max_rem).contains(&rem) {
+            rem
+        } else {
+            0
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn probe_ht4(&self, p32: u32, max_rem: u32) -> u32 {
+        if self.ht4.is_empty() {
+            return 0;
+        }
+        let e = self.ht4[((p32 >> self.shift4) as usize) & self.mask4];
+        let rem = e & 0x00FF_FFFF;
+        if ((e ^ p32) >> 24) == 0 && (1..=max_rem).contains(&rem) {
+            rem
+        } else {
+            0
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn search4_mask<S: SimdBackend>(
+        &self,
+        simd: S,
+        p64: u64,
+        sec_hash: u32,
+    ) -> Option<(&[u32; 4], u32)> {
+        let bucket = self.bucket4(p64)?;
+        let tag8 = sec_hash >> 24;
+        let mask = dispatch_simd!(
+            simd,
+            S => x64: |tok| raw_dict_search4_avx2(bucket, tag8, tok),
+            neon: |tok| raw_dict_search4_neon(bucket, tag8, tok),
+            scalar: raw_dict_search4_scalar(bucket, tag8),
+        );
+        Some((bucket, mask))
+    }
+}
+
 struct PreparedDictInner {
     bytes: Box<[u8]>,
     raw_len: usize,
     quality_hint: u8,
+    raw_index: std::sync::OnceLock<RawDictIndex>,
     entries: std::sync::OnceLock<Box<[DictEntry]>>,
     dict_chain: std::sync::OnceLock<Option<crate::q11::DictChain>>,
     tables_cache: std::sync::RwLock<Vec<std::sync::Arc<PreparedDictTables>>>,
@@ -335,8 +524,16 @@ impl PreparedDictionary {
         let dict = &dict[dict.len().saturating_sub(Self::MAX_RAW_LEN)..];
         let raw_len = dict.len();
         let bytes: Box<[u8]> = dict[raw_len.saturating_sub(window_size(wbits))..].into();
-        let (entries, dict_chain) = (std::sync::OnceLock::new(), std::sync::OnceLock::new());
-        if quality <= 9 {
+        let (raw_index, entries, dict_chain) = (
+            std::sync::OnceLock::new(),
+            std::sync::OnceLock::new(),
+            std::sync::OnceLock::new(),
+        );
+        if quality <= 5 {
+            if !bytes.is_empty() {
+                let _ = raw_index.set(RawDictIndex::build(&bytes));
+            }
+        } else if quality <= 9 {
             let _ = entries.set(build_dict_entries(&bytes, quality as usize));
         } else {
             let _ = dict_chain.set(crate::q11::DictChain::new(&bytes));
@@ -345,11 +542,12 @@ impl PreparedDictionary {
             bytes,
             raw_len,
             quality_hint: quality.min(12) as u8,
+            raw_index,
             entries,
             dict_chain,
             tables_cache: std::sync::RwLock::new(Vec::new()),
         }));
-        if !cfg!(miri) && quality <= 9 && !prep.0.bytes.is_empty() {
+        if !cfg!(miri) && (6..=9).contains(&quality) && !prep.0.bytes.is_empty() {
             if let Some(key) =
                 crate::compress::canonical_dict_key(quality, wbits, prep.0.bytes.len())
             {
@@ -378,10 +576,22 @@ impl PreparedDictionary {
     }
 
     #[inline]
-    pub(crate) fn entries(&self) -> &[DictEntry] {
+    pub(crate) fn raw_index(&self) -> &RawDictIndex {
         self.0
-            .entries
-            .get_or_init(|| build_dict_entries(&self.0.bytes, self.0.quality_hint as usize))
+            .raw_index
+            .get_or_init(|| RawDictIndex::build(&self.0.bytes))
+    }
+
+    #[inline]
+    pub(crate) fn entries(&self) -> &[DictEntry] {
+        self.0.entries.get_or_init(|| {
+            let q = if (6..=9).contains(&self.0.quality_hint) {
+                self.0.quality_hint as usize
+            } else {
+                9
+            };
+            build_dict_entries(&self.0.bytes, q)
+        })
     }
 
     #[inline]
@@ -1557,6 +1767,53 @@ fn common_prefix_from<const START: usize, S: SimdBackend>(
 }
 
 #[inline(always)]
+pub(crate) fn common_prefix_slices_from_16<S: SimdBackend>(simd: S, a: &[u8], b: &[u8]) -> usize {
+    let limit = MAX_COPY_LEN.min(a.len()).min(b.len());
+    if limit <= 16 {
+        return limit;
+    }
+    dispatch_simd!(
+        simd,
+        S => |tok| {
+            let (a, b) = (&a[..limit], &b[..limit]);
+            let mut off = 16;
+            while let (Some(s1), Some(s2)) = (
+                a.get(off..).and_then(|s| s.first_chunk::<32>()),
+                b.get(off..).and_then(|s| s.first_chunk::<32>()),
+            ) {
+                let mask = diff_mask32(s1, s2, tok);
+                if mask != 0 {
+                    return off + mask.trailing_zeros() as usize;
+                }
+                off += 32;
+            }
+            if off < limit {
+                if let (Some(s1), Some(s2)) = (
+                    a.get(off..).and_then(|s| s.first_chunk::<16>()),
+                    b.get(off..).and_then(|s| s.first_chunk::<16>()),
+                ) {
+                    let m = diff_mask16(s1, s2, tok);
+                    if m != 0 {
+                        return off + m.trailing_zeros() as usize;
+                    }
+                    off += 16;
+                }
+                if off < limit {
+                    if let (Some(s1), Some(s2)) = (a.last_chunk::<16>(), b.last_chunk::<16>()) {
+                        let m = diff_mask16(s1, s2, tok);
+                        if m != 0 {
+                            return limit - 16 + m.trailing_zeros() as usize;
+                        }
+                    }
+                }
+            }
+            limit
+        },
+        16 + common_prefix_len(&a[16..limit], &b[16..limit], limit - 16)
+    )
+}
+
+#[inline(always)]
 pub(crate) fn longest_match_from_16<S: SimdBackend>(
     simd: S,
     data: &[u8],
@@ -1682,35 +1939,39 @@ pub(crate) fn extend_match_backward(
     if pos <= min_match_pos || *match_len >= MAX_COPY_LEN {
         return pos;
     }
-    if dist < pos {
-        if let Some(dst_end) = data.get(..pos) {
-            let s_end = pos - dist;
-            if let (Some(d8), Some(s8)) = (
-                dst_end.last_chunk::<8>(),
-                dst_end[..s_end].last_chunk::<8>(),
-            ) {
-                let diff = u64::from_le_bytes(*d8) ^ u64::from_le_bytes(*s8);
-                let max_back = (pos - min_match_pos).min(MAX_COPY_LEN - *match_len);
-                if diff != 0 {
-                    let ext = ((diff.leading_zeros() >> 3) as usize).min(max_back);
-                    *match_len += ext;
-                    return pos - ext;
-                }
-                if max_back <= 8 {
-                    *match_len += max_back;
-                    return pos - max_back;
-                }
-                *match_len += 8;
-                return extend_match_backward_slow(
-                    has_dict,
-                    data,
-                    active_dict,
-                    pos - 8,
-                    dist,
-                    min_match_pos,
-                    match_len,
-                );
+    let src_end_slice = if dist < pos {
+        pos.checked_sub(dist).and_then(|s_end| data.get(..s_end))
+    } else if has_dict && dist > pos {
+        active_dict
+            .len()
+            .checked_sub(dist - pos)
+            .and_then(|e| active_dict.get(..e))
+    } else {
+        None
+    };
+    if let (Some(dst_end), Some(s_end)) = (data.get(..pos), src_end_slice) {
+        if let (Some(d8), Some(s8)) = (dst_end.last_chunk::<8>(), s_end.last_chunk::<8>()) {
+            let diff = u64::from_le_bytes(*d8) ^ u64::from_le_bytes(*s8);
+            let max_back = (pos - min_match_pos).min(MAX_COPY_LEN - *match_len);
+            if diff != 0 {
+                let ext = ((diff.leading_zeros() >> 3) as usize).min(max_back);
+                *match_len += ext;
+                return pos - ext;
             }
+            if max_back <= 8 {
+                *match_len += max_back;
+                return pos - max_back;
+            }
+            *match_len += 8;
+            return extend_match_backward_slow(
+                has_dict,
+                data,
+                active_dict,
+                pos - 8,
+                dist,
+                min_match_pos,
+                match_len,
+            );
         }
     }
     extend_match_backward_slow(
@@ -2182,6 +2443,7 @@ fn compute_hash3(word64: u64) -> BoundedUsize<HT3_MASK> {
 pub(crate) struct SliceEnv<'a> {
     data: &'a [u8],
     active_dict: &'a [u8],
+    dict_idx: Option<&'a RawDictIndex>,
     model: &'a SliceCostModel,
     ldm_spans: &'a [FastLdmSpan],
     bounds: (usize, usize),
@@ -2460,8 +2722,7 @@ impl<'a> ProbeCtx<'a> {
         lit_q5 - cmd_q5
     }
 
-    #[cold]
-    #[inline(never)]
+    #[inline(always)]
     fn cross_dict_len(&self, dist: usize, best_len: u32) -> u32 {
         let (data, dict, pos) = (self.env.data, self.env.active_dict, self.pos);
         if dist <= pos {
@@ -2494,6 +2755,70 @@ impl<'a> ProbeCtx<'a> {
             }
         }
         0
+    }
+
+    #[inline(always)]
+    fn cross_dict_rem_at_cursor<S: SimdBackend>(
+        &self,
+        simd: S,
+        at_pos: BoundedPrefixCursor<'_, u8, 16>,
+        rem: usize,
+        best_len: u32,
+        min_w: u32,
+    ) -> u32 {
+        let (data, dict, pos) = (self.env.data, self.env.active_dict, self.pos);
+        let bl = best_len.max(min_w - 1) as usize;
+        let chk4 = bl >= 3;
+        if rem == 0 || rem > dict.len() || (chk4 && (rem < 4 || rem <= bl)) {
+            return 0;
+        }
+        let off = dict.len() - rem;
+        let s = &dict[off..];
+        let l = if let Some(c8) = s.first_chunk::<8>() {
+            let diff0 = u64::from_le_bytes(*c8) ^ self.word64;
+            if diff0 != 0 {
+                let first = diff0.trailing_zeros() >> 3;
+                if chk4 && first <= bl as u32 {
+                    return 0;
+                }
+                first
+            } else if chk4 && bl >= 8 && !eq_chunk4(s, bl - 3, data, pos + bl - 3) {
+                return 0;
+            } else if let Some(s16) = s.first_chunk::<16>() {
+                let diff8 =
+                    u64::from_le_bytes(*s16.last_chunk::<8>().unwrap()) ^ at_pos.load_u64_le::<8>();
+                if diff8 != 0 {
+                    8 + (diff8.trailing_zeros() >> 3)
+                } else {
+                    common_prefix_slices_from_16(simd, s, &data[pos..]) as u32
+                }
+            } else {
+                8 + common_prefix_len(&s[8..], &data[pos + 8..], MAX_COPY_LEN - 8) as u32
+            }
+        } else if min_w >= 8 {
+            return 0;
+        } else if let Some(c4) = s.first_chunk::<4>() {
+            let diff32 = u32::from_le_bytes(*c4) ^ (self.word64 as u32);
+            if diff32 != 0 {
+                if chk4 {
+                    return 0;
+                }
+                diff32.trailing_zeros() >> 3
+            } else if chk4 && bl >= 4 && !eq_chunk4(s, bl - 3, data, pos + bl - 3) {
+                return 0;
+            } else {
+                4 + common_prefix_len(&s[4..], &data[pos + 4..], MAX_COPY_LEN - 4) as u32
+            }
+        } else if chk4 {
+            return 0;
+        } else {
+            common_prefix_len(s, &data[pos..], MAX_COPY_LEN) as u32
+        };
+        if l >= min_w {
+            l
+        } else {
+            0
+        }
     }
 
     #[inline(always)]
@@ -2533,16 +2858,6 @@ impl<'a> ProbeCtx<'a> {
     }
 
     #[inline(always)]
-    fn cross_dict_ge(&self, du: usize, best_len: u32, min_w: u32) -> u32 {
-        let l = self.cross_dict_len(du, best_len.max(min_w - 1));
-        if l >= min_w {
-            l
-        } else {
-            0
-        }
-    }
-
-    #[inline(always)]
     fn lookback_len<S: SimdBackend>(
         &self,
         simd: S,
@@ -2558,7 +2873,7 @@ impl<'a> ProbeCtx<'a> {
                 return if min8 { 0 } else { diff0.trailing_zeros() >> 3 };
             }
             self.in_win_tail8(simd, at_pos, c16, du, best_len)
-        } else if has_dict {
+        } else if has_dict && du > self.pos {
             let min_w = if min8 {
                 8
             } else if allow_sub4 {
@@ -2566,7 +2881,7 @@ impl<'a> ProbeCtx<'a> {
             } else {
                 4
             };
-            self.cross_dict_ge(du, best_len, min_w)
+            self.cross_dict_rem_at_cursor(simd, at_pos, du - self.pos, best_len, min_w)
         } else {
             0
         }
@@ -2599,6 +2914,44 @@ impl<'a> ProbeCtx<'a> {
                     best.len,
                     (C::FAST_MATCHING, false),
                 );
+                if best.try_lz(len, len, dist, self, acfg) {
+                    improved = true;
+                    if len >= nice_len {
+                        break;
+                    }
+                }
+            }
+        }
+        improved
+    }
+
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn scan_dict_candidates<S: SimdBackend, C: MatchConfig>(
+        &self,
+        simd: S,
+        d_idx: &RawDictIndex,
+        p64: u64,
+        sec_hash: u32,
+        max_rem: u32,
+        at_pos: BoundedPrefixCursor<'_, u8, 16>,
+        best: &mut BestMatch,
+    ) -> bool {
+        let Some((bucket, mut mask)) = d_idx.search4_mask(simd, p64, sec_hash) else {
+            return false;
+        };
+        if mask == 0 {
+            return false;
+        }
+        let acfg = const { arch_cfg::<C>() };
+        let (mut improved, nice_len) = (false, self.env.qcfg.nice_len as u32);
+        while mask != 0 {
+            let idx = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            let rem = *bucket.bget_masked(idx) & 0x00FF_FFFF;
+            if (1..=max_rem).contains(&rem) {
+                let len = self.cross_dict_rem_at_cursor(simd, at_pos, rem as usize, best.len, 8);
+                let dist = (self.pos as u32) + rem;
                 if best.try_lz(len, len, dist, self, acfg) {
                     improved = true;
                     if len >= nice_len {
@@ -2864,6 +3217,10 @@ impl TableSlices1<'_> {
 
 trait InteriorOps<S: SimdBackend> {
     #[inline(always)]
+    fn may_use_dict_idx(&self, _: S) -> bool {
+        true
+    }
+    #[inline(always)]
     fn is_ht4_one(&self, _: S) -> bool {
         false
     }
@@ -3013,6 +3370,10 @@ impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize>
 impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize, S: SimdBackend> InteriorOps<S>
     for InteriorTables<'_, POS_BITS, WAYS, HT4_WAYS>
 {
+    #[inline(always)]
+    fn may_use_dict_idx(&self, _: S) -> bool {
+        const { WAYS <= 8 }
+    }
     #[inline(always)]
     fn is_ht4_one(&self, _: S) -> bool {
         const { HT4_WAYS == 1 }
@@ -3410,6 +3771,10 @@ pub(crate) struct HashTable {
 }
 
 impl InteriorOps<Scalar> for HashTable {
+    #[inline(always)]
+    fn may_use_dict_idx(&self, _: Scalar) -> bool {
+        self.ways <= 8
+    }
     #[inline(always)]
     fn step_ht3(&mut self, _: Scalar, word64: u64, vpos: u32) -> u32 {
         let Some(t3) = self.ht3.as_deref_mut() else {
@@ -4009,10 +4374,14 @@ def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| 
     };
     let lw_ldm = large_window && !ldm_spans.is_empty();
     let eff_w32 = eff_wsize as u32;
-    let (d_len, d_full_len) = if has_dict {
-        (active_dict.len(), env.win.2)
+    let (d_len, d_full_len, max_dict_pos) = if has_dict {
+        (
+            active_dict.len(),
+            env.win.2,
+            if stream_base == 0 { wsize } else { 0 },
+        )
     } else {
-        (0, 0)
+        (0, 0, 0)
     };
     let (max_d4, lazy_margin) = (model.max_d4.min(eff_w32), model.lazy_margin);
     let (mut dists, mut dists4) = ([0u32; 32], [0u32; 32]);
@@ -4030,6 +4399,15 @@ def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| 
             PREFETCH_OFFSET
         };
         ht.prefetch_ahead::<C>(simd, pfx16, pos + pf_off);
+        if has_dict && ht.may_use_dict_idx(simd) && !C::FAST_MATCHING && unm >= 2 {
+            if let Some(d_idx) = env.dict_idx {
+                if pos + pf_off < max_dict_pos {
+                    let pf_p64 = u64::from_le_bytes(*pfx16.get_sub_clamped::<8, 0>(pos + pf_off))
+                        .wrapping_mul(HASH_MUL64);
+                    d_idx.prefetch4(simd, pf_p64);
+                }
+            }
+        }
         let vpos = vpos_base.wrapping_add(pos) as u32;
         let mut mask = ht.search_main(simd, p64, vpos, sec_hash, eff_w32, &mut dists);
         let prev_vpos3 = if const { C::USE_3B_TABLE } && !hl && unm < 64 {
@@ -4075,8 +4453,14 @@ def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| 
                                         pctx.in_win_tail8(simd, at_pos, c16, du, rep_bl)
                                     }
                                 }
-                            } else if has_dict {
-                                pctx.cross_dict_ge(du, rep_bl, if allow_sub4 { 2 } else { 4 })
+                            } else if has_dict && du > pos {
+                                pctx.cross_dict_rem_at_cursor(
+                                    simd,
+                                    at_pos,
+                                    du - pos,
+                                    rep_bl,
+                                    if allow_sub4 { 2 } else { 4 },
+                                )
                             } else {
                                 0
                             };
@@ -4106,6 +4490,27 @@ def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| 
         if pctx.scan_main_candidates::<S, C>(simd, has_dict, at_pos, &dists, mask, &mut best) {
             best_is_rep = false;
         }
+        let max_local_for_dict = if C::FAST_MATCHING { 8 } else { 16 };
+        if has_dict
+            && ht.may_use_dict_idx(simd)
+            && best.len < max_local_for_dict
+            && !(hl && lazy.len >= 16)
+            && pos < max_dict_pos
+        {
+            if let Some(d_idx) = env.dict_idx {
+                if pctx.scan_dict_candidates::<S, C>(
+                    simd,
+                    d_idx,
+                    p64,
+                    sec_hash,
+                    (max_dict_pos - pos).min(d_len) as u32,
+                    at_pos,
+                    &mut best,
+                ) {
+                    best_is_rep = false;
+                }
+            }
+        }
 
         if lw_ldm && best.len < 32 {
             if let Some((sp_start, sp_end, sp_dist)) =
@@ -4129,16 +4534,7 @@ def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| 
 
         if const { C::FAST_MATCHING } {
             if best.len < 8 && unm < 128 {
-                let d4 = ht.search_ht4_one(simd, p32, vpos, eff_w32);
-                if d4 != 0 && d4 != best.dist {
-                    let len4 = pctx.lookback_len(
-                        simd,
-                        has_dict,
-                        at_pos,
-                        d4 as usize,
-                        best.len,
-                        (false, false),
-                    );
+                let try_fast_ht4 = |d4: u32, len4: u32, best: &mut BestMatch, rep: &mut bool| {
                     let near_rep = d4.wrapping_sub(last_distances[0]).wrapping_add(2) <= 4
                         || d4.wrapping_sub(last_distances[1]).wrapping_add(2) <= 4;
                     let max_d = match len4 {
@@ -4157,7 +4553,41 @@ def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| 
                         && (near_rep || d4 <= max_d)
                         && best.try_lz(len4, len4, d4, &pctx, acfg)
                     {
-                        best_is_rep = false;
+                        *rep = false;
+                    }
+                };
+                let d4 = ht.search_ht4_one(simd, p32, vpos, eff_w32);
+                if d4 != 0 && d4 != best.dist {
+                    let len4 = pctx.lookback_len(
+                        simd,
+                        has_dict,
+                        at_pos,
+                        d4 as usize,
+                        best.len,
+                        (false, false),
+                    );
+                    try_fast_ht4(d4, len4, &mut best, &mut best_is_rep);
+                }
+                if has_dict
+                    && ht.may_use_dict_idx(simd)
+                    && best.len < 8
+                    && pos < max_dict_pos.min(HT4_DICT_WINDOW)
+                {
+                    if let Some(d_idx) = env.dict_idx {
+                        let rem4 = d_idx.probe_ht4(p32, (max_dict_pos - pos).min(d_len) as u32);
+                        if rem4 != 0 {
+                            let d4_dict = (pos as u32) + rem4;
+                            if d4_dict != best.dist {
+                                let len4 = pctx.cross_dict_rem_at_cursor(
+                                    simd,
+                                    at_pos,
+                                    rem4 as usize,
+                                    best.len,
+                                    4,
+                                );
+                                try_fast_ht4(d4_dict, len4, &mut best, &mut best_is_rep);
+                            }
+                        }
                     }
                 }
             }
@@ -4201,6 +4631,31 @@ def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| 
                                     if len4 >= nice_len {
                                         break;
                                     }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if has_dict
+                && ht.may_use_dict_idx(simd)
+                && best.len < 8
+                && pos < max_dict_pos.min(HT4_DICT_WINDOW)
+            {
+                if let Some(d_idx) = env.dict_idx {
+                    let rem4 = d_idx.probe_ht4(p32, (max_dict_pos - pos).min(d_len) as u32);
+                    if rem4 != 0 {
+                        let d4 = (pos as u32) + rem4;
+                        if d4 != best.dist {
+                            let len4 =
+                                pctx.cross_dict_rem_at_cursor(simd, at_pos, rem4 as usize, 0, 4);
+                            if len4 >= 4
+                                && (len4 > 4 || d4 <= max_d4)
+                                && (len4 > best.len || d4 < best.dist)
+                            {
+                                let gain = pctx.score(acfg, len4, d4);
+                                if gain > best.gain {
+                                    best.set(d4, len4, len4, gain);
                                 }
                             }
                         }
@@ -4300,15 +4755,33 @@ def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| 
                         copy_len: 0,
                         gain: best.gain + 16,
                     };
-                    if pctx1
-                        .scan_main_candidates::<S, C>(simd, has_dict, at_p1, &dists, m1, &mut b1)
+                    let mut found1 = pctx1
+                        .scan_main_candidates::<S, C>(simd, has_dict, at_p1, &dists, m1, &mut b1);
+                    if has_dict
+                        && ht.may_use_dict_idx(simd)
+                        && b1.len < nice_len
+                        && p1 < max_dict_pos
                     {
+                        if let Some(d_idx) = env.dict_idx {
+                            found1 |= pctx1.scan_dict_candidates::<S, C>(
+                                simd,
+                                d_idx,
+                                p64_1,
+                                sh1,
+                                (max_dict_pos - p1).min(d_len) as u32,
+                                at_p1,
+                                &mut b1,
+                            );
+                        }
+                    }
+                    if found1 {
                         (pos, best, next_ins_start) = (p1, b1, p1 + 1);
                     }
                 }
             }
             let back = (C::STEP_SHIFT < 32
-                || (large_window && best.dist > FAST_LDM_MIN_DIST as u32))
+                || (large_window && best.dist > FAST_LDM_MIN_DIST as u32)
+                || (has_dict && env.dict_idx.is_some() && (best.dist as usize) > pos))
                 && !hl
                 && best.len >= 4;
             (pos, best, next_ins_start, back)
@@ -4374,7 +4847,7 @@ impl HashTable {
                 load_word64_padded(&data[pos..]),
                 vpos_base.wrapping_add(pos) as u32,
             );
-            let (p64, _, p32) = hash8_p64(word64);
+            let (p64, sec_h, p32) = hash8_p64(word64);
             let pctx = ProbeCtx::from_pos(env, acfg.lvl, anchor, pos, word64, ld);
             let mut best = BestMatch::new(acfg.fast);
             let newest_d = |s: &[u32], heads: &[u8], row: usize, w: usize| {
@@ -4405,9 +4878,46 @@ impl HashTable {
             } else {
                 0
             };
+            let (dm_dict, dh4_dict) =
+                if hd && self.may_use_dict_idx(Scalar) && env.stream_base == 0 && pos < wsize {
+                    if let Some(d_idx) = env.dict_idx {
+                        let mr = (wsize - pos).min(d_len) as u32;
+                        let dm = if pos + 8 <= len_data {
+                            let r = d_idx.probe4_one(p64, sec_h, mr);
+                            if r != 0 {
+                                (pos as u32) + r
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        };
+                        let dh4 = if pos < HT4_DICT_WINDOW {
+                            let r = d_idx.probe_ht4(p32, mr);
+                            if r != 0 {
+                                (pos as u32) + r
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        };
+                        (dm, dh4)
+                    } else {
+                        (0, 0)
+                    }
+                } else {
+                    (0, 0)
+                };
             let max_d = (pos + d_len).min(wsize).min(eff_wsize) as u32;
-            for d in [if pos > anchor { ld[0] } else { 0 }, m_d, h4_d] {
-                if (1..=max_d).contains(&d) && (!acfg.fast || d != h4_d || d <= env.model.max_d4) {
+            for (d, is_h4) in [
+                (if pos > anchor { ld[0] } else { 0 }, false),
+                (m_d, false),
+                (h4_d, h4_d != m_d),
+                (dm_dict, false),
+                (dh4_dict, true),
+            ] {
+                if (1..=max_d).contains(&d) && (!acfg.fast || !is_h4 || d <= env.model.max_d4) {
                     let mlen = pctx.cross_len(hd, d as usize, 0);
                     let _ = best.try_lz(mlen, mlen, d, &pctx, acfg);
                 }
@@ -4442,7 +4952,7 @@ impl HashTable {
         large_window: bool,
         has_dict: bool,
         (data, target_end, wsize): (&[u8], usize, usize),
-        (active_dict, full_dict_len): (&[u8], usize),
+        (active_dict, full_dict_len, dict_idx): (&[u8], usize, Option<&RawDictIndex>),
         state: &mut SliceParseState,
         md: &mut MetablockSink<'_>,
         model: &SliceCostModel,
@@ -4490,6 +5000,7 @@ impl HashTable {
         let env = SliceEnv {
             data,
             active_dict,
+            dict_idx,
             model,
             ldm_spans: &ldm_spans,
             bounds: (slice_start, interior_end),
@@ -4814,6 +5325,35 @@ mod test {
             if (m4u & (1 << i)) != 0 {
                 assert_eq!(d_u[i], d_c[i]);
             }
+        }
+    }
+
+    #[test]
+    fn test_raw_dict_search4_simd_parity() {
+        let cap = if cfg!(miri) { 2 * 1024 } else { 64 * 1024 };
+        let mut dict = Vec::with_capacity(cap);
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..cap {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            dict.push((s >> 56) as u8);
+        }
+        let idx = super::RawDictIndex::build(&dict);
+        let simd = crate::constants::try_simd(true);
+        for off in (0..dict.len() - 8).step_by(37) {
+            let w = u64::from_le_bytes(*dict[off..off + 8].first_chunk::<8>().unwrap());
+            let (p64, sec, _) = super::hash8_p64(w);
+            let res_scalar = idx.search4_mask(Scalar, p64, sec);
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            if let Some(tok) = simd {
+                let res_simd = idx.search4_mask(tok, p64, sec);
+                assert_eq!(
+                    res_simd.map(|(b, m)| (*b, m)),
+                    res_scalar.map(|(b, m)| (*b, m))
+                );
+            }
+            let _ = (simd, res_scalar);
         }
     }
 }

@@ -22,10 +22,11 @@
 use crate::compress::{accum_quad, accum_slice_4bank, should_emit_uncompressed};
 use crate::constants::*;
 use crate::hashtable::{
-    clamp_ldm_next_pos, common_prefix_len, extend_match_backward, hash4_p64, hash5_p64, hash6_p64,
-    hash8_p64, longest_match_from_16, pos_mask_u32, probe_ldm_span, static_dict_bounds,
-    FastLdmSpan, HashTable, PreparedDictionary, TableSlices1, FAST_LDM_MIN_LEN, INTERIOR_MARGIN,
-    STATIC_CMD_OFF, STATIC_LIT_MULT,
+    clamp_ldm_next_pos, common_prefix_len, common_prefix_slices_from_16, extend_match_backward,
+    hash4_p64, hash5_p64, hash6_p64, hash8_p64, longest_match_from_16, pos_mask_u32,
+    probe_ldm_span, static_dict_bounds, FastLdmSpan, HashTable, PreparedDictionary, RawDictIndex,
+    TableSlices1, FAST_LDM_MIN_LEN, HT4_DICT_WINDOW, INTERIOR_MARGIN, STATIC_CMD_OFF,
+    STATIC_LIT_MULT,
 };
 use crate::huffman::{compute_bits_from_lengths, HuffmanCode, HuffmanCodeEntry};
 use crate::map_to_sym::{
@@ -637,6 +638,7 @@ struct ChunkSpan<'a> {
     full_dict_len: usize,
     stream_base: usize,
     dict: &'a [u8],
+    dict_idx: Option<&'a RawDictIndex>,
 }
 
 #[inline(always)]
@@ -694,32 +696,102 @@ fn extend_from_diff_cursor<S: SimdBackend>(
 }
 
 #[inline(always)]
-fn dict_prefix_match_len<const MIN_LEN: usize>(
+fn dict_prefix_match_len<const MIN_LEN: usize, S: SimdBackend>(
+    simd: S,
     dict: &[u8],
     prefix: &[u8],
-    pos: usize,
+    at_ev: BoundedPrefixCursor<'_, u8, 16>,
     dist: usize,
     w: u64,
 ) -> Option<usize> {
+    let pos = at_ev.pos();
     let dict_rem = dist.wrapping_sub(pos);
     if !(MIN_LEN..=dict.len()).contains(&dict_rem) {
         return None;
     }
     let d_slice = &dict[dict.len() - dict_rem..];
-    if !d_slice.starts_with(&w.to_le_bytes()[..MIN_LEN]) {
+    if let Some(c8) = d_slice.first_chunk::<8>() {
+        let diff0 = u64::from_le_bytes(*c8) ^ w;
+        if MIN_LEN == 8 {
+            if diff0 != 0 {
+                return None;
+            }
+        } else {
+            if (diff0 & 0xFFFF_FFFF) != 0 {
+                return None;
+            }
+            if diff0 != 0 {
+                return Some((diff0.trailing_zeros() >> 3) as usize);
+            }
+        }
+        if let Some(d16) = d_slice.first_chunk::<16>() {
+            let diff8 = u64::from_le_bytes(*d16.last_chunk::<8>().unwrap())
+                ^ u64::from_le_bytes(*at_ev.sub_array::<8, 8>());
+            return Some(if diff8 != 0 {
+                8 + (diff8.trailing_zeros() >> 3) as usize
+            } else {
+                common_prefix_slices_from_16(simd, d_slice, &prefix[pos..])
+            });
+        }
+        return Some(8 + common_prefix_len(&d_slice[8..], &prefix[pos + 8..], MAX_COPY_LEN - 8));
+    }
+    if MIN_LEN == 8 || !d_slice.starts_with(&w.to_le_bytes()[..MIN_LEN]) {
         return None;
     }
     Some(common_prefix_len(d_slice, &prefix[pos..], MAX_COPY_LEN))
 }
 
 #[inline(always)]
+fn probe_raw_dict4<const FIRST_ONLY: bool, S: SimdBackend>(
+    simd: S,
+    d_idx: &RawDictIndex,
+    span: ChunkSpan<'_>,
+    at_cur: BoundedPrefixCursor<'_, u8, 16>,
+    (dp64, dsec, cur_w): (u64, u32, u64),
+    max_rem: u32,
+) -> (u32, usize) {
+    let Some((bucket, mut mask)) = d_idx.search4_mask(simd, dp64, dsec) else {
+        return (0, 0);
+    };
+    let cur_pos = at_cur.pos();
+    let (mut best_d, mut best_l) = (0u32, 0usize);
+    while mask != 0 {
+        let idx = mask.trailing_zeros() as usize;
+        mask &= mask - 1;
+        let rem = *bucket.bget_masked(idx) & 0x00FF_FFFF;
+        if (1..=max_rem).contains(&rem) {
+            let d_dict = (cur_pos as u32) + rem;
+            if let Some(len) = dict_prefix_match_len::<8, _>(
+                simd,
+                span.dict,
+                span.prefix,
+                at_cur,
+                d_dict as usize,
+                cur_w,
+            ) {
+                if const { FIRST_ONLY } {
+                    return (d_dict, len);
+                }
+                if len > best_l {
+                    (best_d, best_l) = (d_dict, len);
+                    if len >= 64 {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    (best_d, best_l)
+}
+
+#[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn refine_trawl_d0_ldm<S: SimdBackend>(
     simd: S,
-    prefix: &[u8],
+    span: ChunkSpan<'_>,
     at_cur: BoundedPrefixCursor<'_, u8, 16>,
     cur_w: u64,
-    (allow_d0, skip, skip_cap, lw): (bool, usize, usize, bool),
+    (hd, allow_d0, skip, skip_cap, lw): (bool, bool, usize, usize, bool),
     (d0, d0_cap, d0_checked, anchor, chunk_start): (u32, u32, usize, usize, usize),
     ldm_spans: &[FastLdmSpan],
     ldm_i: &mut usize,
@@ -733,8 +805,20 @@ fn refine_trawl_d0_ldm<S: SimdBackend>(
             if (diff_r & 0xFFFF_FFFF) == 0 {
                 (*m_dist, *m_len) = (
                     d0,
-                    extend_from_diff_cursor(simd, prefix, at_cur, rc16, d0 as usize, diff_r),
+                    extend_from_diff_cursor(simd, span.prefix, at_cur, rc16, d0 as usize, diff_r),
                 );
+            }
+        } else if hd && span.stream_base == 0 && cur_pos < span.wsize && (d0 as usize) <= span.wsize
+        {
+            if let Some(len) = dict_prefix_match_len::<4, _>(
+                simd,
+                span.dict,
+                span.prefix,
+                at_cur,
+                d0 as usize,
+                cur_w,
+            ) {
+                (*m_dist, *m_len) = (d0, len);
             }
         }
     }
@@ -1048,10 +1132,11 @@ fn eval_8b_match<S: SimdBackend>(
             return extend_from_8_cursor(simd, span.prefix, at_ev, c16, d_ev as usize);
         }
     } else if hd {
-        return dict_prefix_match_len::<8>(
+        return dict_prefix_match_len::<8, _>(
+            simd,
             span.dict,
             span.prefix,
-            at_ev.pos(),
+            at_ev,
             d_ev as usize,
             w_ev,
         )
@@ -1106,7 +1191,7 @@ fn eval_short4_match<S: SimdBackend, const IS_Q0: bool>(
         }
     } else if hd {
         if let Some(len) =
-            dict_prefix_match_len::<4>(span.dict, span.prefix, at_ev.pos(), d_ev as usize, w_ev)
+            dict_prefix_match_len::<4, _>(simd, span.dict, span.prefix, at_ev, d_ev as usize, w_ev)
         {
             if accept_short4_match::<IS_Q0>(lw, len, d_ev, d0, d1) {
                 return len;
@@ -1116,10 +1201,10 @@ fn eval_short4_match<S: SimdBackend, const IS_Q0: bool>(
     0
 }
 
-// Expands the unified `Q0..=Q2` parser directly inside `fast_parse_avx2` (`#[target_feature]`),
-// `fast_parse_avx2_dyn`, and `fast_parse_scalar` (`#[cold]`) so LLVM's bottom-up CGSCC inliner
-// sees AVX2/BMI2 target features, `const` `(LW, MODE, MLS, FLAG)` specialization, and local SROA
-// over `DirectHuffSink`'s `BitStreamCursor` with zero cross-boundary outlining.
+// Expands the unified `Q0..=Q2` parser directly inside `fast_parse_avx2`/`fast_parse_neon`
+// (`#[target_feature]`), `*_dyn`, and `fast_parse_scalar` (`#[cold]`) so LLVM's bottom-up CGSCC
+// inliner sees AVX2/NEON features, `const` `(LW, MODE, MLS, FLAG, HD)` specialization, and local
+// SROA over `DirectHuffSink`'s `BitStreamCursor` with zero cross-boundary outlining.
 macro_rules! def_fast_parse_chunk {
     (|$MODE_PB:ident, $IS_Q0:ident, $simd:ident, $ts:ident, $vpos_base:ident, $lw:ident, $mode:ident, $hd:ident, $mls:ident, $flag:ident, $span:ident, $ldm_spans:ident, $ring:ident, $init:ident| $body:block) => {
         #[cfg(target_arch = "x86_64")]
@@ -1134,6 +1219,7 @@ macro_rules! def_fast_parse_chunk {
             const MODE: u8,
             const MLS: u8,
             const FLAG: bool,
+            const HD: bool,
             I: FastSinkInit,
         >(
             $ts: TableSlices1<'_>,
@@ -1145,28 +1231,7 @@ macro_rules! def_fast_parse_chunk {
             $simd: X64V3,
             _tok: impl SimdToken,
         ) -> bool {
-            let ($lw, $mode, $hd, $mls, $flag) = (!$IS_Q0 && LW, MODE, false, MLS, FLAG);
-            $body
-        }
-
-        #[cfg(target_arch = "x86_64")]
-        #[simd_entry]
-        #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
-        #[inline(never)]
-        #[allow(clippy::too_many_arguments)]
-        fn fast_parse_avx2_dict<const $MODE_PB: u8, const $IS_Q0: bool, I: FastSinkInit>(
-            $ts: TableSlices1<'_>,
-            $vpos_base: usize,
-            ($mode, $mls, $flag): (u8, u8, bool),
-            $span: ChunkSpan<'_>,
-            $ldm_spans: &[FastLdmSpan],
-            $ring: &mut [u32; 2],
-            $init: I,
-            $simd: X64V3,
-            _tok: impl SimdToken,
-        ) -> bool {
-            let ($lw, $hd) = (false, true);
-            let $mode = if $IS_Q0 { 0 } else { $mode };
+            let ($lw, $mode, $hd, $mls, $flag) = (!$IS_Q0 && LW, MODE, HD, MLS, FLAG);
             $body
         }
 
@@ -1203,6 +1268,7 @@ macro_rules! def_fast_parse_chunk {
             const MODE: u8,
             const MLS: u8,
             const FLAG: bool,
+            const HD: bool,
             I: FastSinkInit,
         >(
             $ts: TableSlices1<'_>,
@@ -1214,28 +1280,7 @@ macro_rules! def_fast_parse_chunk {
             $simd: A64Neon,
             _tok: impl SimdToken,
         ) -> bool {
-            let ($lw, $mode, $hd, $mls, $flag) = (!$IS_Q0 && LW, MODE, false, MLS, FLAG);
-            $body
-        }
-
-        #[cfg(target_arch = "aarch64")]
-        #[simd_entry]
-        #[target_feature(enable = "neon")]
-        #[inline(never)]
-        #[allow(clippy::too_many_arguments)]
-        fn fast_parse_neon_dict<const $MODE_PB: u8, const $IS_Q0: bool, I: FastSinkInit>(
-            $ts: TableSlices1<'_>,
-            $vpos_base: usize,
-            ($mode, $mls, $flag): (u8, u8, bool),
-            $span: ChunkSpan<'_>,
-            $ldm_spans: &[FastLdmSpan],
-            $ring: &mut [u32; 2],
-            $init: I,
-            $simd: A64Neon,
-            _tok: impl SimdToken,
-        ) -> bool {
-            let ($lw, $hd) = (false, true);
-            let $mode = if $IS_Q0 { 0 } else { $mode };
+            let ($lw, $mode, $hd, $mls, $flag) = (!$IS_Q0 && LW, MODE, HD, MLS, FLAG);
             $body
         }
 
@@ -1289,61 +1334,10 @@ macro_rules! def_fast_parse_chunk {
             init: I,
             simd: OptSimd,
         ) -> bool {
-            let dict_no_lw = cfg.2 && !cfg.0;
-            let dict23 = dict_no_lw && IS_Q0 && ts.tag_mask == !((1u32 << 23) - 1);
-            let dict25 = dict_no_lw && ts.tag_mask == !((1u32 << 25) - 1);
             match simd {
-                #[cfg(target_arch = "x86_64")]
-                Some(tok) if dict23 => fast_parse_avx2_dict::<23, IS_Q0, I>(
-                    ts,
-                    vpos_base,
-                    (cfg.1, cfg.3, cfg.4),
-                    span,
-                    ldm_spans,
-                    ring,
-                    init,
-                    tok,
-                    tok,
-                ),
-                #[cfg(target_arch = "x86_64")]
-                Some(tok) if dict25 => fast_parse_avx2_dict::<25, IS_Q0, I>(
-                    ts,
-                    vpos_base,
-                    (cfg.1, cfg.3, cfg.4),
-                    span,
-                    ldm_spans,
-                    ring,
-                    init,
-                    tok,
-                    tok,
-                ),
                 #[cfg(target_arch = "x86_64")]
                 Some(tok) => fast_parse_avx2_dyn::<IS_Q0, I>(
                     ts, vpos_base, cfg, span, ldm_spans, ring, init, tok, tok,
-                ),
-                #[cfg(target_arch = "aarch64")]
-                Some(tok) if dict23 => fast_parse_neon_dict::<23, IS_Q0, I>(
-                    ts,
-                    vpos_base,
-                    (cfg.1, cfg.3, cfg.4),
-                    span,
-                    ldm_spans,
-                    ring,
-                    init,
-                    tok,
-                    tok,
-                ),
-                #[cfg(target_arch = "aarch64")]
-                Some(tok) if dict25 => fast_parse_neon_dict::<25, IS_Q0, I>(
-                    ts,
-                    vpos_base,
-                    (cfg.1, cfg.3, cfg.4),
-                    span,
-                    ldm_spans,
-                    ring,
-                    init,
-                    tok,
-                    tok,
                 ),
                 #[cfg(target_arch = "aarch64")]
                 Some(tok) => fast_parse_neon_dyn::<IS_Q0, I>(
@@ -1369,7 +1363,7 @@ def_fast_parse_chunk!(|MODE_PB,
                        ldm_spans,
                        ring,
                        init| {
-    let single_tbl = mode <= 1 && !hd;
+    let single_tbl = mode <= 1;
     let TableSlices1 {
         table,
         tags,
@@ -1387,6 +1381,11 @@ def_fast_parse_chunk!(|MODE_PB,
     let log = ts.table.log();
     let interior_end = chunk_end.saturating_sub(INTERIOR_MARGIN);
     let eff_wsize_u32 = span.eff_wsize as u32;
+    let max_dict_pos = if hd && span.stream_base == 0 {
+        span.wsize
+    } else {
+        0
+    };
     let sd_pos_limit = if !IS_Q0 && flag {
         FAST_TWOPASS_SD_MAX_POS.saturating_sub(span.stream_base)
     } else {
@@ -1420,7 +1419,11 @@ def_fast_parse_chunk!(|MODE_PB,
         if !single_tbl && ts.ht4.is_none() {
             return false;
         }
-        let d0_cap = eff_wsize_u32.min(if lw { 1 << 18 } else { 1 << 20 });
+        let d0_cap = if hd {
+            span.wsize.min(u32::MAX as usize) as u32
+        } else {
+            eff_wsize_u32.min(if lw { 1 << 18 } else { 1 << 20 })
+        };
         let min_mask: u64 = match mls {
             4 => 0xFFFF_FFFF,
             5 => 0x0000_00FF_FFFF_FFFF,
@@ -1441,13 +1444,31 @@ def_fast_parse_chunk!(|MODE_PB,
                     let pw = u64::from_le_bytes(*at_p.sub_array::<8, 0>());
                     let (pp64, ps, _) = hash8_p64(pw);
                     let pvp = vpos_base.wrapping_add(p) as u32;
-                    let d8 =
+                    let mut d8 =
                         ts.search_and_insert_one_hash64::<MODE_PB>(pp64, pvp, ps, eff_wsize_u32);
-                    if d8 != 0 && d8 != d0 {
-                        let len8 = eval_8b_match(simd, hd, span, at_p, pw, d8);
-                        if len8 > best_len + 1 {
-                            (match_dist, best_len) = (d8, len8);
+                    let mut len8 = if d8 != 0 && d8 != d0 {
+                        eval_8b_match(simd, hd, span, at_p, pw, d8)
+                    } else {
+                        0
+                    };
+                    if hd && len8 == 0 && p < max_dict_pos {
+                        if let Some(d_idx) = span.dict_idx {
+                            let rem = d_idx.probe4_one(
+                                pp64,
+                                ps,
+                                (max_dict_pos - p).min(span.dict.len()) as u32,
+                            );
+                            if rem != 0 {
+                                let dd = (p as u32) + rem;
+                                if dd != d0 {
+                                    d8 = dd;
+                                    len8 = eval_8b_match(simd, true, span, at_p, pw, dd);
+                                }
+                            }
                         }
+                    }
+                    if len8 > best_len + 1 {
+                        (match_dist, best_len) = (d8, len8);
                     }
                 }
             } else {
@@ -1556,10 +1577,11 @@ def_fast_parse_chunk!(|MODE_PB,
                     if !IS_Q0 {
                         refine_trawl_d0_ldm(
                             simd,
-                            prefix,
+                            span,
                             at_cur,
                             cur_w,
                             (
+                                hd,
                                 !single_tbl || mls > 4,
                                 skip,
                                 if single_tbl { 96 } else { 112 },
@@ -1571,6 +1593,57 @@ def_fast_parse_chunk!(|MODE_PB,
                             &mut m_dist,
                             &mut m_len,
                         );
+                    }
+                    if hd && m_dist == 0 && cur_pos < max_dict_pos {
+                        if let Some(d_idx) = span.dict_idx {
+                            let (dp64, dsec, dp32) = if single_tbl {
+                                hash8_p64(cur_w)
+                            } else {
+                                (cur_p64, cur_s, cur_p32)
+                            };
+                            let max_rem = (max_dict_pos - cur_pos).min(span.dict.len()) as u32;
+                            if IS_Q0 || single_tbl {
+                                (m_dist, m_len) = probe_raw_dict4::<true, _>(
+                                    simd,
+                                    d_idx,
+                                    span,
+                                    at_cur,
+                                    (dp64, dsec, cur_w),
+                                    max_rem,
+                                );
+                                if m_dist == 0
+                                    && ((IS_Q0 && span.dict.len() <= 64)
+                                        || (!IS_Q0 && cur_pos < HT4_DICT_WINDOW && skip < 96))
+                                {
+                                    let mr4 = if IS_Q0 { max_rem } else { max_rem.min(32_768) };
+                                    let rem4 = d_idx.probe_ht4(dp32, mr4);
+                                    if rem4 != 0 {
+                                        let d4_dict = (cur_pos as u32) + rem4;
+                                        let len4 = eval_short4_match::<_, IS_Q0>(
+                                            simd,
+                                            (lw, true),
+                                            span,
+                                            at_cur,
+                                            cur_w,
+                                            d4_dict,
+                                            (d0, d1),
+                                        );
+                                        if len4 != 0 {
+                                            (m_dist, m_len) = (d4_dict, len4);
+                                        }
+                                    }
+                                }
+                            } else {
+                                (m_dist, m_len) = probe_raw_dict4::<false, _>(
+                                    simd,
+                                    d_idx,
+                                    span,
+                                    at_cur,
+                                    (dp64, dsec, cur_w),
+                                    max_rem,
+                                );
+                            }
+                        }
                     }
                     if m_dist != 0 {
                         (hit_pos, match_dist, best_len) = (cur_pos, m_dist, m_len);
@@ -1590,6 +1663,7 @@ def_fast_parse_chunk!(|MODE_PB,
                                 vpos,
                                 eff_wsize_u32,
                             );
+                            let mut cand4 = (0u32, 0usize);
                             if d4 != 0 && d4 != d_main {
                                 let len = eval_short4_match::<_, IS_Q0>(
                                     simd,
@@ -1601,29 +1675,69 @@ def_fast_parse_chunk!(|MODE_PB,
                                     (d0, d1),
                                 );
                                 if len != 0 {
-                                    (hit_pos, match_dist, best_len) = (cur_pos, d4, len);
-                                    if !IS_Q0 && mode >= 2 && len < 8 {
-                                        if let Some(at_p1) = pfx16.cursor_at(cur_pos + 1) {
-                                            let w1 = u64::from_le_bytes(*at_p1.sub_array::<8, 0>());
-                                            let (p64_1, s1, _) = hash8_p64(w1);
-                                            let d8_1 = ts.search_and_insert_one_hash64::<MODE_PB>(
-                                                p64_1,
-                                                vpos + 1,
-                                                s1,
-                                                eff_wsize_u32,
-                                            );
-                                            if d8_1 != 0 {
-                                                let len1 =
-                                                    eval_8b_match(simd, hd, span, at_p1, w1, d8_1);
-                                                if len1 > len {
-                                                    (hit_pos, match_dist, best_len) =
-                                                        (cur_pos + 1, d8_1, len1);
+                                    cand4 = (d4, len);
+                                }
+                            }
+                            if cand4.1 == 0 && hd && cur_pos < max_dict_pos.min(HT4_DICT_WINDOW) {
+                                if let Some(d_idx) = span.dict_idx {
+                                    let rem4 = d_idx.probe_ht4(
+                                        cur_p32,
+                                        (max_dict_pos - cur_pos).min(span.dict.len()) as u32,
+                                    );
+                                    if rem4 != 0 {
+                                        let d4_dict = (cur_pos as u32) + rem4;
+                                        let len = eval_short4_match::<_, IS_Q0>(
+                                            simd,
+                                            (lw, true),
+                                            span,
+                                            at_cur,
+                                            cur_w,
+                                            d4_dict,
+                                            (d0, d1),
+                                        );
+                                        if len != 0 {
+                                            cand4 = (d4_dict, len);
+                                        }
+                                    }
+                                }
+                            }
+                            if cand4.1 != 0 {
+                                (hit_pos, match_dist, best_len) = (cur_pos, cand4.0, cand4.1);
+                                if !IS_Q0 && mode >= 2 && cand4.1 < 8 {
+                                    if let Some(at_p1) = pfx16.cursor_at(cur_pos + 1) {
+                                        let w1 = u64::from_le_bytes(*at_p1.sub_array::<8, 0>());
+                                        let (p64_1, s1, _) = hash8_p64(w1);
+                                        let mut d8_1 = ts.search_and_insert_one_hash64::<MODE_PB>(
+                                            p64_1,
+                                            vpos + 1,
+                                            s1,
+                                            eff_wsize_u32,
+                                        );
+                                        if d8_1 == 0 && hd && cur_pos + 1 < max_dict_pos {
+                                            if let Some(d_idx) = span.dict_idx {
+                                                let rem = d_idx.probe4_one(
+                                                    p64_1,
+                                                    s1,
+                                                    (max_dict_pos - (cur_pos + 1))
+                                                        .min(span.dict.len())
+                                                        as u32,
+                                                );
+                                                if rem != 0 {
+                                                    d8_1 = ((cur_pos + 1) as u32) + rem;
                                                 }
                                             }
                                         }
+                                        if d8_1 != 0 {
+                                            let len1 =
+                                                eval_8b_match(simd, hd, span, at_p1, w1, d8_1);
+                                            if len1 > best_len {
+                                                (hit_pos, match_dist, best_len) =
+                                                    (cur_pos + 1, d8_1, len1);
+                                            }
+                                        }
                                     }
-                                    break 'trawl;
                                 }
+                                break 'trawl;
                             }
                             if !IS_Q0
                                 && mode >= 2
@@ -1783,20 +1897,19 @@ fn prepare_fast_ht<'d>(
     cap_wsize: usize,
     prep_len: Option<usize>,
     dict: Option<&'d PreparedDictionary>,
-) -> (bool, usize, &'d [u8]) {
+) -> (bool, usize, &'d [u8], Option<&'d RawDictIndex>) {
+    if let Some(plen) = prep_len {
+        ht.prepare_for_input(cap_wsize, plen.max(16));
+    }
     if let Some(d) = dict.filter(|d| !d.is_empty()) {
-        let ad = d.active_slice(cap_wsize);
-        ht.ensure_ht4_near();
-        if let Some(plen) = prep_len {
-            let dict_cap = (1usize << ht.ht4_log) * 2;
-            ht.prepare_for_input_with_dict(cap_wsize, plen.max(16), d, dict_cap, false);
-        }
-        (true, d.raw_len(), ad)
+        (
+            true,
+            d.raw_len(),
+            d.active_slice(cap_wsize),
+            Some(d.raw_index()),
+        )
     } else {
-        if let Some(plen) = prep_len {
-            ht.prepare_for_input(cap_wsize, plen.max(16));
-        }
-        (false, 0, &[])
+        (false, 0, &[], None)
     }
 }
 
@@ -1804,7 +1917,7 @@ fn prepare_fast_ht<'d>(
 #[inline(always)]
 fn drive_fast_chunks(
     (raw_wsize, cap_wsize, chunk_size): (usize, usize, usize),
-    (_, full_dict_len, active_dict): (bool, usize, &[u8]),
+    (_, full_dict_len, active_dict, dict_idx): (bool, usize, &[u8], Option<&RawDictIndex>),
     (is_eof, stream_base): (bool, usize),
     data: &[u8],
     range: core::ops::Range<usize>,
@@ -1829,6 +1942,7 @@ fn drive_fast_chunks(
             full_dict_len,
             stream_base,
             dict: active_dict,
+            dict_idx,
         };
         let (chunk_end, uncomp) = encode_chunk(span, bw);
         need_trailing_empty = is_eof && chunk_end == range.end && uncomp;
@@ -1878,7 +1992,7 @@ impl OnePassEncoder {
         enc
     }
 
-    fn has_sampled_match(&self, hd: bool, span: ChunkSpan<'_>) -> bool {
+    fn has_sampled_match(&self, span: ChunkSpan<'_>) -> bool {
         let (prefix, chunk_start, chunk_len) =
             (span.prefix, span.start, span.prefix.len() - span.start);
         let vpos_base = self.ht.next_vpos.wrapping_sub(chunk_start);
@@ -1893,21 +2007,16 @@ impl OnePassEncoder {
         for i in 0..16 {
             let pos = chunk_start + i * base_stride;
             let w = load_u64_at(prefix, pos);
-            let p64 = if hd {
-                hash8_p64(w).0
-            } else {
-                hash_single_p64(true, mls, w, log).0
-            };
+            let p64 = hash_single_p64(true, mls, w, log).0;
             let prev = self.ht.table[((p64 >> shift) as usize) & mask] & pos_mask;
             let dist = if prev != 0 {
                 (vpos_base.wrapping_add(pos) as u32).wrapping_sub(prev)
             } else {
                 0
             };
-            let mlen = if hd { 8 } else { mls_usize };
             if dist != 0 && (dist as usize) <= span.eff_wsize.min(pos) {
                 let cand = pos - dist as usize;
-                if prefix.get(cand..cand + mlen) == prefix.get(pos..pos + mlen) {
+                if prefix.get(cand..cand + mls_usize) == prefix.get(pos..pos + mls_usize) {
                     return true;
                 }
             }
@@ -1934,14 +2043,13 @@ impl OnePassEncoder {
     #[inline(always)]
     fn emit_uncompressed_chunk(
         &mut self,
-        hd: bool,
         span: ChunkSpan<'_>,
         is_final: bool,
         bw: &mut BitWriter,
     ) -> (usize, bool) {
         (
             span.prefix.len(),
-            emit_uncompressed_fast_chunk(&mut self.ht, (true, !hd, self.mls), span, is_final, bw),
+            emit_uncompressed_fast_chunk(&mut self.ht, (true, true, self.mls), span, is_final, bw),
         )
     }
 
@@ -1961,7 +2069,7 @@ impl OnePassEncoder {
         let mut chunk_len = raw_chunk.len();
         let mut is_final = is_eof && span.prefix.len() == range_end;
         if !hd && chunk_len <= 56 {
-            return self.emit_uncompressed_chunk(hd, span, is_final, bw);
+            return self.emit_uncompressed_chunk(span, is_final, bw);
         }
 
         let lw = self.lw;
@@ -1991,9 +2099,9 @@ impl OnePassEncoder {
                 let sum_sq: u64 = raw_sample.iter().map(|&c| (c as u64) * (c as u64)).sum();
                 if !hd
                     && 256 * sum_sq <= sample_n * sample_n + 88 * sample_n
-                    && !self.has_sampled_match(hd, span)
+                    && !self.has_sampled_match(span)
                 {
-                    return self.emit_uncompressed_chunk(hd, span, is_final, bw);
+                    return self.emit_uncompressed_chunk(span, is_final, bw);
                 }
                 for (d, &c) in counts.iter_mut().zip(&raw_sample) {
                     if c != 0 {
@@ -2036,8 +2144,8 @@ impl OnePassEncoder {
                 sample_n = (blocks * BSIZE) as u64;
                 let sum_sq: u32 = raw_sample.iter().map(|&c| c * c).sum();
                 let max_sum_sq: u32 = if blocks == 16 { 5_440 } else { 19_200 };
-                if !hd && sum_sq <= max_sum_sq && !self.has_sampled_match(hd, span) {
-                    return self.emit_uncompressed_chunk(hd, span, is_final, bw);
+                if !hd && sum_sq <= max_sum_sq && !self.has_sampled_match(span) {
+                    return self.emit_uncompressed_chunk(span, is_final, bw);
                 }
                 let present_rows = if chunk_len > 32_768 {
                     0xFFFF
@@ -2100,9 +2208,9 @@ impl OnePassEncoder {
             };
             #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             macro_rules! q0_pb {
-                ($func:ident, $t:ident, $p:literal) => {
+                ($func:ident, $t:ident, $p:literal, $hd_c:literal) => {
                     match (mls, track) {
-                        (4, false) => $func::<$p, false, true, 0, 4, false, _>(
+                        (4, false) => $func::<$p, false, true, 0, 4, false, $hd_c, _>(
                             ts,
                             vpos_base,
                             span,
@@ -2112,7 +2220,7 @@ impl OnePassEncoder {
                             $t,
                             $t,
                         ),
-                        (5, false) => $func::<$p, false, true, 0, 5, false, _>(
+                        (5, false) => $func::<$p, false, true, 0, 5, false, $hd_c, _>(
                             ts,
                             vpos_base,
                             span,
@@ -2122,7 +2230,17 @@ impl OnePassEncoder {
                             $t,
                             $t,
                         ),
-                        (5, true) => $func::<$p, false, true, 0, 5, true, _>(
+                        (4, true) => $func::<$p, false, true, 0, 4, true, $hd_c, _>(
+                            ts,
+                            vpos_base,
+                            span,
+                            &[],
+                            ring,
+                            init,
+                            $t,
+                            $t,
+                        ),
+                        (5, true) => $func::<$p, false, true, 0, 5, true, $hd_c, _>(
                             ts,
                             vpos_base,
                             span,
@@ -2145,19 +2263,27 @@ impl OnePassEncoder {
                     }
                 };
             }
-            match (simd, hd, self.pos_bits) {
+            match (simd, hd, lw, self.pos_bits) {
                 #[cfg(target_arch = "x86_64")]
-                (Some(tok), false, 23) => q0_pb!(fast_parse_avx2, tok, 23),
+                (Some(tok), false, _, 23) => q0_pb!(fast_parse_avx2, tok, 23, false),
                 #[cfg(target_arch = "x86_64")]
-                (Some(tok), false, 25) => q0_pb!(fast_parse_avx2, tok, 25),
+                (Some(tok), false, _, 25) => q0_pb!(fast_parse_avx2, tok, 25, false),
                 #[cfg(target_arch = "x86_64")]
-                (Some(tok), false, 26) => q0_pb!(fast_parse_avx2, tok, 26),
+                (Some(tok), false, _, 26) => q0_pb!(fast_parse_avx2, tok, 26, false),
+                #[cfg(target_arch = "x86_64")]
+                (Some(tok), true, false, 23) => q0_pb!(fast_parse_avx2, tok, 23, true),
+                #[cfg(target_arch = "x86_64")]
+                (Some(tok), true, false, 25) => q0_pb!(fast_parse_avx2, tok, 25, true),
                 #[cfg(target_arch = "aarch64")]
-                (Some(tok), false, 23) => q0_pb!(fast_parse_neon, tok, 23),
+                (Some(tok), false, _, 23) => q0_pb!(fast_parse_neon, tok, 23, false),
                 #[cfg(target_arch = "aarch64")]
-                (Some(tok), false, 25) => q0_pb!(fast_parse_neon, tok, 25),
+                (Some(tok), false, _, 25) => q0_pb!(fast_parse_neon, tok, 25, false),
                 #[cfg(target_arch = "aarch64")]
-                (Some(tok), false, 26) => q0_pb!(fast_parse_neon, tok, 26),
+                (Some(tok), false, _, 26) => q0_pb!(fast_parse_neon, tok, 26, false),
+                #[cfg(target_arch = "aarch64")]
+                (Some(tok), true, false, 23) => q0_pb!(fast_parse_neon, tok, 23, true),
+                #[cfg(target_arch = "aarch64")]
+                (Some(tok), true, false, 25) => q0_pb!(fast_parse_neon, tok, 25, true),
                 _ => fast_parse_dyn::<true, _>(
                     ts,
                     vpos_base,
@@ -2699,10 +2825,10 @@ fn encode_twopass_chunk(
         );
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         macro_rules! p1_all {
-            ($func:ident, $tok:ident, $mpb:literal, $lw_c:literal) => {{
+            ($func:ident, $tok:ident, $mpb:literal, $lw_c:literal, $hd_c:literal) => {{
                 macro_rules! run {
                     ($m:literal, $mls:literal, $sd:literal) => {
-                        $func::<$mpb, $lw_c, false, $m, $mls, $sd, _>(
+                        $func::<$mpb, $lw_c, false, $m, $mls, $sd, $hd_c, _>(
                             ts, vpos_base, span, ldm, ring, init, $tok, $tok,
                         )
                     };
@@ -2720,13 +2846,13 @@ fn encode_twopass_chunk(
         macro_rules! p1_big_lw {
             ($func:ident, $tok:ident, $mpb:literal) => {
                 match (mode >= 2, chunk_sd) {
-                    (true, true) => $func::<$mpb, true, false, 2, 4, true, _>(
+                    (true, true) => $func::<$mpb, true, false, 2, 4, true, false, _>(
                         ts, vpos_base, span, ldm, ring, init, $tok, $tok,
                     ),
-                    (true, false) => $func::<$mpb, true, false, 2, 4, false, _>(
+                    (true, false) => $func::<$mpb, true, false, 2, 4, false, false, _>(
                         ts, vpos_base, span, ldm, ring, init, $tok, $tok,
                     ),
-                    (false, _) => $func::<$mpb, true, false, 1, 6, false, _>(
+                    (false, _) => $func::<$mpb, true, false, 1, 6, false, false, _>(
                         ts, vpos_base, span, ldm, ring, init, $tok, $tok,
                     ),
                 }
@@ -2734,17 +2860,21 @@ fn encode_twopass_chunk(
         }
         let _ = match (simd, hd, lw, pos_bits) {
             #[cfg(target_arch = "x86_64")]
-            (Some(tok), false, false, 25) => p1_all!(fast_parse_avx2, tok, 25, false),
+            (Some(tok), false, false, 25) => p1_all!(fast_parse_avx2, tok, 25, false, false),
             #[cfg(target_arch = "x86_64")]
-            (Some(tok), false, true, 25) => p1_all!(fast_parse_avx2, tok, 25, true),
+            (Some(tok), false, true, 25) => p1_all!(fast_parse_avx2, tok, 25, true, false),
+            #[cfg(target_arch = "x86_64")]
+            (Some(tok), true, false, 25) => p1_all!(fast_parse_avx2, tok, 25, false, true),
             #[cfg(target_arch = "x86_64")]
             (Some(tok), false, true, 29) if mode >= 2 || mls == 6 => {
                 p1_big_lw!(fast_parse_avx2, tok, 29)
             }
             #[cfg(target_arch = "aarch64")]
-            (Some(tok), false, false, 25) => p1_all!(fast_parse_neon, tok, 25, false),
+            (Some(tok), false, false, 25) => p1_all!(fast_parse_neon, tok, 25, false, false),
             #[cfg(target_arch = "aarch64")]
-            (Some(tok), false, true, 25) => p1_all!(fast_parse_neon, tok, 25, true),
+            (Some(tok), false, true, 25) => p1_all!(fast_parse_neon, tok, 25, true, false),
+            #[cfg(target_arch = "aarch64")]
+            (Some(tok), true, false, 25) => p1_all!(fast_parse_neon, tok, 25, false, true),
             #[cfg(target_arch = "aarch64")]
             (Some(tok), false, true, 29) if mode >= 2 || mls == 6 => {
                 p1_big_lw!(fast_parse_neon, tok, 29)
@@ -3247,6 +3377,9 @@ mod tests {
             check_tp_mode::<1, 6, FAST_TWOPASS_CHUNK_SIZE>(inp, Some((&prep30, dict_raw)), 30, tok);
             check_tp_mode::<2, 4, FAST_Q2_CHUNK_SIZE>(inp, Some((&prep, dict_raw)), 28, tok);
             check_tp_mode::<2, 4, FAST_Q2_CHUNK_SIZE>(inp, Some((&prep30, dict_raw)), 30, tok);
+            let prep22 = PreparedDictionary::with_lgwin(dict_raw, 1, 22);
+            check_tp_mode::<1, 6, FAST_TWOPASS_CHUNK_SIZE>(inp, Some((&prep22, dict_raw)), 22, tok);
+            check_tp_mode::<2, 4, FAST_Q2_CHUNK_SIZE>(inp, Some((&prep22, dict_raw)), 22, tok);
         }
     }
 
@@ -3286,13 +3419,14 @@ mod tests {
                 full_dict_len: 0,
                 stream_base: 0,
                 dict: &[],
+                dict_idx: None,
             }
         }
-        assert!(!q0.has_sampled_match(false, make_span(&sparse)));
+        assert!(!q0.has_sampled_match(make_span(&sparse)));
         let sample_tag = *b"Q0Sample";
         sparse[HI_START + 4..HI_START + 12].copy_from_slice(&sample_tag);
         sparse[HI_START + 20..HI_START + 28].copy_from_slice(&sample_tag);
-        assert!(q0.has_sampled_match(false, make_span(&sparse)));
+        assert!(q0.has_sampled_match(make_span(&sparse)));
 
         // Build compressible content at `>= 4 GiB` plus a 1024-byte LDM copy from `HIST_START + 8192`
         // (`dist = 81_920 > FAST_LDM_MIN_DIST`), exercising `FastCmd::lit_start`, `FastLdmSpan`,
