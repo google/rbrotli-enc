@@ -353,7 +353,7 @@ impl MetablockData {
             let sym_or_nbits = _mm256_and_si256(get_sym_mask, sym_or_nbits);
             let mask_even_lanes = _mm256_set1_epi32(0xFFFF);
             let load_huff =
-                |idx: u16| -> u32 { transmute!(self.histogram_buf[(idx & 0x7FFF) as usize]) };
+                |idx: u16| -> u32 { self.histogram_buf[(idx & 0x7FFF) as usize].to_u32() };
             let huff_even_nbits_bits =
                 _mm256_loadu_si256(&std::array::from_fn(|k| load_huff(sym_arr[k * 2])));
             let huff_odd_nbits_bits =
