@@ -622,6 +622,8 @@ pub(crate) fn write_compressed_metablock(
 #[cfg(test)]
 pub(crate) mod test_helpers {
     use std::io::Read;
+    use std::sync::OnceLock;
+
     pub(crate) fn decompress_brotli(compressed: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         let mut dec = brotli_decompressor::Decompressor::new(compressed, 4096);
@@ -643,6 +645,38 @@ pub(crate) mod test_helpers {
         )
         .unwrap();
         out
+    }
+
+    /// Returns whether the linked `brotli-decompressor` crate implements RFC 9841 Compound
+    /// Dictionary static-dictionary offset subtraction once `stream_pos >= wsize - dict.len()`
+    /// (`v6+` does; legacy `v5` omits `- custom_dict_size` once `pos >= wsize - dict.len()`).
+    pub(crate) fn custom_dict_supports_rfc9841_past_window() -> bool {
+        static SUPPORTS: OnceLock<bool> = OnceLock::new();
+        *SUPPORTS.get_or_init(|| {
+            let dict_raw = b"0123456789abcdef0123456789abcdef";
+            let mut probe = Vec::with_capacity(1400);
+            probe.extend_from_slice(dict_raw);
+            probe.resize(1040, b'x');
+            probe.extend_from_slice(
+                b"Information about international government policy and university research! \
+                  The universal application of standard dictionary transformations in Brotli.",
+            );
+            let dict = crate::PreparedDictionary::with_lgwin(dict_raw, 11, 10);
+            let mut enc = crate::Encoder::with_lgwin(11, 10);
+            let comp = enc.compress_with_dict(&probe, &dict, None).unwrap();
+            assert!(comp.len() < 110, "probe must emit static dictionary words");
+            let mut r = comp;
+            let mut out = Vec::new();
+            let (mut in_buf, mut out_buf) = ([0u8; 512], [0u8; 512]);
+            brotli_decompressor::BrotliDecompressCustomDict(
+                &mut r,
+                &mut out,
+                &mut in_buf,
+                &mut out_buf,
+                dict_raw.to_vec(),
+            )
+            .is_ok_and(|()| out == probe)
+        })
     }
 }
 
