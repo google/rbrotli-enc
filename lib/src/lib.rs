@@ -15,6 +15,7 @@
 
 #[allow(dead_code)]
 mod block_split;
+#[allow(dead_code)]
 mod compress;
 #[allow(dead_code)]
 mod constants;
