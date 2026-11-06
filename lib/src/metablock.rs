@@ -15,30 +15,7 @@
 use bounded_utils::BoundedUsize;
 use lsb_bitwriter::{BitStreamCursor, BitWriter};
 
-#[derive(Clone, Debug)]
-pub(crate) struct BlockSplit {
-    pub(crate) num_types: usize,
-    pub(crate) types: Vec<u8>,
-    pub(crate) lengths: Vec<usize>,
-    pub(crate) type_counts: Vec<u32>,
-    pub(crate) len_counts: [u32; NUM_BLOCK_LEN_SYMBOLS],
-}
-
-pub(crate) struct MetablockPlan {
-    pub(crate) npostfix: u8,
-    pub(crate) ndirect: u8,
-    pub(crate) lit_split: BlockSplit,
-    pub(crate) iac_split: BlockSplit,
-    pub(crate) dist_split: BlockSplit,
-    pub(crate) context_modes: Vec<ContextMode>,
-    pub(crate) lit_cmap: Vec<u8>,
-    pub(crate) lit_tree_counts: Vec<[u32; MAX_LIT]>,
-    pub(crate) iac_tree_counts: Vec<[u32; MAX_IAC]>,
-    pub(crate) dist_cmap: Vec<u8>,
-    pub(crate) dist_alpha: usize,
-    pub(crate) dist_tree_counts: Vec<Vec<u32>>,
-    pub(crate) exact_compressed_bits: u64,
-}
+use crate::block_split::{BlockSplit, MetablockPlan};
 use crate::constants::{try_avx2, Scalar, MAX_IAC, MAX_LIT};
 use crate::context;
 use crate::huffman::{ContextMap, HuffmanCode, HuffmanCodeEntry};
