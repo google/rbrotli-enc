@@ -21,15 +21,13 @@
 //! let _bad: BoundedUsize<0> = BoundedUsize::<100>::MAX.widen::<0>();
 //! ```
 
-mod bounded_iterator;
 mod bounded_slice;
 mod bounded_usize;
+
 #[cfg(target_arch = "aarch64")]
 pub mod safe_aarch64;
-
 #[cfg(target_arch = "x86_64")]
 pub mod safe_x86_64;
-pub use bounded_iterator::*;
 pub use bounded_slice::*;
 pub use bounded_usize::*;
 

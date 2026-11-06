@@ -25,7 +25,7 @@ mod context;
 mod hashtable;
 #[allow(dead_code)]
 mod huffman;
-#[allow(dead_code, unused_imports)]
+#[allow(dead_code)]
 mod map_to_sym;
 #[allow(dead_code)]
 mod metablock;
