@@ -20,14 +20,17 @@ const _: () = assert!(std::mem::size_of::<usize>() < std::mem::size_of::<u128>()
 
 macro_rules! make_bounded_type {
     ($d:tt, $BoundedType:ident, $array_macro:ident, $ty:ident) => {
-        /// A struct containing a `$ty` guaranteed to be smaller than `MAX`.
+        /// A struct containing a `$ty` guaranteed to be at most `MAX` (`<= MAX`).
         // Invariant: self.0 <= MAX.
         #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug, AsBytes, FromZeroes)]
         #[repr(transparent)]
         pub struct $BoundedType<const MAX: usize>($ty);
 
         impl<const MAX: usize> $BoundedType<MAX> {
-            pub const MAX: Self = $BoundedType(MAX as $ty);
+            pub const MAX: Self = {
+                const { assert!(MAX <= $ty::MAX as usize) };
+                $BoundedType(MAX as $ty)
+            };
 
             /// Constructs a new $BoundedType without checking that the bound
             /// is indeed satisfied.
@@ -35,14 +38,20 @@ macro_rules! make_bounded_type {
             /// # Safety
             /// `val` must be less than or equal to `MAX`.
             pub const unsafe fn new_unchecked(val: $ty) -> $BoundedType<MAX> {
-                const { assert!(std::mem::size_of::<$ty>() <= std::mem::size_of::<usize>()) };
+                const {
+                    assert!(std::mem::size_of::<$ty>() <= std::mem::size_of::<usize>());
+                    assert!(MAX <= $ty::MAX as usize);
+                }
                 debug_assert!((val as usize) <= MAX);
                 $BoundedType(val)
             }
 
             pub const fn new(val: $ty) -> Option<$BoundedType<MAX>> {
+                const {
+                    assert!(std::mem::size_of::<$ty>() <= std::mem::size_of::<usize>());
+                    assert!(MAX <= $ty::MAX as usize);
+                }
                 if (val as usize) <= MAX {
-                    const { assert!(std::mem::size_of::<$ty>() <= std::mem::size_of::<usize>()) };
                     Some($BoundedType(val))
                 } else {
                     None
@@ -50,13 +59,37 @@ macro_rules! make_bounded_type {
             }
 
             pub const fn new_masked(val: $ty) -> $BoundedType<MAX> {
-                const { assert!((MAX as u128).saturating_add(1).is_power_of_two()) };
+                const {
+                    assert!(MAX <= $ty::MAX as usize);
+                    assert!((MAX as u128).wrapping_add(1).is_power_of_two());
+                }
                 $BoundedType(val & (MAX as $ty))
+            }
+
+            #[inline(always)]
+            pub const fn new_clamped(val: $ty) -> Self {
+                const { assert!(MAX <= $ty::MAX as usize) };
+                Self(if (val as usize) <= MAX {
+                    val
+                } else {
+                    MAX as $ty
+                })
+            }
+
+            #[inline(always)]
+            pub const fn add_bounded<const RHS: usize, const OUT: usize>(
+                &self,
+                rhs: $BoundedType<RHS>,
+            ) -> $BoundedType<OUT> {
+                const {
+                    assert!(OUT <= $ty::MAX as usize && OUT as u128 >= MAX as u128 + RHS as u128);
+                }
+                $BoundedType(self.0 + rhs.0)
             }
 
             pub const fn constant<const VAL: usize>() -> $BoundedType<MAX> {
                 const {
-                    assert!(VAL <= $ty::MAX as usize);
+                    assert!(MAX <= $ty::MAX as usize);
                     assert!(VAL <= MAX);
                 }
                 $BoundedType(VAL as $ty)
@@ -67,6 +100,7 @@ macro_rules! make_bounded_type {
             }
 
             pub const fn tighten<const NEW_BOUND: usize>(&self) -> Option<$BoundedType<NEW_BOUND>> {
+                const { assert!(NEW_BOUND <= $ty::MAX as usize) };
                 if (self.0 as usize) <= NEW_BOUND {
                     Some($BoundedType(self.0))
                 } else {
@@ -78,33 +112,48 @@ macro_rules! make_bounded_type {
                 &self,
             ) -> Option<$BoundedType<NEW_BOUND>> {
                 const {
-                    assert!(MAX as u128 >= NEW_BOUND as u128 + SUB as u128);
+                    assert!(MAX <= $ty::MAX as usize);
+                    assert!(NEW_BOUND <= $ty::MAX as usize);
+                    assert!(MAX as u128 <= NEW_BOUND as u128 + SUB as u128);
                     assert!(SUB <= $ty::MAX as usize);
                 }
                 self.0.checked_sub(SUB as $ty).map(|x| $BoundedType(x))
             }
 
             pub const fn widen<const NEW_BOUND: usize>(&self) -> $BoundedType<NEW_BOUND> {
-                const { assert!(NEW_BOUND >= MAX) };
+                const {
+                    assert!(NEW_BOUND <= $ty::MAX as usize);
+                    assert!(NEW_BOUND >= MAX);
+                }
                 $BoundedType(self.0)
             }
 
             pub const fn add<const NEW_BOUND: usize, const ADD: usize>(
                 &self,
             ) -> $BoundedType<NEW_BOUND> {
-                const { assert!(NEW_BOUND as u128 >= MAX as u128 + ADD as u128) };
+                const {
+                    assert!(NEW_BOUND <= $ty::MAX as usize);
+                    assert!(NEW_BOUND as u128 >= MAX as u128 + ADD as u128);
+                }
                 $BoundedType(self.0 + ADD as $ty)
             }
 
             pub const fn mod_add(&self, val: $ty) -> $BoundedType<MAX> {
-                $BoundedType(((self.0 as usize + val as usize) % (MAX + 1)) as $ty)
+                const { assert!(MAX <= $ty::MAX as usize) };
+                if MAX == $ty::MAX as usize {
+                    $BoundedType(self.0.wrapping_add(val))
+                } else if (MAX + 1).is_power_of_two() {
+                    $BoundedType(self.0.wrapping_add(val) & (MAX as $ty))
+                } else {
+                    $BoundedType(((self.0 as u128 + val as u128) % (MAX as u128 + 1)) as $ty)
+                }
             }
         }
 
         impl<const MAX: usize> BitOr for $BoundedType<MAX> {
             type Output = $BoundedType<MAX>;
             fn bitor(self, rhs: Self) -> Self::Output {
-                const { assert!((MAX as u128).saturating_add(1).is_power_of_two()) };
+                const { assert!((MAX as u128).wrapping_add(1).is_power_of_two()) };
                 $BoundedType(self.0 | rhs.0)
             }
         }
@@ -133,6 +182,7 @@ make_bounded_type!(
     usize
 );
 make_bounded_type!($, BoundedU8, bounded_u8_array, u8);
+make_bounded_type!($, BoundedU16, bounded_u16_array, u16);
 make_bounded_type!($, BoundedU32, bounded_u32_array, u32);
 
 impl BoundedUsize<255> {
@@ -150,6 +200,14 @@ impl<const BOUND: usize> From<BoundedU8<BOUND>> for BoundedUsize<BOUND> {
 impl<const BOUND: usize> From<BoundedU32<BOUND>> for BoundedUsize<BOUND> {
     fn from(value: BoundedU32<BOUND>) -> Self {
         const _: () = assert!(std::mem::size_of::<u32>() <= std::mem::size_of::<usize>());
+        BoundedUsize(value.0 as usize)
+    }
+}
+
+impl<const BOUND: usize> From<BoundedU16<BOUND>> for BoundedUsize<BOUND> {
+    #[inline(always)]
+    fn from(value: BoundedU16<BOUND>) -> Self {
+        const { assert!(std::mem::size_of::<u16>() <= std::mem::size_of::<usize>()) };
         BoundedUsize(value.0 as usize)
     }
 }
