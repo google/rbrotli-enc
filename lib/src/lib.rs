@@ -14,10 +14,12 @@
 #![deny(unsafe_code)]
 
 mod compress;
+#[allow(dead_code)]
 mod constants;
 mod hashtable;
 #[allow(dead_code)]
 mod huffman;
+#[allow(dead_code, unused_imports)]
 mod map_to_sym;
 mod metablock;
 

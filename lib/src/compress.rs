@@ -15,10 +15,7 @@
 use crate::{
     hashtable::HashTable,
     huffman::{ContextMap, HuffmanCode, HuffmanCodeEntry},
-    map_to_sym::{
-        distance_to_sym_and_bits_simd, insert_copy_len_to_sym_and_bits,
-        insert_copy_len_to_sym_and_bits_simd,
-    },
+    map_to_sym::{encode_iac, encode_raw_distance_00, match_short_dist_code},
     metablock::{self, ContextMode},
 };
 use bounded_utils::{BoundedIterable, BoundedSlice, BoundedUsize};
@@ -28,9 +25,19 @@ use safe_unaligned_simd::x86_64::{_mm256_loadu_si256, _mm256_storeu_si256, _mm_l
 use simd_tokens::{simd_entry, Avx2Token, SimdToken};
 use std::arch::x86_64::*;
 use std::mem::MaybeUninit;
-use zerocopy::{transmute, transmute_mut};
+use zerocopy::transmute;
 
 use crate::constants::*;
+const IAC_HIST_BUF_SIZE: usize = 1024;
+const MAX_DIST: usize = STD_DIST_ALPHABET_SIZE;
+const LITERAL_BUF_SIZE: usize = METABLOCK_SIZE + 128;
+const ICD_BUF_SIZE: usize = METABLOCK_SIZE / 4 + 128;
+const SYMBOL_BUF_LIMIT: usize = 1 << 24;
+const SYMBOL_BUF_SIZE: usize = SYMBOL_BUF_LIMIT + 16;
+const DIST_BASE: u16 = MAX_IAC as u16;
+const LIT_BASE: u16 = DIST_BASE + MAX_DIST as u16;
+const HISTOGRAM_BUF_SIZE: usize = 1 << 16;
+const SYMBOL_MASK: u16 = 0x8000;
 
 pub type Literal = u8;
 
@@ -154,79 +161,15 @@ impl MetablockData {
         self.iac_literals += count;
     }
 
-    #[inline]
-    fn add_raw_bits(&mut self, nbits_pat: u64, nbits_count: usize, bits: u64) {
-        *BoundedSlice::new_from_equal_array_mut(
-            self.symbol_or_nbits
-                .first_chunk_mut::<SYMBOL_BUF_SIZE>()
-                .unwrap(),
-        )
-        .get_array_mut::<4, SYMBOL_BUF_LIMIT>(self.num_syms) = transmute!(nbits_pat.to_le_bytes());
-        *BoundedSlice::new_from_equal_array_mut(
-            self.bits.first_chunk_mut::<SYMBOL_BUF_SIZE>().unwrap(),
-        )
-        .get_array_mut::<4, SYMBOL_BUF_LIMIT>(self.num_syms) = transmute!(bits.to_le_bytes());
-        self.num_syms = self.num_syms.mod_add(nbits_count);
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    #[inline]
-    #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2")]
-    fn add_iac(
-        &mut self,
-        i: usize,
-        ii: usize,
-        insert_and_copy_bits_buf: &[u64; 8],
-        insert_and_copy_nbits_pat_buf: &[u64; 8],
-        insert_and_copy_nbits_count_buf: &[u32; 8],
-        insert_and_copy_sym_buf: &[u32; 8],
-        distance_bits_buf: &[u32; 8],
-        distance_nbits_pat_buf: &[u32; 8],
-        distance_nbits_count_buf: &[u32; 8],
-        distance_sym_buf: &[u32; 8],
-        iac_hist_flat: &mut [u32; IAC_HIST_BUF_SIZE],
-        dist_hist_flat: &mut [u32; MAX_DIST],
-    ) {
-        let iac_sym_off = insert_and_copy_sym_buf[ii] as u16;
-        *BoundedSlice::new_from_equal_array_mut(
-            self.symbol_or_nbits
-                .first_chunk_mut::<SYMBOL_BUF_SIZE>()
-                .unwrap(),
-        )
-        .get_mut(self.num_syms) = iac_sym_off;
-        self.num_syms = self.num_syms.mod_add(1);
-        self.add_raw_bits(
-            insert_and_copy_nbits_pat_buf[ii],
-            insert_and_copy_nbits_count_buf[ii] as usize,
-            insert_and_copy_bits_buf[ii],
-        );
-
-        self.add_literals(self.insert_len[i + ii]);
-
-        let dist_sym_off = distance_sym_buf[ii];
-        *BoundedSlice::new_from_equal_array_mut(
-            self.symbol_or_nbits
-                .first_chunk_mut::<SYMBOL_BUF_SIZE>()
-                .unwrap(),
-        )
-        .get_mut(self.num_syms) = dist_sym_off as u16;
-        self.num_syms = self.num_syms.mod_add(1);
-        self.add_raw_bits(
-            distance_nbits_pat_buf[ii] as u64,
-            distance_nbits_count_buf[ii] as usize,
-            distance_bits_buf[ii] as u64,
-        );
-
-        *BoundedSlice::new_from_equal_array_mut(iac_hist_flat).get_mut(BoundedUsize::<
-            { IAC_HIST_BUF_SIZE - 1 },
-        >::new_masked(
-            iac_sym_off as usize - SYMBOL_MASK as usize,
-        )) += 1;
-        *BoundedSlice::new_from_equal_array_mut(dist_hist_flat).get_mut(BoundedUsize::<
-            { MAX_DIST - 1 },
-        >::new_masked(
-            dist_sym_off as usize - (SYMBOL_MASK + DIST_BASE) as usize,
-        )) += 1;
+    fn push_extra(&mut self, mut nbits: u8, mut bits: u64) {
+        while nbits > 0 {
+            let take = nbits.min(16);
+            self.symbol_or_nbits[self.num_syms.get()] = take as u16;
+            self.bits[self.num_syms.get()] = (bits & ((1u64 << take) - 1)) as u16;
+            bits >>= take;
+            nbits -= take;
+            self.num_syms = self.num_syms.mod_add(1);
+        }
     }
 
     #[inline(never)]
@@ -236,97 +179,43 @@ impl MetablockData {
         iac_hist: &mut [u32; IAC_HIST_BUF_SIZE],
         dist_hist: &mut [u32; MAX_DIST],
     ) {
-        let mut insert_and_copy_bits_buf = [0; 8];
-        let mut insert_and_copy_nbits_pat_buf = [0; 8];
-        let mut insert_and_copy_nbits_count_buf = [0; 8];
-        let mut insert_and_copy_sym_buf = [0; 8];
-        let mut distance_bits_buf = [0; 8];
-        let mut distance_nbits_pat_buf = [0; 8];
-        let mut distance_nbits_count_buf = [0; 8];
-        let mut distance_sym_buf = [0; 8];
-
         self.num_syms = BoundedUsize::constant::<0>();
         self.iac_literals = 0;
-        let total_icd = self.total_icd as usize;
-        const ICD_BUF_LIMIT: usize = ICD_BUF_SIZE - 17;
-        debug_assert!(ICD_BUF_LIMIT >= total_icd);
-        for i in BoundedUsize::iter(0, total_icd.div_ceil(8), 8) {
-            insert_copy_len_to_sym_and_bits_simd(
-                BoundedSlice::new_from_equal_array(
-                    self.insert_len.first_chunk::<ICD_BUF_SIZE>().unwrap(),
-                ),
-                BoundedSlice::new_from_equal_array(
-                    self.copy_len.first_chunk::<ICD_BUF_SIZE>().unwrap(),
-                ),
-                i,
-                &mut insert_and_copy_sym_buf,
-                &mut insert_and_copy_bits_buf,
-                &mut insert_and_copy_nbits_pat_buf,
-                &mut insert_and_copy_nbits_count_buf,
-            );
-            distance_to_sym_and_bits_simd::<ICD_BUF_SIZE, ICD_BUF_LIMIT, { ICD_BUF_LIMIT + 2 }>(
-                BoundedSlice::new_from_equal_array(
-                    self.distance.first_chunk::<ICD_BUF_SIZE>().unwrap(),
-                ),
-                i,
-                &mut distance_sym_buf,
-                &mut distance_bits_buf,
-                &mut distance_nbits_pat_buf,
-                &mut distance_nbits_count_buf,
-            );
-
-            if i.get() + 8 <= total_icd {
-                for ii in 0..8 {
-                    self.add_iac(
-                        i.get(),
-                        ii,
-                        &insert_and_copy_bits_buf,
-                        &insert_and_copy_nbits_pat_buf,
-                        &insert_and_copy_nbits_count_buf,
-                        &insert_and_copy_sym_buf,
-                        &distance_bits_buf,
-                        &distance_nbits_pat_buf,
-                        &distance_nbits_count_buf,
-                        &distance_sym_buf,
-                        iac_hist,
-                        transmute_mut!(dist_hist),
-                    );
+        let mut ring = INITIAL_LAST_DISTANCES;
+        for idx in 0..self.total_icd as usize {
+            let ins = self.insert_len[idx];
+            let copy = self.copy_len[idx];
+            let d = self.distance[idx];
+            let (iac_sym, iac_eb, iac_bits) = encode_iac(ins, copy, false);
+            iac_hist[iac_sym as usize] += 1;
+            self.symbol_or_nbits[self.num_syms.get()] = iac_sym | SYMBOL_MASK;
+            self.num_syms = self.num_syms.mod_add(1);
+            self.push_extra(iac_eb, iac_bits);
+            self.add_literals(ins);
+            let (dist_sym, dist_eb, dist_bits) = if let Some(sc) = match_short_dist_code(d, ring) {
+                if sc != 0 {
+                    ring = [d, ring[0], ring[1], ring[2]];
                 }
+                (sc as u16, 0u8, 0u64)
             } else {
-                for ii in 0..(total_icd - i.get()) {
-                    self.add_iac(
-                        i.get(),
-                        ii,
-                        &insert_and_copy_bits_buf,
-                        &insert_and_copy_nbits_pat_buf,
-                        &insert_and_copy_nbits_count_buf,
-                        &insert_and_copy_sym_buf,
-                        &distance_bits_buf,
-                        &distance_nbits_pat_buf,
-                        &distance_nbits_count_buf,
-                        &distance_sym_buf,
-                        iac_hist,
-                        transmute_mut!(dist_hist),
-                    );
-                }
-            }
+                ring = [d, ring[0], ring[1], ring[2]];
+                let (s, eb, b) = encode_raw_distance_00(d);
+                (s, eb, b as u64)
+            };
+            dist_hist[dist_sym as usize] += 1;
+            self.symbol_or_nbits[self.num_syms.get()] = (dist_sym + DIST_BASE) | SYMBOL_MASK;
+            self.num_syms = self.num_syms.mod_add(1);
+            self.push_extra(dist_eb, dist_bits);
         }
         let remaining = self.total_literals - self.iac_literals;
         if remaining != 0 {
-            let (last_iac_sym, mut last_iac_nbits, mut last_iac_bits) =
-                insert_copy_len_to_sym_and_bits(remaining, 4);
+            let (last_iac_sym, last_iac_nbits, last_iac_bits) = encode_iac(remaining, 4, false);
             iac_hist[last_iac_sym as usize] += 1;
             self.symbol_or_nbits[self.num_syms.get()] = last_iac_sym | SYMBOL_MASK;
             self.num_syms = self.num_syms.mod_add(1);
-            while last_iac_nbits > 0 {
-                self.symbol_or_nbits[self.num_syms.get()] = last_iac_nbits.min(16) as u16;
-                self.bits[self.num_syms.get()] = (last_iac_bits & 0xFFFF) as u16;
-                last_iac_bits >>= 16;
-                last_iac_nbits -= last_iac_nbits.min(16);
-                self.num_syms = self.num_syms.mod_add(1);
-            }
+            self.push_extra(last_iac_nbits, last_iac_bits);
             self.add_literals(remaining);
-        };
+        }
     }
 
     #[inline]
@@ -353,7 +242,7 @@ impl MetablockData {
             let sym_or_nbits = _mm256_and_si256(get_sym_mask, sym_or_nbits);
             let mask_even_lanes = _mm256_set1_epi32(0xFFFF);
             let load_huff =
-                |idx: u16| -> u32 { self.histogram_buf[(idx & 0x7FFF) as usize].to_u32() };
+                |idx: u16| -> u32 { transmute!(self.histogram_buf[(idx & 0x7FFF) as usize]) };
             let huff_even_nbits_bits =
                 _mm256_loadu_si256(&std::array::from_fn(|k| load_huff(sym_arr[k * 2])));
             let huff_odd_nbits_bits =
@@ -417,13 +306,6 @@ impl MetablockData {
     #[inline]
     #[target_feature(enable = "sse,sse2,sse3,ssse3,sse4.1,sse4.2,avx,avx2")]
     fn write(&mut self, bw: &mut BitWriter, histo_buf: &mut HistogramBuffers, count: usize) {
-        let mut header = metablock::Header {
-            len: count,
-            ndirect: 0,
-            context_mode: vec![self.context_mode],
-            ..Default::default()
-        };
-
         histo_buf.iac_hist.fill(0);
         histo_buf.dist_hist.fill(0);
         histo_buf.lit_hist.data.fill(0);
@@ -440,32 +322,30 @@ impl MetablockData {
             *histo.get_mut(BoundedUsize::from_u8(*lit)) += 1;
         }
         lit_hist.total = lit_hist.data.iter().copied().sum::<u32>();
-
-        // If we have no literal we still need a dummy huffman tree in the header to comply with the spec
         if lit_hist.total == 0 {
             lit_hist.data[0] += 1;
         }
 
         assert!(self.total_icd <= ICD_BUF_SIZE as u32 + 16);
-
         self.compute_symbols_and_icd_histograms(iac_hist, dist_hist);
-
         if dist_hist.iter().sum::<u32>() == 0 {
             dist_hist[0] = 1;
         }
 
-        let mut buf = &mut self.histogram_buf[..];
-        let mut code;
-        (buf, code) = HuffmanCode::from_counts(&iac_hist[..MAX_IAC], 15, buf);
-        header.insert_and_copy_codes.push(code);
-
-        header.distance_cmap = ContextMap::new(&[0, 0, 0, 0]);
-        (buf, code) = HuffmanCode::from_counts(dist_hist, 15, buf);
-        header.distance_codes.push(code);
-
-        header.literals_cmap = ContextMap::new(&[0; 64]);
-        (_, code) = HuffmanCode::from_counts(&lit_hist.data, 15, buf);
-        header.literals_codes.push(code);
+        let buf = &mut self.histogram_buf[..];
+        let (buf, iac_code) = HuffmanCode::from_counts(&iac_hist[..MAX_IAC], 15, buf);
+        let (buf, dist_code) = HuffmanCode::from_counts(dist_hist, 15, buf);
+        let (_, lit_code) = HuffmanCode::from_counts(&lit_hist.data, 15, buf);
+        let header = metablock::Header {
+            len: count,
+            context_mode: vec![self.context_mode],
+            insert_and_copy_codes: vec![iac_code],
+            distance_cmap: ContextMap::new(&[0; 4]),
+            distance_codes: vec![dist_code],
+            literals_cmap: ContextMap::new(&[0; 64]),
+            literals_codes: vec![lit_code],
+            ..Default::default()
+        };
         header.write(bw);
 
         self.write_bits(bw);
