@@ -17,7 +17,6 @@ mod block_split;
 mod compress;
 mod constants;
 mod context;
-#[allow(dead_code)]
 mod fast_onepass;
 mod hashtable;
 mod huffman;
