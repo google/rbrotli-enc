@@ -15,6 +15,7 @@
 //! Subquadratic $O(N \log N)$ optimal Brotli encoder (`Q10`..=`Q12`).
 
 pub(crate) mod match_gen;
+mod optimal_parse;
 
 pub(crate) use match_gen::DictChain;
 
