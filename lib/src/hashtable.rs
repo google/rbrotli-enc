@@ -180,6 +180,105 @@ pub(crate) fn hash4_p64(word64: u64, log: u32) -> (u64, u32, u32) {
     ((p32 as u64) << 32, p32 << (log & 31), p32)
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct DictEntry(pub(crate) u32, pub(crate) u32, pub(crate) u32);
+
+fn build_dict_entries(bytes: &[u8], q: usize) -> Box<[DictEntry]> {
+    let q = q.min(9);
+    let (lt, cap, n_offs) = (
+        [13, 15, 15, 15, 16, 16, 16, 17, 16, 17][q],
+        [1u8, 1, 4, 8, 8, 8, 16, 16, 32, 32][q],
+        bytes.len().saturating_sub(7),
+    );
+    let mut entries_rev = Vec::with_capacity(n_offs.min((cap as usize) << lt));
+    let mut counts = vec![0u8; usize::from(n_offs > 0) << lt];
+    for off in (0..n_offs).rev() {
+        let (p64, sec_h, _) = hash8_p64(load_word64_padded(&bytes[off..]));
+        let hash32 = (p64 >> 32) as u32;
+        let cnt = &mut counts[(hash32 >> (32 - lt)) as usize];
+        if *cnt < cap {
+            *cnt += 1;
+            entries_rev.push(DictEntry(hash32, sec_h, off as u32));
+        }
+    }
+    entries_rev.reverse();
+    entries_rev.into_boxed_slice()
+}
+
+struct PreparedDictInner {
+    bytes: Box<[u8]>,
+    raw_len: usize,
+    quality_hint: u8,
+    entries: std::sync::OnceLock<Box<[DictEntry]>>,
+}
+
+/// Pre-hashed raw prefix / shared dictionary that can be reused across multiple
+/// [`Encoder::compress_with_dict`](crate::Encoder::compress_with_dict) and
+/// [`StreamingEncoder::set_dictionary`](crate::StreamingEncoder::set_dictionary) calls without
+/// re-hashing.
+///
+/// Encoded streams follow the Brotli Shared/Compound Dictionary specification
+/// (`BrotliDecoderAttachDictionary(..., BROTLI_SHARED_DICTIONARY_RAW, ...)` in C `libbrotlidec` /
+/// `BrotliDecompressCustomDict` in Rust `brotli-decompressor`), rather than the legacy `<= 16 MiB`
+/// `BrotliDecoderSetCustomDictionary` API. Dictionaries larger than [`Self::MAX_RAW_LEN`] retain
+/// their trailing [`Self::MAX_RAW_LEN`] active suffix.
+#[derive(Clone)]
+pub struct PreparedDictionary(std::sync::Arc<PreparedDictInner>);
+
+impl PreparedDictionary {
+    /// Maximum raw compound dictionary byte length accepted by Brotli decoders
+    /// (`SHARED_BROTLI_MAX_RAW_DICT_SIZE`: `2 GiB` on 64-bit targets, `128 MiB` on 32-bit targets).
+    pub const MAX_RAW_LEN: usize = 1usize << if usize::BITS >= 64 { 31 } else { 27 };
+
+    /// Prepares a raw prefix dictionary for `quality` using the default 24-bit window.
+    pub fn new(dict: &[u8], quality: u32) -> Self {
+        Self::with_lgwin(dict, quality, WBITS as u32)
+    }
+
+    /// Prepares a raw prefix dictionary for `(quality, lgwin)`.
+    pub fn with_lgwin(dict: &[u8], quality: u32, lgwin: u32) -> Self {
+        let wbits = (lgwin as usize).clamp(MIN_WBITS, LARGE_MAX_WBITS);
+        let dict = &dict[dict.len().saturating_sub(Self::MAX_RAW_LEN)..];
+        let raw_len = dict.len();
+        let bytes: Box<[u8]> = dict[raw_len.saturating_sub(window_size(wbits))..].into();
+        let entries = std::sync::OnceLock::new();
+        if quality <= 9 {
+            let _ = entries.set(build_dict_entries(&bytes, quality as usize));
+        }
+        Self(std::sync::Arc::new(PreparedDictInner {
+            bytes,
+            raw_len,
+            quality_hint: quality.min(9) as u8,
+            entries,
+        }))
+    }
+
+    /// Full byte length of the attached raw dictionary (used as `compound_dictionary_size` by Brotli decoders).
+    #[inline(always)]
+    pub fn raw_len(&self) -> usize {
+        self.0.raw_len
+    }
+
+    /// Returns `true` if the attached dictionary is empty.
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.0.raw_len == 0
+    }
+
+    #[inline(always)]
+    pub(crate) fn active_slice(&self, wsize: usize) -> &[u8] {
+        let bytes = &self.0.bytes;
+        &bytes[bytes.len().saturating_sub(wsize)..]
+    }
+
+    #[inline]
+    pub(crate) fn entries(&self) -> &[DictEntry] {
+        self.0
+            .entries
+            .get_or_init(|| build_dict_entries(&self.0.bytes, self.0.quality_hint as usize))
+    }
+}
+
 /// Piecewise-linear `log2(x)` in `Q5` fixed-point (`32 == 1.0 bit`) for `x >= 1`.
 #[inline(always)]
 pub(crate) fn log2_u64_q5(x: u64) -> i32 {
@@ -3120,6 +3219,54 @@ impl HashTable {
         self.next_vpos = next;
         if let Some(ldm) = self.ldm.as_mut() {
             ldm.scanned_vpos = next;
+        }
+        wrapped
+    }
+
+    pub(crate) fn prepare_for_input_with_dict(
+        &mut self,
+        wsize: usize,
+        input_len: usize,
+        dict: &PreparedDictionary,
+        seed_ht4_win: usize,
+        seed_ht3: bool,
+    ) -> bool {
+        let ad = dict.active_slice(wsize);
+        let d_len = ad.len();
+        if d_len == 0 {
+            return self.prepare_for_input(wsize, input_len);
+        }
+        let eff_wsize = wsize.min(d_len.saturating_add(input_len));
+        let gap = (eff_wsize + 1).saturating_sub(d_len).max(1);
+        let (dv, wrapped) = self.reserve_vpos_start(gap, d_len, input_len);
+
+        if seed_ht4_win > 0 {
+            self.ensure_ht4_near();
+            if d_len >= 4 && (10..=20).contains(&self.ht4_log) {
+                for off in d_len.saturating_sub(seed_ht4_win)..=d_len - 4 {
+                    let p32 = u32::from_le_bytes(*ad[off..].first_chunk::<4>().unwrap())
+                        .wrapping_mul(HASH_MUL32);
+                    self.insert_ht4(Scalar, p32, (dv + off) as u32);
+                }
+            }
+        }
+        if seed_ht3 && d_len >= 3 {
+            let t3 = self.ht3.get_or_insert_with(|| Box::new([0u32; HT3_SIZE]));
+            for off in d_len.saturating_sub(HT3_MAX_DIST as usize)..=d_len - 3 {
+                *t3.bget_mut(compute_hash3(load_word64_padded(&ad[off..]))) = (dv + off) as u32;
+            }
+        }
+        if (10..=20).contains(&self.log) {
+            let skip = dict.0.bytes.len() - d_len;
+            for &DictEntry(hash32, sec_hash, off) in dict.entries() {
+                if let Some(rel) = (off as usize).checked_sub(skip) {
+                    self.insert_main(Scalar, (hash32 as u64) << 32, (dv + rel) as u32, sec_hash);
+                }
+            }
+        }
+        (self.next_vpos, self.max_vpos_used) = (dv + d_len, dv + d_len);
+        if let Some(ldm) = self.ldm.as_mut() {
+            ldm.scanned_vpos = self.next_vpos;
         }
         wrapped
     }
