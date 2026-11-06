@@ -22,7 +22,7 @@ use crate::{
     metablock::{self, ContextMode},
 };
 use bounded_utils::{BoundedIterable, BoundedSlice, BoundedUsize};
-use hugepage_buffer::BoxedHugePageArray;
+use hugepage_buffer::HugePageBuf;
 use lsb_bitwriter::BitWriter;
 use safe_unaligned_simd::x86_64::{_mm256_loadu_si256, _mm256_storeu_si256, _mm_loadu_si128};
 use simd_tokens::{simd_entry, Avx2Token, SimdToken};
@@ -41,20 +41,20 @@ struct LiteralHistogram {
 }
 
 struct HistogramBuffers {
-    iac_hist: BoxedHugePageArray<u32, IAC_HIST_BUF_SIZE>,
+    iac_hist: HugePageBuf<u32>,
     dist_hist: [u32; MAX_DIST],
     lit_hist: LiteralHistogram,
 }
 
 pub struct MetablockData {
-    literals: BoxedHugePageArray<Literal, LITERAL_BUF_SIZE>,
+    literals: HugePageBuf<Literal>,
     total_literals: u32,
-    copy_len: BoxedHugePageArray<u32, ICD_BUF_SIZE>,
-    insert_len: BoxedHugePageArray<u32, ICD_BUF_SIZE>,
-    distance: BoxedHugePageArray<u32, ICD_BUF_SIZE>,
-    symbol_or_nbits: BoxedHugePageArray<u16, SYMBOL_BUF_SIZE>,
-    bits: BoxedHugePageArray<u16, SYMBOL_BUF_SIZE>,
-    histogram_buf: BoxedHugePageArray<HuffmanCodeEntry, HISTOGRAM_BUF_SIZE>,
+    copy_len: HugePageBuf<u32>,
+    insert_len: HugePageBuf<u32>,
+    distance: HugePageBuf<u32>,
+    symbol_or_nbits: HugePageBuf<u16>,
+    bits: HugePageBuf<u16>,
+    histogram_buf: HugePageBuf<HuffmanCodeEntry>,
     total_icd: u32,
     iac_literals: u32,
     context_mode: ContextMode,
@@ -64,14 +64,14 @@ pub struct MetablockData {
 impl MetablockData {
     fn new() -> MetablockData {
         MetablockData {
-            literals: BoxedHugePageArray::new_zeroed(),
+            literals: HugePageBuf::new_zeroed(LITERAL_BUF_SIZE),
             total_literals: 0,
-            insert_len: BoxedHugePageArray::new_zeroed(),
-            copy_len: BoxedHugePageArray::new_zeroed(),
-            distance: BoxedHugePageArray::new_zeroed(),
-            symbol_or_nbits: BoxedHugePageArray::new_zeroed(),
-            bits: BoxedHugePageArray::new_zeroed(),
-            histogram_buf: BoxedHugePageArray::new_zeroed(),
+            insert_len: HugePageBuf::new_zeroed(ICD_BUF_SIZE),
+            copy_len: HugePageBuf::new_zeroed(ICD_BUF_SIZE),
+            distance: HugePageBuf::new_zeroed(ICD_BUF_SIZE),
+            symbol_or_nbits: HugePageBuf::new_zeroed(SYMBOL_BUF_SIZE),
+            bits: HugePageBuf::new_zeroed(SYMBOL_BUF_SIZE),
+            histogram_buf: HugePageBuf::new_zeroed(HISTOGRAM_BUF_SIZE),
             total_icd: 0,
             iac_literals: 0,
             context_mode: ContextMode::Signed,
@@ -120,8 +120,14 @@ impl MetablockData {
         if count == 0 {
             return;
         }
-        let literals = BoundedSlice::new_from_equal_array(&self.literals);
-        let syms = BoundedSlice::new_from_equal_array_mut(&mut self.symbol_or_nbits);
+        let literals = BoundedSlice::new_from_equal_array(
+            self.literals.first_chunk::<LITERAL_BUF_SIZE>().unwrap(),
+        );
+        let syms = BoundedSlice::new_from_equal_array_mut(
+            self.symbol_or_nbits
+                .first_chunk_mut::<SYMBOL_BUF_SIZE>()
+                .unwrap(),
+        );
 
         const SIZE_OF_LITERAL: usize = std::mem::size_of::<Literal>();
         let num = count.div_ceil(16);
@@ -150,11 +156,16 @@ impl MetablockData {
 
     #[inline]
     fn add_raw_bits(&mut self, nbits_pat: u64, nbits_count: usize, bits: u64) {
-        *BoundedSlice::new_from_equal_array_mut(&mut self.symbol_or_nbits)
-            .get_array_mut::<4, SYMBOL_BUF_LIMIT>(self.num_syms) =
-            transmute!(nbits_pat.to_le_bytes());
-        *BoundedSlice::new_from_equal_array_mut(&mut self.bits)
-            .get_array_mut::<4, SYMBOL_BUF_LIMIT>(self.num_syms) = transmute!(bits.to_le_bytes());
+        *BoundedSlice::new_from_equal_array_mut(
+            self.symbol_or_nbits
+                .first_chunk_mut::<SYMBOL_BUF_SIZE>()
+                .unwrap(),
+        )
+        .get_array_mut::<4, SYMBOL_BUF_LIMIT>(self.num_syms) = transmute!(nbits_pat.to_le_bytes());
+        *BoundedSlice::new_from_equal_array_mut(
+            self.bits.first_chunk_mut::<SYMBOL_BUF_SIZE>().unwrap(),
+        )
+        .get_array_mut::<4, SYMBOL_BUF_LIMIT>(self.num_syms) = transmute!(bits.to_le_bytes());
         self.num_syms = self.num_syms.mod_add(nbits_count);
     }
 
@@ -177,8 +188,12 @@ impl MetablockData {
         dist_hist_flat: &mut [u32; MAX_DIST],
     ) {
         let iac_sym_off = insert_and_copy_sym_buf[ii] as u16;
-        *BoundedSlice::new_from_equal_array_mut(&mut self.symbol_or_nbits).get_mut(self.num_syms) =
-            iac_sym_off;
+        *BoundedSlice::new_from_equal_array_mut(
+            self.symbol_or_nbits
+                .first_chunk_mut::<SYMBOL_BUF_SIZE>()
+                .unwrap(),
+        )
+        .get_mut(self.num_syms) = iac_sym_off;
         self.num_syms = self.num_syms.mod_add(1);
         self.add_raw_bits(
             insert_and_copy_nbits_pat_buf[ii],
@@ -189,8 +204,12 @@ impl MetablockData {
         self.add_literals(self.insert_len[i + ii]);
 
         let dist_sym_off = distance_sym_buf[ii];
-        *BoundedSlice::new_from_equal_array_mut(&mut self.symbol_or_nbits).get_mut(self.num_syms) =
-            dist_sym_off as u16;
+        *BoundedSlice::new_from_equal_array_mut(
+            self.symbol_or_nbits
+                .first_chunk_mut::<SYMBOL_BUF_SIZE>()
+                .unwrap(),
+        )
+        .get_mut(self.num_syms) = dist_sym_off as u16;
         self.num_syms = self.num_syms.mod_add(1);
         self.add_raw_bits(
             distance_nbits_pat_buf[ii] as u64,
@@ -233,8 +252,12 @@ impl MetablockData {
         debug_assert!(ICD_BUF_LIMIT >= total_icd);
         for i in BoundedUsize::iter(0, total_icd.div_ceil(8), 8) {
             insert_copy_len_to_sym_and_bits_simd(
-                BoundedSlice::new_from_equal_array(&self.insert_len),
-                BoundedSlice::new_from_equal_array(&self.copy_len),
+                BoundedSlice::new_from_equal_array(
+                    self.insert_len.first_chunk::<ICD_BUF_SIZE>().unwrap(),
+                ),
+                BoundedSlice::new_from_equal_array(
+                    self.copy_len.first_chunk::<ICD_BUF_SIZE>().unwrap(),
+                ),
                 i,
                 &mut insert_and_copy_sym_buf,
                 &mut insert_and_copy_bits_buf,
@@ -242,7 +265,9 @@ impl MetablockData {
                 &mut insert_and_copy_nbits_count_buf,
             );
             distance_to_sym_and_bits_simd::<ICD_BUF_SIZE, ICD_BUF_LIMIT, { ICD_BUF_LIMIT + 2 }>(
-                BoundedSlice::new_from_equal_array(&self.distance),
+                BoundedSlice::new_from_equal_array(
+                    self.distance.first_chunk::<ICD_BUF_SIZE>().unwrap(),
+                ),
                 i,
                 &mut distance_sym_buf,
                 &mut distance_bits_buf,
@@ -312,12 +337,18 @@ impl MetablockData {
         bw.write_foreach(
             BoundedUsize::<{ SYMBOL_BUF_SIZE - 16 }>::iter(0, self.num_syms.get() / 16, 16),
             |i| {
-                let sym_arr = BoundedSlice::new_from_equal_array(&self.symbol_or_nbits)
-                    .get_array::<16, { SYMBOL_BUF_SIZE - 16 }>(i);
+                let sym_arr = BoundedSlice::new_from_equal_array(
+                    self.symbol_or_nbits
+                        .first_chunk::<SYMBOL_BUF_SIZE>()
+                        .unwrap(),
+                )
+                .get_array::<16, { SYMBOL_BUF_SIZE - 16 }>(i);
                 let sym_or_nbits = _mm256_loadu_si256(sym_arr);
                 let bits = _mm256_loadu_si256(
-                    BoundedSlice::new_from_equal_array(&self.bits)
-                        .get_array::<16, { SYMBOL_BUF_SIZE - 16 }>(i),
+                    BoundedSlice::new_from_equal_array(
+                        self.bits.first_chunk::<SYMBOL_BUF_SIZE>().unwrap(),
+                    )
+                    .get_array::<16, { SYMBOL_BUF_SIZE - 16 }>(i),
                 );
                 const _: () = assert!(SYMBOL_MASK == 0x8000);
                 let is_symbol = _mm256_srai_epi16::<15>(sym_or_nbits);
@@ -398,7 +429,10 @@ impl MetablockData {
         histo_buf.dist_hist.fill(0);
         histo_buf.lit_hist.data.fill(0);
         histo_buf.lit_hist.total = 0;
-        let iac_hist = &mut histo_buf.iac_hist;
+        let iac_hist = histo_buf
+            .iac_hist
+            .first_chunk_mut::<IAC_HIST_BUF_SIZE>()
+            .unwrap();
         let dist_hist = &mut histo_buf.dist_hist;
         let lit_hist = &mut histo_buf.lit_hist;
 
@@ -506,7 +540,7 @@ impl<
                     data: [0; MAX_LIT],
                     total: 0,
                 },
-                iac_hist: BoxedHugePageArray::new_zeroed(),
+                iac_hist: HugePageBuf::new_zeroed(IAC_HIST_BUF_SIZE),
                 dist_hist: [0; MAX_DIST],
             },
             bwbuf: vec![],

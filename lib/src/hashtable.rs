@@ -16,7 +16,7 @@ use crate::compress::MetablockData;
 use crate::constants::*;
 use bounded_utils::safe_x86_64;
 use bounded_utils::{BoundedIterable, BoundedSlice, BoundedU8, BoundedUsize};
-use hugepage_buffer::BoxedHugePageArray;
+use hugepage_buffer::HugePageBuf;
 use safe_unaligned_simd::x86_64::{_mm256_loadu_si256, _mm256_storeu_si256};
 use std::arch::x86_64::*;
 use zerocopy::FromZeroes;
@@ -358,8 +358,8 @@ pub struct HashTable<
     const ENTRY_SIZE_MINUS_ONE: usize,
     const ENTRY_SIZE_MINUS_EIGHT: usize,
 > {
-    table: BoxedHugePageArray<HashTableEntry<ENTRY_SIZE>, TABLE_SIZE>,
-    replacement_idx: BoxedHugePageArray<BoundedU8<ENTRY_SIZE>, TABLE_SIZE>,
+    table: HugePageBuf<HashTableEntry<ENTRY_SIZE>>,
+    replacement_idx: HugePageBuf<BoundedU8<ENTRY_SIZE>>,
 }
 
 impl<
@@ -370,8 +370,8 @@ impl<
 {
     pub fn new() -> Self {
         HashTable {
-            table: BoxedHugePageArray::new_zeroed(),
-            replacement_idx: BoxedHugePageArray::new_zeroed(),
+            table: HugePageBuf::new_zeroed(TABLE_SIZE),
+            replacement_idx: HugePageBuf::new_zeroed(TABLE_SIZE),
         }
     }
 
@@ -390,8 +390,13 @@ impl<
     #[inline]
     #[target_feature(enable = "sse")]
     fn prefetch_pos(&self, pos: BoundedUsize<{ TABLE_SIZE - 1 }>) {
-        let entry = BoundedSlice::new_from_equal_array(&self.table).get(pos);
-        let ridx = BoundedSlice::new_from_equal_array(&self.replacement_idx).get(pos);
+        let entry =
+            BoundedSlice::new_from_equal_array(self.table.first_chunk::<TABLE_SIZE>().unwrap())
+                .get(pos);
+        let ridx = BoundedSlice::new_from_equal_array(
+            self.replacement_idx.first_chunk::<TABLE_SIZE>().unwrap(),
+        )
+        .get(pos);
         safe_x86_64::_mm_safe_prefetch::<_MM_HINT_ET0, _>(entry);
         safe_x86_64::_mm_safe_prefetch::<_MM_HINT_ET0, _>(ridx);
     }
@@ -443,9 +448,16 @@ impl<
             let hash = BoundedUsize::<{ TABLE_SIZE - 1 }>::new_masked(
                 *BoundedSlice::new_from_equal_array(&hashes).get(po) as usize,
             );
-            let table = BoundedSlice::new_from_equal_array_mut(&mut self.table).get_mut(hash);
-            let replacement_idx =
-                BoundedSlice::new_from_equal_array_mut(&mut self.replacement_idx).get_mut(hash);
+            let table = BoundedSlice::new_from_equal_array_mut(
+                self.table.first_chunk_mut::<TABLE_SIZE>().unwrap(),
+            )
+            .get_mut(hash);
+            let replacement_idx = BoundedSlice::new_from_equal_array_mut(
+                self.replacement_idx
+                    .first_chunk_mut::<TABLE_SIZE>()
+                    .unwrap(),
+            )
+            .get_mut(hash);
 
             if skip == 0 {
                 let (dist, len, gain) = if replacement_idx.get() == 0 {
@@ -543,9 +555,16 @@ impl<
             let hash = BoundedUsize::<{ TABLE_SIZE - 1 }>::new_masked(
                 *BoundedSlice::new_from_equal_array(&hashes).get(po) as usize,
             );
-            let table = BoundedSlice::new_from_equal_array_mut(&mut self.table).get_mut(hash);
-            let replacement_idx =
-                BoundedSlice::new_from_equal_array_mut(&mut self.replacement_idx).get_mut(hash);
+            let table = BoundedSlice::new_from_equal_array_mut(
+                self.table.first_chunk_mut::<TABLE_SIZE>().unwrap(),
+            )
+            .get_mut(hash);
+            let replacement_idx = BoundedSlice::new_from_equal_array_mut(
+                self.replacement_idx
+                    .first_chunk_mut::<TABLE_SIZE>()
+                    .unwrap(),
+            )
+            .get_mut(hash);
             fill_entry_inner::<ENTRY_SIZE, ENTRY_SIZE_MINUS_ONE>(
                 pos,
                 chunk1,
@@ -645,9 +664,16 @@ impl<
             let hash = BoundedUsize::<{ TABLE_SIZE - 1 }>::new_masked(
                 *BoundedSlice::new_from_equal_array(&hashes).get(po) as usize,
             );
-            let table = BoundedSlice::new_from_equal_array_mut(&mut self.table).get_mut(hash);
-            let replacement_idx =
-                BoundedSlice::new_from_equal_array_mut(&mut self.replacement_idx).get_mut(hash);
+            let table = BoundedSlice::new_from_equal_array_mut(
+                self.table.first_chunk_mut::<TABLE_SIZE>().unwrap(),
+            )
+            .get_mut(hash);
+            let replacement_idx = BoundedSlice::new_from_equal_array_mut(
+                self.replacement_idx
+                    .first_chunk_mut::<TABLE_SIZE>()
+                    .unwrap(),
+            )
+            .get_mut(hash);
 
             let (dist, len, _gain) = if replacement_idx.get() == 0 {
                 (0, 0, 0)
@@ -689,11 +715,16 @@ impl<
                     let hash = BoundedUsize::<{ TABLE_SIZE - 1 }>::new_masked(
                         hashes[po.get() + i] as usize,
                     );
-                    let table =
-                        BoundedSlice::new_from_equal_array_mut(&mut self.table).get_mut(hash);
-                    let replacement_idx =
-                        BoundedSlice::new_from_equal_array_mut(&mut self.replacement_idx)
-                            .get_mut(hash);
+                    let table = BoundedSlice::new_from_equal_array_mut(
+                        self.table.first_chunk_mut::<TABLE_SIZE>().unwrap(),
+                    )
+                    .get_mut(hash);
+                    let replacement_idx = BoundedSlice::new_from_equal_array_mut(
+                        self.replacement_idx
+                            .first_chunk_mut::<TABLE_SIZE>()
+                            .unwrap(),
+                    )
+                    .get_mut(hash);
                     fill_entry_inner::<ENTRY_SIZE, ENTRY_SIZE_MINUS_ONE>(
                         pos + i,
                         chunk1,
