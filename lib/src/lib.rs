@@ -32,3 +32,4 @@ mod metablock;
 mod static_dict;
 
 pub use compress::Encoder;
+pub use hashtable::PreparedDictionary;
