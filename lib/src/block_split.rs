@@ -24,10 +24,12 @@ use std::collections::BinaryHeap;
 use crate::constants::{MAX_IAC, MAX_LIT};
 use crate::context;
 use crate::huffman::{ContextMap, HuffmanCode, HuffmanCodeEntry, MAX_HUFFMAN_ALPHABET};
-
+use crate::map_to_sym::{
+    copy_code_only, dist_alphabet_size, encode_raw_distance_params, max_dist_symbol,
+};
 use crate::metablock::{
     block_count_to_sym_and_bits, header_count_bit_cost, step_block_type_mtf, ContextMode,
-    NUM_BLOCK_LEN_SYMBOLS,
+    OptimalCommand, NUM_BLOCK_LEN_SYMBOLS,
 };
 
 #[derive(Clone, Debug)]
@@ -700,6 +702,198 @@ pub(crate) fn optimize_flat_clustering(
     (best_flat, best_cmap, best_bits)
 }
 
+fn prescreen_dist_params(
+    raw_dists: &[(u8, u32)],
+    raw_seen: usize,
+    large_window: bool,
+    two_ctx: bool,
+    np: u8,
+    nd: u8,
+    counts: &mut [[u32; MAX_HUFFMAN_ALPHABET]; 2],
+) -> u64 {
+    let alpha = dist_alphabet_size(np, nd, large_window);
+    let sym_limit = max_dist_symbol(np, nd, large_window);
+    counts[0][16..alpha].fill(0);
+    if two_ctx {
+        counts[1][16..alpha].fill(0);
+    }
+    let (mut n0, mut n1, mut extra) = (0u32, 0u32, 0u64);
+    for &(ctx, d) in raw_dists {
+        let (s, nb, _) = encode_raw_distance_params(d, np, nd);
+        if (s as usize) >= sym_limit {
+            return u64::MAX;
+        }
+        let ci = usize::from(two_ctx && ctx != 0);
+        counts[ci][s as usize] += 1;
+        (n0, n1, extra) = (n0 + (1 - ci as u32), n1 + ci as u32, extra + nb as u64);
+    }
+    let mut entropy_fp16 = extra << 16;
+    let (mut used_tot, mut span_hdr) = (0u64, 0u64);
+    for (ci, n) in [(0, n0), (1, n1)] {
+        if n == 0 {
+            continue;
+        }
+        let (mut sym_fp16, mut max_sym) = (0u64, 16usize);
+        for (s, &c) in counts[ci][16..alpha].iter().enumerate() {
+            if c > 0 {
+                used_tot += 1;
+                max_sym = 16 + s;
+                sym_fp16 += context::xlog2x_fp16(c);
+            }
+        }
+        entropy_fp16 += context::xlog2x_fp16(n).saturating_sub(sym_fp16);
+        span_hdr += ((max_sym - 16) as u64) / 4;
+    }
+    if raw_seen > raw_dists.len() {
+        entropy_fp16 =
+            (entropy_fp16 + used_tot * 47_274) * (raw_seen as u64) / (raw_dists.len() as u64);
+    }
+    let hdr_bits = if two_ctx {
+        used_tot * 4 + span_hdr
+    } else {
+        used_tot * 6
+    };
+    entropy_fp16 + (hdr_bits << 16)
+}
+
+/// Fast 15-candidate sampled entropy selector for `Q6..=Q9` unsplit metablocks.
+pub(crate) fn select_distance_params_from_samples(
+    samples: &[(u8, u32)],
+    raw_seen: usize,
+    max_raw_d: u32,
+    large_window: bool,
+) -> (u8, u8) {
+    if raw_seen < 48 || samples.len() < 24 {
+        return (0, 0);
+    }
+    let mut counts = [[0u32; MAX_HUFFMAN_ALPHABET]; 2];
+    #[rustfmt::skip]
+    const CANDIDATES: [(u8, u8); 15] = [
+        (0, 0), (0, 4), (0, 8), (0, 12), (0, 15),
+        (1, 0), (1, 4), (1, 8), (1, 16), (1, 30),
+        (2, 0), (2, 8), (2, 16), (2, 32), (2, 60),
+    ];
+    // Evaluating `encode_raw_distance_params` only at `max_raw_d` relies on `np <= 2`
+    // (at `np == 3`, symbol indices are non-monotonic near `2^30`, e.g. `(3, 32)`).
+    const {
+        let mut i = 0;
+        while i < CANDIDATES.len() {
+            assert!(CANDIDATES[i].0 <= 2);
+            i += 1;
+        }
+    };
+    let base_cost = prescreen_dist_params(samples, raw_seen, large_window, true, 0, 0, &mut counts);
+    let (mut best_cost, mut best_pair) = (base_cost, (0u8, 0u8));
+    for &(np, nd) in &CANDIDATES[1..] {
+        if large_window
+            && max_raw_d > 0
+            && (encode_raw_distance_params(max_raw_d, np, nd).0 as usize)
+                >= max_dist_symbol(np, nd, true)
+        {
+            continue;
+        }
+        let c = prescreen_dist_params(samples, raw_seen, large_window, true, np, nd, &mut counts);
+        if c < best_cost {
+            (best_cost, best_pair) = (c, (np, nd));
+        }
+    }
+    if best_pair != (0, 0) && best_cost + (64 << 16) < base_cost {
+        best_pair
+    } else {
+        (0, 0)
+    }
+}
+
+/// Full-grid prescreen -> top-K exact 4-context pricing for `Q10..=Q12` metablocks.
+fn select_optimal_distance_params(
+    cmds: &[OptimalCommand],
+    large_window: bool,
+    effort: u8,
+    hbuf: &mut [HuffmanCodeEntry],
+) -> (u8, u8) {
+    let mut raw_dists: Vec<(u8, u32)> = Vec::new();
+    let mut short_counts = [[0u32; 16]; 4];
+    for c in cmds {
+        if c.emits_dist_sym() {
+            let d_ctx = copy_code_only(c.copy_len).min(3) as u8;
+            if c.dist_mode < 16 {
+                short_counts[d_ctx as usize][c.dist_mode as usize] += 1;
+            } else {
+                raw_dists.push((d_ctx, c.dist));
+            }
+        }
+    }
+    if raw_dists.len() < 16 {
+        return (0, 0);
+    }
+    let mut counts = [[0u32; MAX_HUFFMAN_ALPHABET]; 2];
+    let (mut cands, mut n_cands) = ([(0u64, 0u8, 0u8); 64], 0usize);
+    let (max_np, k_step) = if effort >= 11 {
+        (3u8, 1usize)
+    } else {
+        (2u8, 2usize)
+    };
+    for np in 0..=max_np {
+        for k in (0..15u8).step_by(k_step).chain([15]) {
+            let nd = k << np;
+            let score = prescreen_dist_params(
+                &raw_dists,
+                raw_dists.len(),
+                large_window,
+                false,
+                np,
+                nd,
+                &mut counts,
+            );
+            let mut j = n_cands;
+            while j > 0 && cands[j - 1].0 > score {
+                cands[j] = cands[j - 1];
+                j -= 1;
+            }
+            cands[j] = (score, np, nd);
+            n_cands += 1;
+        }
+    }
+    let top_n = n_cands.min(match effort {
+        12.. => 24,
+        11 => 10,
+        _ => 4,
+    });
+    if !cands[..top_n].iter().any(|&(_, np, nd)| np == 0 && nd == 0) {
+        cands[top_n - 1] = (0, 0, 0);
+    }
+
+    let (mut best_pair, mut best_exact_bits) = ((0u8, 0u8), u64::MAX);
+    let mut ctx_flat = Vec::with_capacity(4 * MAX_HUFFMAN_ALPHABET);
+    'cand: for &(_, np, nd) in &cands[..top_n] {
+        let alpha = dist_alphabet_size(np, nd, large_window);
+        let sym_limit = max_dist_symbol(np, nd, large_window);
+        ctx_flat.clear();
+        ctx_flat.resize(4 * alpha, 0);
+        let mut ctx_tots = [0u32; 4];
+        for ctx in 0..4 {
+            ctx_flat[ctx * alpha..ctx * alpha + 16].copy_from_slice(&short_counts[ctx]);
+            ctx_tots[ctx] = short_counts[ctx].iter().sum();
+        }
+        let mut extra = 0u64;
+        for &(d_ctx, d) in &raw_dists {
+            let (s, eb, _) = encode_raw_distance_params(d, np, nd);
+            if (s as usize) >= sym_limit {
+                continue 'cand;
+            }
+            ctx_flat[(d_ctx as usize) * alpha + (s as usize)] += 1;
+            ctx_tots[d_ctx as usize] += 1;
+            extra += eb as u64;
+        }
+        let (_, _, tree_and_cmap_bits) =
+            optimize_flat_clustering(&ctx_flat, &ctx_tots, alpha, 4, effort, false, hbuf);
+        if tree_and_cmap_bits + extra < best_exact_bits {
+            (best_exact_bits, best_pair) = (tree_and_cmap_bits + extra, (np, nd));
+        }
+    }
+    best_pair
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -727,5 +921,88 @@ mod tests {
         assert_eq!((s_multi.num_types, s_multi.types[0]), (3, 0));
         assert_eq!(s_multi.lengths.iter().sum::<usize>(), multi.len());
         assert!(s_multi.types.windows(2).all(|w| w[0] != w[1]));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_large_window_distance_params_respect_max_dist_symbol() {
+        let mut hbuf = vec![HuffmanCodeEntry::default(); MAX_HUFFMAN_ALPHABET];
+        for base_stride in [4u32, 8] {
+            for extreme_d in [
+                0x4000_0026u32,
+                0x6000_0001,
+                0x6000_0021,
+                0x7FFF_FFF1,
+                0x7FFF_FFFC,
+            ] {
+                let mut cmds: Vec<OptimalCommand> = (0..600u32)
+                    .map(|i| {
+                        let d = if base_stride == 8 {
+                            if i % 2 == 0 {
+                                25 + ((i / 2) % 8)
+                            } else {
+                                609 + ((i / 2) % 8) * 8
+                            }
+                        } else {
+                            4 + (i % 16) * 4
+                        };
+                        OptimalCommand::new(
+                            1,
+                            if (i & 1) == 0 { 4 } else { 6 },
+                            5,
+                            d,
+                            crate::metablock::DIST_MODE_RAW,
+                        )
+                    })
+                    .collect();
+                let to_samples = |cs: &[OptimalCommand]| -> (Vec<(u8, u32)>, u32) {
+                    let s: Vec<_> = cs
+                        .iter()
+                        .map(|c| (u8::from(c.copy_len > 4), c.dist))
+                        .collect();
+                    let m = cs.iter().map(|c| c.dist).max().unwrap_or(0);
+                    (s, m)
+                };
+                let (s0, m0) = to_samples(&cmds);
+                assert_ne!(
+                    select_distance_params_from_samples(&s0, s0.len(), m0, true),
+                    (0, 0)
+                );
+                if base_stride == 8 {
+                    assert_eq!(
+                        select_optimal_distance_params(&cmds, true, 12, &mut hbuf),
+                        (3, 32)
+                    );
+                }
+
+                cmds.push(OptimalCommand::new(
+                    1,
+                    5,
+                    5,
+                    extreme_d,
+                    crate::metablock::DIST_MODE_STATIC_DICT,
+                ));
+                let (s1, m1) = to_samples(&cmds);
+                for effort in [6u8, 10, 11, 12] {
+                    let (np, nd) = if effort < 10 {
+                        select_distance_params_from_samples(&s1, s1.len(), m1, true)
+                    } else {
+                        select_optimal_distance_params(&cmds, true, effort, &mut hbuf)
+                    };
+                    if extreme_d > 0x6000_0000 {
+                        assert_ne!((np, nd), (3, 32));
+                    }
+                    for c in &cmds {
+                        let s = encode_raw_distance_params(c.dist, np, nd).0 as usize;
+                        assert!(
+                            s < max_dist_symbol(np, nd, true),
+                            "stride={base_stride} effort={effort} d={:#x} selected ({np}, {nd}) -> sym={s} >= {}",
+                            c.dist,
+                            max_dist_symbol(np, nd, true)
+                        );
+                    }
+                }
+            }
+        }
     }
 }
