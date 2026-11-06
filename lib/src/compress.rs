@@ -1,4 +1,4 @@
-#![allow(unused_imports, unused_macros)]
+#![allow(unused_imports)]
 // Copyright 2024 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -724,6 +724,880 @@ impl MetablockData {
             }
         }
         self.total_literals = (tl + num_lits) as u32;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
+    fn map_multi_ctx_syms_avx2(lits: __m128i, ctxs: __m128i, cmap_luts: &[__m128i; 4]) -> __m256i {
+        let h0 = _mm_shuffle_epi8(cmap_luts[0], ctxs);
+        let h1 = _mm_shuffle_epi8(cmap_luts[1], ctxs);
+        let h2 = _mm_shuffle_epi8(cmap_luts[2], ctxs);
+        let h3 = _mm_shuffle_epi8(cmap_luts[3], ctxs);
+        let (b4, b5) = (_mm_slli_epi16::<3>(ctxs), _mm_slli_epi16::<2>(ctxs));
+        let hi16 = _mm_blendv_epi8(_mm_blendv_epi8(h0, h1, b4), _mm_blendv_epi8(h2, h3, b4), b5);
+        _mm256_set_m128i(_mm_unpackhi_epi8(lits, hi16), _mm_unpacklo_epi8(lits, hi16))
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
+    fn cmap_luts_avx2(cmap: &[u8; 64]) -> [__m128i; 4] {
+        const LIT_HI: u8 = (LIT_BASE >> 8) as u8;
+        let mut hi = [0u8; 64];
+        let mut c = 0;
+        while c < 64 {
+            hi[c] = LIT_HI.wrapping_add(cmap[c]);
+            c += 1;
+        }
+        let chunks = hi.as_chunks::<16>().0;
+        [
+            _mm_loadu_si128(&chunks[0]),
+            _mm_loadu_si128(&chunks[1]),
+            _mm_loadu_si128(&chunks[2]),
+            _mm_loadu_si128(&chunks[3]),
+        ]
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[simd_entry]
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
+    #[inline(never)]
+    fn encode_symbols_avx2<const TWO_DIST_CTX: bool>(
+        &mut self,
+        npostfix: u8,
+        ndirect: u8,
+        trailing_literals: u32,
+        iac_hist: &mut [u32; IAC_HIST_BUF_SIZE],
+        dist_hist: &mut [u32; DIST_HIST_BUF_SIZE],
+        _token: impl SimdToken,
+    ) {
+        let mut bufs = IcdBatchBufs::default();
+        let total_icd = self.total_icd as usize;
+        let n_batches = total_icd.div_ceil(8);
+        debug_assert!(self.icd_limit + 1 >= total_icd);
+        let ins_chunks = &self.insert_len.as_chunks::<8>().0[..n_batches];
+        let copy_chunks = &self.copy_len.as_chunks::<8>().0[..n_batches];
+        let dist_chunks = &self.distance.as_chunks::<8>().0[..n_batches];
+        let mut enc_icds =
+            Pow2SliceMut::<u64, 8>::from_padded(&mut self.enc_icds[..]).expect("icd_buf");
+
+        let mut ring = self.dist_ring;
+        for (b, ((ins_arr, copy_arr), dist_slice)) in ins_chunks
+            .iter()
+            .zip(copy_chunks)
+            .zip(dist_chunks)
+            .enumerate()
+        {
+            let base_i = b * 8;
+            let limit = (total_icd - base_i).min(8);
+            insert_copy_len_to_sym_and_bits_simd::<TWO_DIST_CTX>(ins_arr, copy_arr, &mut bufs);
+            let v_raw = _mm256_loadu_si256(dist_slice);
+            let prev = _mm_setr_epi32(
+                ring[3] as i32,
+                ring[2] as i32,
+                ring[1] as i32,
+                ring[0] as i32,
+            );
+            let (lo, hi) = (
+                _mm256_castsi256_si128(v_raw),
+                _mm256_extracti128_si256::<1>(v_raw),
+            );
+            let cand_d0 = _mm256_set_m128i(
+                _mm_alignr_epi8::<12>(hi, lo),
+                _mm_alignr_epi8::<12>(lo, prev),
+            );
+            let skip = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_or_si256(
+                v_raw,
+                _mm256_cmpeq_epi32(v_raw, cand_d0),
+            )));
+            let vd = if limit == 8 && skip == 0 {
+                ring = [dist_slice[7], dist_slice[6], dist_slice[5], dist_slice[4]];
+                [
+                    cand_d0,
+                    _mm256_set_m128i(_mm_alignr_epi8::<8>(hi, lo), _mm_alignr_epi8::<8>(lo, prev)),
+                    _mm256_set_m128i(_mm_alignr_epi8::<4>(hi, lo), _mm_alignr_epi8::<4>(lo, prev)),
+                    _mm256_set_m128i(lo, prev),
+                ]
+            } else {
+                let [a0, a1, a2, a3] = step_dist_ring_batch(dist_slice, limit, &mut ring);
+                [
+                    _mm256_loadu_si256(&a0),
+                    _mm256_loadu_si256(&a1),
+                    _mm256_loadu_si256(&a2),
+                    _mm256_loadu_si256(&a3),
+                ]
+            };
+            distance_to_sym_and_bits_simd(vd, v_raw, npostfix, ndirect, &mut bufs);
+            for ii in 0..limit {
+                let (raw_iac, d_sym) = (bufs.iac_sym[ii], bufs.dist_sym[ii]);
+                let imp_d0 = d_sym == 0 && raw_iac < 256;
+                let iac_sym = if imp_d0 { raw_iac - 128 } else { raw_iac };
+                let d_ctx = if TWO_DIST_CTX { bufs.dist_ctx[ii] } else { 0 };
+                let d_sym_enc = if imp_d0 { IMP_D0_SYM } else { d_sym };
+                debug_assert!(iac_sym < MAX_IAC as u32 && d_sym < MAX_HUFFMAN_ALPHABET as u32);
+                debug_assert!(bufs.dist_bits[ii] < (1 << 29));
+                *enc_icds.get_masked_mut(base_i + ii) = (iac_sym as u64)
+                    | ((d_sym_enc as u64) << 10)
+                    | ((d_ctx as u64) << 21)
+                    | ((bufs.dist_bits[ii] as u64) << 22)
+                    | (bufs.iac_bits[ii] << 51);
+                *iac_hist.bget_masked_mut(iac_sym as usize) += 1;
+                if !imp_d0 {
+                    let dist_idx = d_ctx as usize * MAX_HUFFMAN_ALPHABET + d_sym as usize;
+                    *dist_hist.bget_masked_mut(dist_idx) += 1;
+                }
+            }
+        }
+        self.dist_ring = ring;
+        if trailing_literals != 0 {
+            let (sym, _, _) = encode_iac(trailing_literals, 4, false);
+            *iac_hist.bget_masked_mut(sym as usize) += 1;
+        }
+    }
+
+    #[cfg_attr(target_arch = "x86_64", cold)]
+    #[inline(never)]
+    fn emit_lits_range<const MULTI_CTX: bool>(
+        &self,
+        cur: &mut BitStreamCursor<'_, '_>,
+        ls: usize,
+        lb: usize,
+        cmap: &[u8; 64],
+    ) {
+        let Some(lit_sub) = self.literals.get(ls..ls + lb) else {
+            return;
+        };
+        let lc = match (MULTI_CTX, &self.lit_ctx) {
+            (true, Some(c)) => match c.get(ls..ls + lb) {
+                Some(s) => Some(s),
+                None => return,
+            },
+            _ => None,
+        };
+        for (i, &lit) in lit_sub.iter().enumerate() {
+            let c_off = match lc {
+                Some(c) => (cmap[(c[i] & 63) as usize] as usize) << 8,
+                None => 0,
+            };
+            let h = self.histogram_buf[LIT_BASE + c_off + lit as usize];
+            cur.put_bounded(bound64_from_u63(h.len as usize), h.bits as u64);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    fn pack_mc_quad(
+        huff_arr: &[HuffmanCodeEntry; HISTOGRAM_BUF_SIZE],
+        cmap_base: &[usize; 64],
+        &[l0, l1, l2, l3]: &[u8; 4],
+        &[c0, c1, c2, c3]: &[u8; 4],
+        len: usize,
+    ) -> (BoundedUsize<64>, u64) {
+        macro_rules! mc {
+            ($l:ident, $c:ident) => {
+                *huff_arr.bget_masked(cmap_base[($c & 63) as usize] + $l as usize)
+            };
+        }
+        pack_entries_quad_bounded([
+            mc!(l0, c0),
+            mask_huff_entry(mc!(l1, c1), len >= 2),
+            mask_huff_entry(mc!(l2, c2), len >= 3),
+            mask_huff_entry(mc!(l3, c3), len >= 4),
+        ])
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
+    fn emit_mc_lits_avx2(
+        &self,
+        cur: &mut BitStreamCursor<'_, '_>,
+        huff_arr: &[HuffmanCodeEntry; HISTOGRAM_BUF_SIZE],
+        cmap: &[u8; 64],
+        cmap_base: &[usize; 64],
+        cmap_luts: &[__m128i; 4],
+        (ls, lb): (usize, usize),
+    ) {
+        let (Some(lit_sub), Some(ctx_sub)) = (
+            self.literals.get(ls..ls + lb),
+            match &self.lit_ctx {
+                Some(c) => c.get(ls..ls + lb),
+                None => None,
+            },
+        ) else {
+            return;
+        };
+        let (l_chunks, l_rem) = lit_sub.as_chunks::<16>();
+        let (c_chunks, c_rem) = ctx_sub.as_chunks::<16>();
+        if !l_chunks.is_empty() {
+            let Ok(mut batch) = cur.try_batch_iter::<4, _>(l_chunks.iter().zip(c_chunks)) else {
+                with_detached!(cur, |tmp| self
+                    .emit_lits_range::<true>(&mut tmp, ls, lb, cmap));
+                return;
+            };
+            while let Some(((lit_arr, ctx_arr), slot)) = batch.next_slot() {
+                let mut sym_arr = [0u16; 16];
+                _mm256_storeu_si256(
+                    &mut sym_arr,
+                    Self::map_multi_ctx_syms_avx2(
+                        _mm_loadu_si128(lit_arr),
+                        _mm_loadu_si128(ctx_arr),
+                        cmap_luts,
+                    ),
+                );
+                macro_rules! gh8 {
+                    ($($i:literal),+) => { [$(huff_arr.bget_masked(sym_arr[$i] as usize).to_u32()),+] };
+                }
+                let (na, ba) = pack_even_odd_16_avx2(
+                    gh8!(0, 2, 4, 6, 8, 10, 12, 14),
+                    gh8!(1, 3, 5, 7, 9, 11, 13, 15),
+                );
+                slot.put::<4>(na, ba);
+            }
+        }
+        let (lq, lt) = l_rem.as_chunks::<4>();
+        let (cq, ct) = c_rem.as_chunks::<4>();
+        for (ql, qc) in lq.iter().zip(cq) {
+            let (nb, b) = Self::pack_mc_quad(huff_arr, cmap_base, ql, qc, 4);
+            cur.put_bounded(nb, b);
+        }
+        if !lt.is_empty() {
+            let (mut nb, mut b) = (0usize, 0u64);
+            for (&lit, &ctx) in lt.iter().zip(ct) {
+                let e = *huff_arr.bget_masked(cmap_base[(ctx & 63) as usize] + lit as usize);
+                b |= (e.bits as u64) << nb;
+                nb += e.len as usize;
+            }
+            cur.put_bounded(bound64_from_u63(nb), b);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[simd_entry]
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
+    fn emit_bits_avx2<const MULTI_CTX: bool>(
+        &self,
+        bw: &mut BitWriter,
+        (npostfix, ndirect): (u8, u8),
+        cmap: &[u8; 64],
+        simd: X64V3,
+        _token: impl SimdToken,
+    ) {
+        let mut cur = bw.cursor();
+        let huff_arr: &[HuffmanCodeEntry; HISTOGRAM_BUF_SIZE] =
+            self.histogram_buf.first_chunk().unwrap();
+        let lit_lut: &[HuffmanCodeEntry; 256] = huff_arr[LIT_BASE..].first_chunk().unwrap();
+        let (total_icd, total_lits) = (self.total_icd as usize, self.total_literals as usize);
+        let (Some(icds), Some(ins_lens), Some(lits_slice)) = (
+            self.enc_icds.get(..total_icd),
+            self.insert_len.get(..total_icd),
+            self.literals.get(..total_lits),
+        ) else {
+            return;
+        };
+        let lit_pfx8 = BoundedPrefix::<u8, 8>::new(&self.literals);
+        let lc_pfx = match (MULTI_CTX, &self.lit_ctx) {
+            (true, Some(c)) => BoundedPrefix::<u8, 8>::new(c),
+            _ => None,
+        };
+        let cmap_luts = if MULTI_CTX {
+            Self::cmap_luts_avx2(cmap)
+        } else {
+            [_mm_setzero_si128(); 4]
+        };
+        let mut cmap_base = [0usize; 64];
+        if MULTI_CTX {
+            let mut c = 0;
+            while c < 64 {
+                cmap_base[c] = LIT_BASE + (((cmap[c] & 15) as usize) << 8);
+                c += 1;
+            }
+        }
+
+        macro_rules! emit_cmd {
+            ($ls:expr, $lb:expr, $iac:expr, $od:expr) => {{
+                let ((ls, lb), (iac_nb, iac_b), opt_dist) = (($ls, $lb), $iac, $od);
+                if !MULTI_CTX {
+                    emit_cmd_and_lits::<true, 8, X64V3>(
+                        simd,
+                        &mut cur,
+                        lits_slice,
+                        lit_pfx8,
+                        (ls, lb),
+                        lit_lut,
+                        (iac_nb, iac_b),
+                        opt_dist,
+                    );
+                } else if lb == 0 {
+                    emit_cmd_no_lits(&mut cur, (iac_nb, iac_b), opt_dist);
+                } else {
+                    let mut fast_done = false;
+                    if lb <= 8 {
+                        if let (Some(p_l), Some(p_c)) = (lit_pfx8, lc_pfx) {
+                            if let (Some(at_l), Some(at_c)) = (p_l.cursor_at(ls), p_c.cursor_at(ls))
+                            {
+                                if lb <= 4 {
+                                    let (lnb, lb_bits) = Self::pack_mc_quad(
+                                        huff_arr,
+                                        &cmap_base,
+                                        at_l.sub_array::<4, 0>(),
+                                        at_c.sub_array::<4, 0>(),
+                                        lb,
+                                    );
+                                    match opt_dist {
+                                        Some((d_nb, d_b)) => cur
+                                            .put_batch([iac_nb, lnb, d_nb], [iac_b, lb_bits, d_b]),
+                                        None => cur.put_batch([iac_nb, lnb], [iac_b, lb_bits]),
+                                    }
+                                } else {
+                                    let (nb0, b0) = Self::pack_mc_quad(
+                                        huff_arr,
+                                        &cmap_base,
+                                        at_l.sub_array::<4, 0>(),
+                                        at_c.sub_array::<4, 0>(),
+                                        4,
+                                    );
+                                    let (nb1, b1) = Self::pack_mc_quad(
+                                        huff_arr,
+                                        &cmap_base,
+                                        at_l.sub_array::<4, 4>(),
+                                        at_c.sub_array::<4, 4>(),
+                                        lb - 4,
+                                    );
+                                    match opt_dist {
+                                        Some((d_nb, d_b)) => cur.put_batch(
+                                            [iac_nb, nb0, nb1, d_nb],
+                                            [iac_b, b0, b1, d_b],
+                                        ),
+                                        None => cur.put_batch([iac_nb, nb0, nb1], [iac_b, b0, b1]),
+                                    }
+                                }
+                                fast_done = true;
+                            }
+                        }
+                    }
+                    if !fast_done {
+                        cur.put_bounded(iac_nb, iac_b);
+                        with_detached!(cur, |tmp| {
+                            self.emit_mc_lits_avx2(
+                                &mut tmp,
+                                huff_arr,
+                                cmap,
+                                &cmap_base,
+                                &cmap_luts,
+                                (ls, lb),
+                            );
+                        });
+                        if let Some((d_nb, d_b)) = opt_dist {
+                            cur.put_bounded(d_nb, d_b);
+                        }
+                    }
+                }
+            }};
+        }
+
+        let mut lit_pos = 0usize;
+        for (c, (&packed, &ins_u32)) in icds.iter().zip(ins_lens).enumerate() {
+            let num_lits = ins_u32 as usize;
+            let iac_sym = (packed & 0x3FF) as usize;
+            let iac_eb_n =
+                *IAC_EXTRA_BITS.bget(BoundedUsize::<{ MAX_IAC - 1 }>::new_clamped(iac_sym));
+            let iac_eb = if iac_eb_n <= 13 {
+                packed >> 51
+            } else {
+                encode_iac(ins_u32, self.copy_len[c], false).2
+            };
+            let iac_entry =
+                pack_huff_extra_bounded(*huff_arr.bget_masked(iac_sym), iac_eb_n, iac_eb);
+            let d_sym = ((packed >> 10) & 0x7FF) as usize;
+            let opt_dist = if d_sym != IMP_D0_SYM as usize {
+                let d_ctx = ((packed >> 21) & 1) as usize;
+                let d_idx = DIST_BASE + d_ctx * MAX_HUFFMAN_ALPHABET + d_sym;
+                let d_eb_n = dist_sym_extra_bits(d_sym, npostfix, ndirect);
+                let d_eb = (packed >> 22) & 0x1FFF_FFFF;
+                Some(pack_huff_extra_bounded(
+                    *huff_arr.bget_masked(d_idx),
+                    d_eb_n,
+                    d_eb,
+                ))
+            } else {
+                None
+            };
+            emit_cmd!(lit_pos, num_lits, iac_entry, opt_dist);
+            lit_pos += num_lits;
+        }
+        let rem = total_lits - lit_pos;
+        if rem != 0 {
+            let (sym, eb_n, eb_b) = encode_iac(rem as u32, 4, false);
+            let iac_entry =
+                pack_huff_extra_bounded(*huff_arr.bget_masked(sym as usize), eb_n, eb_b);
+            emit_cmd!(lit_pos, rem, iac_entry, None);
+        }
+    }
+
+    #[inline(never)]
+    fn hist_icd_portable<const TWO_DIST_CTX: bool>(
+        &mut self,
+        npostfix: u8,
+        ndirect: u8,
+        trailing_literals: u32,
+        iac_hist: &mut [u32; IAC_HIST_BUF_SIZE],
+        dist_hist: &mut [u32; DIST_HIST_BUF_SIZE],
+    ) {
+        let mut ring = self.dist_ring;
+        for idx in 0..self.total_icd as usize {
+            let cmd = (self.insert_len[idx], self.copy_len[idx], self.distance[idx]);
+            let ((iac_sym, _, _), (d_sym, _, _), imp_d0) =
+                step_icd_scalar(cmd, &mut ring, npostfix, ndirect);
+            iac_hist[iac_sym as usize] += 1;
+            if !imp_d0 {
+                let off = usize::from(TWO_DIST_CTX && cmd.1 > 4) * MAX_HUFFMAN_ALPHABET;
+                dist_hist[off + d_sym as usize] += 1;
+            }
+        }
+        self.dist_ring = ring;
+        if trailing_literals != 0 {
+            let (sym, _, _) = encode_iac(trailing_literals, 4, false);
+            iac_hist[sym as usize] += 1;
+        }
+    }
+
+    #[inline(never)]
+    fn emit_payload_portable<const TWO_DIST_CTX: bool, const MULTI_CTX: bool>(
+        &self,
+        bw: &mut BitWriter,
+        mut ring: [u32; 4],
+        npostfix: u8,
+        ndirect: u8,
+        cmap: &[u8; 64],
+    ) {
+        let mut cur = bw.cursor();
+        let put_sym = |cur: &mut BitStreamCursor<'_, '_>, idx: usize, eb_n: u8, eb_b: u64| {
+            let (nb, b) = pack_huff_extra_bounded(self.histogram_buf[idx], eb_n, eb_b);
+            cur.put_bounded(nb, b);
+        };
+        let mut lit_pos = 0usize;
+        for idx in 0..self.total_icd as usize {
+            let cmd = (self.insert_len[idx], self.copy_len[idx], self.distance[idx]);
+            let ((iac_sym, iac_nb, iac_b), (d_sym, d_nb, d_b), imp_d0) =
+                step_icd_scalar(cmd, &mut ring, npostfix, ndirect);
+            put_sym(&mut cur, iac_sym as usize, iac_nb, iac_b);
+            if cmd.0 != 0 {
+                self.emit_lits_range::<MULTI_CTX>(&mut cur, lit_pos, cmd.0 as usize, cmap);
+                lit_pos += cmd.0 as usize;
+            }
+            if !imp_d0 {
+                let off = usize::from(TWO_DIST_CTX && cmd.1 > 4) * MAX_HUFFMAN_ALPHABET;
+                put_sym(
+                    &mut cur,
+                    DIST_BASE + off + d_sym as usize,
+                    d_nb as u8,
+                    d_b as u64,
+                );
+            }
+        }
+        let rem = self.total_literals as usize - lit_pos;
+        if rem != 0 {
+            let (sym, eb_n, eb_b) = encode_iac(rem as u32, 4, false);
+            put_sym(&mut cur, sym as usize, eb_n, eb_b);
+            self.emit_lits_range::<MULTI_CTX>(&mut cur, lit_pos, rem, cmap);
+        }
+    }
+
+    fn has_multi_regime_signal(&self, mb_len: usize) -> bool {
+        if mb_len < 32_768 {
+            return false;
+        }
+        let tl = self.total_literals as usize;
+        if tl >= 4096 {
+            let n_win = (tl / 4096).clamp(2, 8);
+            let w_len = tl / n_win;
+            let excess_thresh = (256 + (w_len / 12)) as i32;
+            let mut wins = [LiteralHistogram::default(); 8];
+            for (w, wh) in wins.iter_mut().enumerate().take(n_win) {
+                let (s, e) = (w * w_len, if w + 1 == n_win { tl } else { (w + 1) * w_len });
+                count_literals_x4(&self.literals[s..e], &mut wh.data);
+                wh.total = (e - s) as u32;
+            }
+            for w1 in 0..(n_win - 1) {
+                for w2 in (w1 + 1)..n_win {
+                    let (a, b) = (&wins[w1], &wins[w2]);
+                    if context::excess_jsd_slice(&a.data, a.total, &b.data, b.total)
+                        >= excess_thresh
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        let total_icd = self.total_icd as usize;
+        if total_icd >= 512 {
+            let q_len = total_icd / 4;
+            let (mut min_ins, mut max_ins) = (u64::MAX, 0u64);
+            for q in 0..4 {
+                let (s, e) = (q * q_len, if q == 3 { total_icd } else { (q + 1) * q_len });
+                let sum_ins: u64 = self.insert_len[s..e].iter().map(|&v| v as u64).sum();
+                min_ins = min_ins.min(sum_ins);
+                max_ins = max_ins.max(sum_ins);
+            }
+            if max_ins > 3 * min_ins + 1024 {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn try_overwrite_multi_block(
+        &mut self,
+        cfg: FlushCfg,
+        bw: &mut BitWriter,
+        (cp, single_bits, saved_ring): (BitWriterCheckpoint, u64, [u32; 4]),
+        (trailing_literals, npostfix, ndirect): (u32, u8, u8),
+        (full_data, mb_start, mb_end): (&[u8], usize, usize),
+    ) -> bool {
+        if !cfg.ctx_block_split
+            || self.static_out.is_none()
+            || !self.has_multi_regime_signal(mb_end - mb_start)
+        {
+            return false;
+        }
+        let total_icd = self.total_icd as usize;
+        let mut cmds = Vec::with_capacity(total_icd);
+        let (mut ring, mut anchor) = (saved_ring, mb_start);
+        for c in 0..total_icd {
+            let (insert_len, copy_len, raw_d) =
+                (self.insert_len[c], self.copy_len[c], self.distance[c]);
+            let out_len = self.cmd_out_len(c);
+            anchor += insert_len as usize + out_len as usize;
+            let (dist, dist_mode) = if (raw_d & STATIC_DICT_DIST_FLAG) != 0 {
+                (raw_d & !STATIC_DICT_DIST_FLAG, DIST_MODE_STATIC_DICT)
+            } else {
+                let (_, (d_sym, _, _), imp_d0) =
+                    step_icd_scalar((insert_len, copy_len, raw_d), &mut ring, 0, 0);
+                let mode = if imp_d0 {
+                    DIST_MODE_IMPLICIT_D0
+                } else if d_sym < 16 {
+                    d_sym as u8
+                } else {
+                    DIST_MODE_RAW
+                };
+                (raw_d, mode)
+            };
+            cmds.push(OptimalCommand::new(
+                insert_len, copy_len, out_len, dist, dist_mode,
+            ));
+        }
+        debug_assert_eq!(anchor, mb_end - trailing_literals as usize);
+
+        let opts = PlanOpts {
+            large_window: cfg.large_window,
+            fixed_dist: Some((npostfix, ndirect)),
+            base_max_lit_trees: cfg.max_lit_clusters,
+            effort: if cfg.two_step_lazy { 9 } else { 8 },
+            num_threads: 1,
+        };
+        if let Some(plan) =
+            try_plan_metablock(full_data, mb_start, mb_end, &cmds, trailing_literals, opts)
+        {
+            if plan.exact_compressed_bits < single_bits
+                && !metablock::should_emit_uncompressed_plan(mb_end - mb_start, &plan)
+            {
+                bw.restore(cp);
+                write_compressed_metablock(
+                    full_data,
+                    mb_start,
+                    mb_end,
+                    &cmds,
+                    trailing_literals,
+                    &plan,
+                    false,
+                    bw,
+                );
+                self.dist_ring = ring;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn prepare_lit_clusters(
+        &self,
+        cfg: FlushCfg,
+        histo_buf: &mut HistogramBuffers,
+        ctx_counted: usize,
+    ) -> Option<(Vec<u32>, Vec<u32>, [u8; 64])> {
+        let tl = self.total_literals as usize;
+        if !cfg.multi_context || tl < 512 {
+            return None;
+        }
+        let lc = self.lit_ctx.as_deref()?;
+        let hb_ctx = histo_buf.ctx_hists_mut();
+        let start = if (1..=tl).contains(&ctx_counted) {
+            ctx_counted
+        } else {
+            hb_ctx.reset();
+            0
+        };
+        accum_ctx_lits(hb_ctx, &lc[start..tl], &self.literals[start..tl]);
+        debug_assert_eq!(hb_ctx.tots.iter().map(|&t| t as usize).sum::<usize>(), tl);
+
+        let min_gain = if cfg.max_lit_clusters <= 4 { 256 } else { 224 };
+        let (cl_flat, cl_tots, cmap_vec) = context::cluster_flat_jsd(
+            &hb_ctx.flat[..],
+            &hb_ctx.tots,
+            MAX_LIT,
+            cfg.max_lit_clusters,
+            min_gain,
+        );
+        if cl_tots.len() < 2 {
+            return None;
+        }
+        if cfg.max_lit_clusters <= 6 {
+            let single_bits =
+                context::slice_entropy_fp16(&histo_buf.lit_hist.data, histo_buf.lit_hist.total)
+                    >> 16;
+            let multi_bits: u64 = cl_flat
+                .as_chunks::<MAX_LIT>()
+                .0
+                .iter()
+                .zip(&cl_tots)
+                .map(|(d, &t)| context::slice_entropy_fp16(d, t) >> 16)
+                .sum();
+            let extra_gate = (tl as u64) >> if cfg.max_lit_clusters <= 4 { 3 } else { 4 };
+            if single_bits < multi_bits + 160 + ((cl_tots.len() - 1) as u64) * 520 + extra_gate {
+                return None;
+            }
+        }
+        Some((cl_flat, cl_tots, cmap_vec.try_into().unwrap()))
+    }
+
+    fn build_codes_and_write_header(
+        &mut self,
+        cfg: FlushCfg,
+        (count, npostfix, ndirect): (usize, u8, u8),
+        histo_buf: &mut HistogramBuffers,
+        clusters: Option<(&mut [u32], &[u32])>,
+        cmap: &[u8; 64],
+        bw: &mut BitWriter,
+    ) -> u64 {
+        let HistogramBuffers {
+            ref iac_hist,
+            ref mut dist_hist,
+            ref mut lit_hist,
+            ..
+        } = *histo_buf;
+        let dist_alpha = dist_alphabet_size(npostfix, ndirect, cfg.large_window);
+        let (iac_dist_buf, mut lit_buf) = self.histogram_buf.split_at_mut(LIT_BASE);
+        let (iac_slot, dist_area) = iac_dist_buf.split_at_mut(DIST_BASE);
+        let hist_bits = |hist: &[u32], hc: &HuffmanCode<'_>, extra: fn(usize, u8, u8) -> u8| {
+            let mut sum = 0u64;
+            for (s, &c) in hist.iter().enumerate() {
+                if c != 0 {
+                    sum +=
+                        (c as u64) * (hc.code[s].len as u64 + extra(s, npostfix, ndirect) as u64);
+                }
+            }
+            sum
+        };
+        let (_, iac_code) = HuffmanCode::from_counts(&iac_hist[..MAX_IAC], 15, iac_slot);
+        let mut payload_bits =
+            hist_bits(&iac_hist[..MAX_IAC], &iac_code, |s, _, _| IAC_EXTRA_BITS[s]);
+
+        let (d0_area, d1_area) = dist_area.split_at_mut(MAX_HUFFMAN_ALPHABET);
+        let mut dist_codes_arr = [HuffmanCode::default(), HuffmanCode::default()];
+        let use_two_dist = cfg.two_dist_ctx && {
+            let (d0, d1_rest) = dist_hist.split_at_mut(MAX_HUFFMAN_ALPHABET);
+            let (h0, h1) = (&mut d0[..dist_alpha], &d1_rest[..dist_alpha]);
+            let two =
+                context::histogram_distance_slice(h0, h0.iter().sum(), h1, h1.iter().sum()) > 48;
+            if !two {
+                context::add_hist_slice(h0, h1);
+            }
+            two
+        };
+        let (num_dist_codes, dist_cmap_arr) = if use_two_dist {
+            let (_, c0) = HuffmanCode::from_counts(&dist_hist[..dist_alpha], 15, d0_area);
+            let h1 = &dist_hist[MAX_HUFFMAN_ALPHABET..][..dist_alpha];
+            dist_codes_arr = [c0, HuffmanCode::from_counts(h1, 15, d1_area).1];
+            payload_bits += hist_bits(
+                &dist_hist[..dist_alpha],
+                &dist_codes_arr[0],
+                dist_sym_extra_bits,
+            ) + hist_bits(h1, &dist_codes_arr[1], dist_sym_extra_bits);
+            (2, [0, 0, 0, 1])
+        } else {
+            let had_dist = dist_hist[..dist_alpha].iter().any(|&c| c != 0);
+            if !had_dist {
+                dist_hist[0] = 1;
+            }
+            let (_, c0) = HuffmanCode::from_counts(&dist_hist[..dist_alpha], 15, d0_area);
+            if had_dist {
+                payload_bits += hist_bits(&dist_hist[..dist_alpha], &c0, dist_sym_extra_bits);
+            }
+            if cfg.two_dist_ctx {
+                d1_area[..dist_alpha].copy_from_slice(c0.code);
+            }
+            dist_codes_arr[0] = c0;
+            (1, [0, 0, 0, 0])
+        };
+
+        let mut lit_codes_arr: [HuffmanCode<'_>; 16] =
+            std::array::from_fn(|_| HuffmanCode::default());
+        let single_tot = [lit_hist.total];
+        let (lit_rows, lit_tots) = match clusters {
+            Some((flat, tots)) => (flat.as_chunks_mut::<MAX_LIT>().0, tots),
+            None => (std::slice::from_mut(&mut lit_hist.data), &single_tot[..]),
+        };
+        for (idx, (row, &tot)) in lit_rows.iter_mut().zip(lit_tots).enumerate() {
+            if tot == 0 {
+                row[0] = 1;
+            }
+            (lit_buf, lit_codes_arr[idx]) = HuffmanCode::from_counts(row, 15, lit_buf);
+            if tot != 0 {
+                payload_bits += lit_codes_arr[idx].payload_bit_cost(row);
+            }
+        }
+        metablock::Header {
+            len: count,
+            npostfix,
+            ndirect,
+            context_mode: &[self.context_mode],
+            insert_and_copy_codes: &[iac_code],
+            distance_codes: &dist_codes_arr[..num_dist_codes],
+            distance_cmap: ContextMap::new(&dist_cmap_arr),
+            literals_codes: &lit_codes_arr[..lit_tots.len()],
+            literals_cmap: ContextMap::new(cmap),
+            ..Default::default()
+        }
+        .write(bw);
+        payload_bits
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn flush_metablock(
+        &mut self,
+        cfg: FlushCfg,
+        bw: &mut BitWriter,
+        histo_buf: &mut HistogramBuffers,
+        full_data: &[u8],
+        (anchor, mb_start, mb_end): (usize, usize, usize),
+        (precomputed_lit_hist, ctx_counted): (Option<&LiteralHistogram>, usize),
+        use_avx2: bool,
+    ) -> bool {
+        self.add_remaining_literals(cfg.multi_context, full_data, anchor, mb_end);
+        let block_data = &full_data[mb_start..mb_end];
+        if let Some(pre) = precomputed_lit_hist {
+            histo_buf.lit_hist = *pre;
+        } else {
+            count_literals_x4(
+                &self.literals[..self.total_literals as usize],
+                &mut histo_buf.lit_hist.data,
+            );
+            histo_buf.lit_hist.total = self.total_literals;
+        }
+        if should_emit_uncompressed(
+            block_data.len(),
+            self.total_icd,
+            self.total_literals,
+            &histo_buf.lit_hist.data,
+        ) {
+            self.total_icd = 0;
+            write_uncompressed_metablock(block_data, bw);
+            return true;
+        }
+
+        let (saved_ring, trailing_literals) =
+            (self.dist_ring, self.total_literals - self.iac_literals);
+        let (start_bits, cp) = (bw.total_bits(), bw.checkpoint());
+        let avx2_tok = try_avx2(use_avx2);
+
+        let mut multi_ctx = self.prepare_lit_clusters(cfg, histo_buf, ctx_counted);
+        let (use_multi_ctx, cmap) = multi_ctx
+            .as_ref()
+            .map_or((false, [0u8; 64]), |(_, _, m)| (true, *m));
+        let (npostfix, ndirect) = self.select_distance_params(cfg);
+        let dist_alpha = dist_alphabet_size(npostfix, ndirect, cfg.large_window);
+        histo_buf.iac_hist.fill(0);
+        histo_buf.dist_hist[..dist_alpha].fill(0);
+        if cfg.two_dist_ctx {
+            histo_buf.dist_hist[MAX_HUFFMAN_ALPHABET..][..dist_alpha].fill(0);
+        }
+        assert!(self.total_icd as usize + 8 <= self.insert_len.len());
+
+        match avx2_tok {
+            #[cfg(target_arch = "x86_64")]
+            Some(tok) => with_const_bool!(cfg.two_dist_ctx, |TD| {
+                self.encode_symbols_avx2::<TD>(
+                    npostfix,
+                    ndirect,
+                    trailing_literals,
+                    &mut histo_buf.iac_hist,
+                    &mut histo_buf.dist_hist,
+                    tok,
+                )
+            }),
+            _ => with_const_bool!(cfg.two_dist_ctx, |TD| {
+                self.hist_icd_portable::<TD>(
+                    npostfix,
+                    ndirect,
+                    trailing_literals,
+                    &mut histo_buf.iac_hist,
+                    &mut histo_buf.dist_hist,
+                )
+            }),
+        }
+        let payload_bits = self.build_codes_and_write_header(
+            cfg,
+            (block_data.len(), npostfix, ndirect),
+            histo_buf,
+            multi_ctx
+                .as_mut()
+                .map(|(f, t, _)| (f.as_mut_slice(), t.as_slice())),
+            &cmap,
+            bw,
+        );
+        let est_single_bits = (bw.total_bits() - start_bits) + payload_bits;
+        if block_data.len() >= 64 && (block_data.len() as u64) * 8 + 48 < est_single_bits {
+            bw.restore(cp);
+            self.dist_ring = saved_ring;
+            write_uncompressed_metablock(block_data, bw);
+            let uncomp_bits = bw.total_bits() - start_bits;
+            if self.try_overwrite_multi_block(
+                cfg,
+                bw,
+                (cp, uncomp_bits, saved_ring),
+                (trailing_literals, npostfix, ndirect),
+                (full_data, mb_start, mb_end),
+            ) {
+                return false;
+            }
+            self.total_icd = 0;
+            return true;
+        }
+
+        if self.try_overwrite_multi_block(
+            cfg,
+            bw,
+            (cp, est_single_bits, saved_ring),
+            (trailing_literals, npostfix, ndirect),
+            (full_data, mb_start, mb_end),
+        ) {
+            return false;
+        }
+
+        match avx2_tok {
+            #[cfg(target_arch = "x86_64")]
+            Some(tok) => with_const_bool!(use_multi_ctx, |MC| {
+                self.emit_bits_avx2::<MC>(bw, (npostfix, ndirect), &cmap, tok, tok)
+            }),
+            _ => with_const_bool!(cfg.two_dist_ctx, use_multi_ctx, |TD, MC| {
+                self.emit_payload_portable::<TD, MC>(bw, saved_ring, npostfix, ndirect, &cmap)
+            }),
+        }
+        debug_assert_eq!(bw.total_bits() - start_bits, est_single_bits);
+        false
     }
 }
 
