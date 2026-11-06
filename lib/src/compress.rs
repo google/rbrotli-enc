@@ -22,6 +22,10 @@ use crate::{
     block_split::{select_distance_params_from_samples, try_plan_metablock, PlanOpts},
     constants::*,
     context::{self, LiteralHistogram},
+    fast_onepass::{
+        compress_fast_with_tok, fast_twopass_checked_max_output_size_for, ChunkStreamEncoder,
+        OnePassEncoder, ONEPASS_CHUNK_SIZE,
+    },
     hashtable::{
         ArchQ3, ArchQ4, ArchQ5To8, ArchQ9, HashTable, MatchConfig, PreparedDictionary, QualityCfg,
         SliceCostModel, SliceParseState, HT4_DICT_WINDOW, STATIC_LIT_MULT,
@@ -2142,6 +2146,14 @@ fn select_tier<T: Copy>(
     (eff_len, tiers[idx])
 }
 
+impl EncoderImpl for (OnePassEncoder, [(u8, u8); 3]) {
+    fn compress_into(&mut self, data: &[u8], dict: OptDict<'_>, bw: &mut BitWriter<'_>) {
+        let (_, (mls, log)) = select_tier(self.0.wbits(), data.len(), dict, self.1);
+        self.0.configure(mls, log as u32);
+        compress_fast_with_tok(&mut self.0, data, dict, bw, try_avx2(true));
+    }
+}
+
 impl<C: MatchConfig> EncoderImpl for EncoderInternal<C> {
     fn compress_into(&mut self, data: &[u8], dict: OptDict<'_>, bw: &mut BitWriter<'_>) {
         let (eff_len, TierParams(ways, ht4_ways, log, ht4_log, mb_kib)) =
@@ -2162,6 +2174,10 @@ impl<C: MatchConfig> EncoderImpl for EncoderInternal<C> {
         );
         self.compress_one_shot(data, dict, bw, true);
     }
+}
+
+const fn q0_tiers(lw: bool) -> [(u8, u8); 3] {
+    [(4, 13), (5, 14), (5, if lw { 15 } else { 14 })]
 }
 
 #[rustfmt::skip]
@@ -2186,7 +2202,7 @@ macro_rules! box_two_pass {
     ($q:ident, $wbits:ident, $lw:ident, $fb:expr) => {{
         let q = $q as usize;
         match $q {
-            0..=3 => Box::new(EncoderInternal::<ArchQ3>::new(
+            1..=3 => Box::new(EncoderInternal::<ArchQ3>::new(
                 $wbits,
                 QualityCfg::Q3,
                 $lw,
@@ -2242,17 +2258,20 @@ impl Encoder {
     pub fn with_threads(quality: u32, lgwin: u32, _num_threads: usize) -> Encoder {
         let wbits = (lgwin as usize).clamp(MIN_WBITS, LARGE_MAX_WBITS);
         let lw = wbits > STD_MAX_WBITS;
-        let inner: Box<dyn EncoderImpl> = box_two_pass!(
-            quality,
-            wbits,
-            lw,
-            Box::new(EncoderInternal::<ArchQ9>::new(
+        let inner: Box<dyn EncoderImpl> = match quality {
+            0 => Box::new((OnePassEncoder::new(wbits), q0_tiers(lw))),
+            _ => box_two_pass!(
+                quality,
                 wbits,
-                QualityCfg::Q9,
                 lw,
-                TWO_PASS_TIERS[6],
-            ))
-        );
+                Box::new(EncoderInternal::<ArchQ9>::new(
+                    wbits,
+                    QualityCfg::Q9,
+                    lw,
+                    TWO_PASS_TIERS[6]
+                ))
+            ),
+        };
         Encoder {
             inner,
             bwbuf: Vec::new(),
@@ -2271,7 +2290,11 @@ impl Encoder {
     }
 
     fn raw_max_required_size(&self, input_len: usize) -> Option<usize> {
-        checked_max_two_pass_output_size(input_len)
+        match self.quality {
+            0 => fast_twopass_checked_max_output_size_for(input_len, ONEPASS_CHUNK_SIZE),
+            1..=9 => checked_max_two_pass_output_size(input_len),
+            _ => checked_max_two_pass_output_size(input_len),
+        }
     }
 
     fn encode_with<'a>(

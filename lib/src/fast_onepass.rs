@@ -1,4 +1,3 @@
-#![allow(unused_imports)]
 // Copyright 2024 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -1580,10 +1579,533 @@ def_fast_parse_chunk!(|MODE_PB,
     false
 });
 
+#[inline(always)]
+fn sample_strided_64b(buf: &[u8], blocks: usize, b0_cnt: &mut [u16; 256], b1_cnt: &mut [u16; 256]) {
+    const BSIZE: usize = 64;
+    let stride = (buf.len() - BSIZE) / (blocks - 1);
+    for i in 0..blocks {
+        for &[c0, c1, c2, c3] in buf[i * stride..i * stride + BSIZE].as_chunks::<4>().0 {
+            b0_cnt[c0 as usize] += 1;
+            b1_cnt[c1 as usize] += 1;
+            b0_cnt[c2 as usize] += 1;
+            b1_cnt[c3 as usize] += 1;
+        }
+    }
+}
+
+pub(crate) fn compress_fast_with_tok<E: ChunkStreamEncoder>(
+    enc: &mut E,
+    data: &[u8],
+    dict: Option<&PreparedDictionary>,
+    bw: &mut BitWriter<'_>,
+    avx2: OptAvx2,
+) {
+    let (wbits, n) = (enc.wbits(), data.len());
+    write_window_bits(wbits, wbits > STD_MAX_WBITS, bw);
+    if n <= 56 && dict.is_none_or(|d| d.is_empty()) {
+        if n > 0 {
+            write_uncompressed_metablock(data, bw);
+        }
+        write_empty_last_metablock(bw);
+        return;
+    }
+    let mut ring = INITIAL_RING01;
+    enc.run_chunks((Some(n), true, 0), data, 0..n, dict, &mut ring, bw, avx2);
+}
+
+#[inline(always)]
+fn prepare_fast_ht<'d>(
+    ht: &mut HashTable,
+    cap_wsize: usize,
+    prep_len: Option<usize>,
+    dict: Option<&'d PreparedDictionary>,
+) -> (bool, usize, &'d [u8]) {
+    if let Some(d) = dict.filter(|d| !d.is_empty()) {
+        let ad = d.active_slice(cap_wsize);
+        ht.ensure_ht4_near();
+        if let Some(plen) = prep_len {
+            let dict_cap = (1usize << ht.ht4_log) * 2;
+            ht.prepare_for_input_with_dict(cap_wsize, plen.max(16), d, dict_cap, false);
+        }
+        (true, d.raw_len(), ad)
+    } else {
+        if let Some(plen) = prep_len {
+            ht.prepare_for_input(cap_wsize, plen.max(16));
+        }
+        (false, 0, &[])
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn drive_fast_chunks(
+    (raw_wsize, cap_wsize, chunk_size): (usize, usize, usize),
+    (_, full_dict_len, active_dict): (bool, usize, &[u8]),
+    (is_eof, stream_base): (bool, usize),
+    data: &[u8],
+    range: core::ops::Range<usize>,
+    bw: &mut BitWriter<'_>,
+    mut encode_chunk: impl FnMut(ChunkSpan<'_>, &mut BitWriter<'_>) -> (usize, bool),
+) {
+    if range.is_empty() {
+        if is_eof {
+            write_empty_last_metablock(bw);
+        }
+        return;
+    }
+    let eff_wsize = effective_window_size(cap_wsize, data.len(), active_dict.len());
+    let (mut need_trailing_empty, mut chunk_start) = (false, range.start);
+    while chunk_start < range.end {
+        let max_end = (chunk_start + chunk_size).min(range.end);
+        let span = ChunkSpan {
+            prefix: &data[..max_end],
+            start: chunk_start,
+            wsize: raw_wsize,
+            eff_wsize,
+            full_dict_len,
+            stream_base,
+            dict: active_dict,
+        };
+        let (chunk_end, uncomp) = encode_chunk(span, bw);
+        need_trailing_empty = is_eof && chunk_end == range.end && uncomp;
+        chunk_start = chunk_end;
+    }
+    if need_trailing_empty {
+        write_empty_last_metablock(bw);
+    }
+}
+
+/// Compact, zero-intermediate-buffer one-pass Brotli encoder (`Q0`).
+pub(crate) struct OnePassEncoder {
+    ht: HashTable,
+    icd_buf: Option<Box<IcdTables>>,
+    icd_adapted: bool,
+    icd_age: u32,
+    wbits: usize,
+    pos_bits: u8,
+    lw: bool,
+    mls: u8,
+}
+
+impl OnePassEncoder {
+    pub(crate) fn new(wbits: usize) -> Self {
+        let _ = fixed_bank();
+        Self {
+            ht: HashTable::new(),
+            icd_buf: None,
+            icd_adapted: false,
+            icd_age: 0,
+            wbits,
+            pos_bits: onepass_pos_bits(wbits),
+            lw: wbits > STD_MAX_WBITS,
+            mls: 5,
+        }
+    }
+
+    pub(crate) fn configure(&mut self, mls: u8, log: u32) {
+        assert!(matches!(mls, 4 | 5));
+        self.mls = mls;
+        self.ht.configure_layout(self.pos_bits, 1, 1, log, log);
+    }
+
+    pub(crate) fn with_params(wbits: usize, mls: u8, log: u32) -> Self {
+        let mut enc = Self::new(wbits);
+        enc.configure(mls, log);
+        enc
+    }
+
+    fn has_sampled_match(&self, hd: bool, span: ChunkSpan<'_>) -> bool {
+        let (prefix, chunk_start, chunk_len) =
+            (span.prefix, span.start, span.prefix.len() - span.start);
+        let vpos_base = self.ht.next_vpos.wrapping_sub(chunk_start);
+        let base_stride = ((chunk_len - 24) / 16) & !15;
+        let mut local_pos = [u32::MAX; 128];
+        let (log, mls) = (self.ht.log, self.mls);
+        let shift = 64 - log;
+        let mask = (1usize << log) - 1;
+        let mls_usize = mls as usize;
+        let pos_mask = pos_mask_u32(self.pos_bits);
+
+        for i in 0..16 {
+            let pos = chunk_start + i * base_stride;
+            let w = load_u64_at(prefix, pos);
+            let p64 = if hd {
+                hash8_p64(w).0
+            } else {
+                hash_single_p64(true, mls, w, log).0
+            };
+            let prev = self.ht.table[((p64 >> shift) as usize) & mask] & pos_mask;
+            let dist = if prev != 0 {
+                (vpos_base.wrapping_add(pos) as u32).wrapping_sub(prev)
+            } else {
+                0
+            };
+            let mlen = if hd { 8 } else { mls_usize };
+            if dist != 0 && (dist as usize) <= span.eff_wsize.min(pos) {
+                let cand = pos - dist as usize;
+                if prefix.get(cand..cand + mlen) == prefix.get(pos..pos + mlen) {
+                    return true;
+                }
+            }
+        }
+        let raw_chunk = &prefix[chunk_start..];
+        let max_base = chunk_len - 64;
+        for b_off in [0, max_base / 3, (max_base * 2) / 3, max_base] {
+            for step in (0..56).step_by(2) {
+                let off = b_off + step;
+                let w64 = load_u64_at(raw_chunk, off);
+                let h = ((w64 << ((8 - mls_usize) * 8)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 57)
+                    as usize;
+                let prev = std::mem::replace(&mut local_pos[h], off as u32) as usize;
+                if prev < off
+                    && raw_chunk.get(prev..prev + mls_usize) == raw_chunk.get(off..off + mls_usize)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    #[inline(always)]
+    fn emit_uncompressed_chunk(
+        &mut self,
+        hd: bool,
+        span: ChunkSpan<'_>,
+        is_final: bool,
+        bw: &mut BitWriter,
+    ) -> (usize, bool) {
+        (
+            span.prefix.len(),
+            emit_uncompressed_fast_chunk(&mut self.ht, (true, !hd, self.mls), span, is_final, bw),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn encode_one_chunk(
+        &mut self,
+        hd: bool,
+        mut span: ChunkSpan<'_>,
+        (is_eof, range_end): (bool, usize),
+        ring: &mut [u32; 2],
+        bw: &mut BitWriter,
+        bank: &FixedBank,
+        avx2: OptAvx2,
+    ) -> (usize, bool) {
+        let mut raw_chunk = &span.prefix[span.start..];
+        let mut chunk_len = raw_chunk.len();
+        let mut is_final = is_eof && span.prefix.len() == range_end;
+        if !hd && chunk_len <= 56 {
+            return self.emit_uncompressed_chunk(hd, span, is_final, bw);
+        }
+
+        let lw = self.lw;
+        let di = usize::from(lw);
+        let mut dyn_lut = [HuffmanCodeEntry::default(); 256];
+        let (cp, saved_bits, saved_ring);
+        let mut high_ent_lits = false;
+        let adapted_icd = self
+            .icd_adapted
+            .then_some(self.icd_buf.as_deref())
+            .flatten();
+
+        let lit_lut: &[HuffmanCodeEntry; 256] = if chunk_len < ONEPASS_PRESET_MAX_LEN {
+            let pidx = classify_lit_preset(raw_chunk);
+            (cp, saved_bits, saved_ring) = (bw.checkpoint(), bw.total_bits(), *ring);
+            write_compressed_metablock_prefix(chunk_len, is_final, bw);
+            let hdr = &bank.fixed_headers[pidx][di];
+            write_baked((&hdr.0, hdr.1), bw);
+            &bank.lit_luts[pidx]
+        } else {
+            let (mut counts, max_len) = ([0u32; 256], if chunk_len <= 16_384 { 15 } else { 14 });
+            let mut raw_sample = [0u32; 256];
+            let sample_n: u64;
+            if chunk_len <= 2_048 {
+                sample_n = chunk_len as u64;
+                crate::compress::count_literals_x4(raw_chunk, &mut raw_sample);
+                let sum_sq: u64 = raw_sample.iter().map(|&c| (c as u64) * (c as u64)).sum();
+                if !hd
+                    && 256 * sum_sq <= sample_n * sample_n + 88 * sample_n
+                    && !self.has_sampled_match(hd, span)
+                {
+                    return self.emit_uncompressed_chunk(hd, span, is_final, bw);
+                }
+                for (d, &c) in counts.iter_mut().zip(&raw_sample) {
+                    if c != 0 {
+                        *d = c + c.min(8);
+                    }
+                }
+            } else {
+                const SPLIT_HALF: usize = 65_536;
+                const BSIZE: usize = 64;
+                let (mut b0_cnt, mut b1_cnt) = ([0u16; 256], [0u16; 256]);
+                let (blocks, shift) = if chunk_len > SPLIT_HALF + 2_048 {
+                    sample_strided_64b(&raw_chunk[..SPLIT_HALF], 16, &mut b0_cnt, &mut b1_cnt);
+                    raw_sample = std::array::from_fn(|k| (b0_cnt[k] + b1_cnt[k]) as u32);
+                    sample_strided_64b(&raw_chunk[SPLIT_HALF..], 16, &mut b0_cnt, &mut b1_cnt);
+                    let mut l1_diff = 0u32;
+                    for k in 0..256 {
+                        let tot = (b0_cnt[k] + b1_cnt[k]) as u32;
+                        l1_diff += raw_sample[k].abs_diff(tot - raw_sample[k]);
+                    }
+                    if l1_diff > 640 {
+                        span.prefix = &span.prefix[..span.start + SPLIT_HALF];
+                        raw_chunk = &span.prefix[span.start..];
+                        chunk_len = SPLIT_HALF;
+                        is_final = false;
+                        (16usize, 4u32)
+                    } else {
+                        raw_sample = std::array::from_fn(|k| (b0_cnt[k] + b1_cnt[k]) as u32);
+                        (32usize, 5u32)
+                    }
+                } else {
+                    let (blks, sh) = if chunk_len <= 16_384 {
+                        (16usize, 4u32)
+                    } else {
+                        (32usize, 5u32)
+                    };
+                    sample_strided_64b(raw_chunk, blks, &mut b0_cnt, &mut b1_cnt);
+                    raw_sample = std::array::from_fn(|k| (b0_cnt[k] + b1_cnt[k]) as u32);
+                    (blks, sh)
+                };
+                sample_n = (blocks * BSIZE) as u64;
+                let sum_sq: u32 = raw_sample.iter().map(|&c| c * c).sum();
+                let max_sum_sq: u32 = if blocks == 16 { 5_440 } else { 19_200 };
+                if !hd && sum_sq <= max_sum_sq && !self.has_sampled_match(hd, span) {
+                    return self.emit_uncompressed_chunk(hd, span, is_final, bw);
+                }
+                let present_rows = if chunk_len > 32_768 {
+                    0xFFFF
+                } else {
+                    let mut init_mask = 0u16;
+                    for (r, row) in raw_sample.as_chunks::<16>().0.iter().enumerate() {
+                        init_mask |= u16::from(row.iter().any(|&c| c != 0)) << r;
+                    }
+                    compute_present_rows(raw_chunk, init_mask, avx2)
+                };
+                for r in 0..16 {
+                    if ((present_rows >> r) & 1) != 0 {
+                        let src = &raw_sample[r << 4..(r << 4) + 16];
+                        let prior = if src.iter().filter(|&&c| c != 0).count() >= 4 {
+                            4
+                        } else {
+                            1
+                        };
+                        for (d, &s) in counts[r << 4..(r << 4) + 16].iter_mut().zip(src) {
+                            *d = (s << shift) + prior + (s.min(8) << shift);
+                        }
+                    }
+                }
+            }
+            let (_, huff) = HuffmanCode::from_counts(&counts, max_len, &mut dyn_lut);
+            if !hd {
+                high_ent_lits = huff.payload_bit_cost(&raw_sample) * 100 >= sample_n * 795;
+            }
+            (cp, saved_bits, saved_ring) = (bw.checkpoint(), bw.total_bits(), *ring);
+            write_compressed_metablock_prefix(chunk_len, is_final, bw);
+            adapted_icd.unwrap_or(&bank.icd[di]).write_header(&huff, bw);
+            &dyn_lut
+        };
+
+        let rem_after = if is_eof {
+            range_end - span.prefix.len()
+        } else {
+            usize::MAX
+        };
+        let need_adapt = (self.icd_age & 7) == 3;
+        let track = rem_after >= 65_536 && chunk_len >= 32_768 && need_adapt;
+        let mut rolling = track.then(|| RollingHist::seeded(lw));
+        let active_icd: &IcdTables =
+            match adapted_icd.filter(|_| chunk_len >= ONEPASS_PRESET_MAX_LEN) {
+                Some(t) => t,
+                None => &bank.icd[di],
+            };
+
+        self.ht.ensure_vpos_capacity(span.eff_wsize, chunk_len);
+        let vpos_base = self.ht.next_vpos.wrapping_sub(span.start);
+        let mls = self.mls;
+        let abort_uncomp = {
+            let ts = self.ht.slices1_mut();
+            let init = OnePassInit {
+                bw,
+                lit_lut,
+                icd: active_icd,
+                hist: rolling.as_mut(),
+                high_ent_lits,
+            };
+            #[cfg(target_arch = "x86_64")]
+            macro_rules! q0_pb {
+                ($t:ident, $p:literal) => {
+                    match (mls, track) {
+                        (4, false) => fast_parse_avx2::<$p, false, true, 0, 4, false, _>(
+                            ts,
+                            vpos_base,
+                            span,
+                            &[],
+                            ring,
+                            init,
+                            $t,
+                            $t,
+                        ),
+                        (5, false) => fast_parse_avx2::<$p, false, true, 0, 5, false, _>(
+                            ts,
+                            vpos_base,
+                            span,
+                            &[],
+                            ring,
+                            init,
+                            $t,
+                            $t,
+                        ),
+                        (5, true) => fast_parse_avx2::<$p, false, true, 0, 5, true, _>(
+                            ts,
+                            vpos_base,
+                            span,
+                            &[],
+                            ring,
+                            init,
+                            $t,
+                            $t,
+                        ),
+                        _ => fast_parse_dyn::<true, _>(
+                            ts,
+                            vpos_base,
+                            (lw, 0, hd, mls, track),
+                            span,
+                            &[],
+                            ring,
+                            init,
+                            avx2,
+                        ),
+                    }
+                };
+            }
+            match (avx2, hd, self.pos_bits) {
+                #[cfg(target_arch = "x86_64")]
+                (Some(tok), false, 23) => q0_pb!(tok, 23),
+                #[cfg(target_arch = "x86_64")]
+                (Some(tok), false, 25) => q0_pb!(tok, 25),
+                #[cfg(target_arch = "x86_64")]
+                (Some(tok), false, 26) => q0_pb!(tok, 26),
+                _ => fast_parse_dyn::<true, _>(
+                    ts,
+                    vpos_base,
+                    (lw, 0, hd, mls, track),
+                    span,
+                    &[],
+                    ring,
+                    init,
+                    avx2,
+                ),
+            }
+        };
+        self.ht.next_vpos += chunk_len;
+        self.ht.max_vpos_used = self.ht.next_vpos;
+
+        let uncomp = if abort_uncomp || bw.total_bits() - saved_bits > (chunk_len as u64) * 8 + 32 {
+            bw.restore(cp);
+            *ring = saved_ring;
+            write_uncompressed_metablock(raw_chunk, bw);
+            true
+        } else {
+            if let Some(h) = rolling.filter(|h| h.cmds >= 48) {
+                self.icd_buf
+                    .get_or_insert_with(|| Box::new(IcdTables::empty()))
+                    .fill_from_counts(&h.iac, &h.dist, lw);
+                self.icd_adapted = true;
+            }
+            self.icd_age = self.icd_age.wrapping_add(1);
+            false
+        };
+        (span.prefix.len(), uncomp)
+    }
+}
+
+const NO_DIST_SYM: BoundedU8<LARGE_DIST_ALPHABET_SIZE> = BoundedU8::MAX;
+
+impl ChunkStreamEncoder for OnePassEncoder {
+    fn wbits(&self) -> usize {
+        self.wbits
+    }
+
+    fn chunk_size(&self) -> usize {
+        ONEPASS_CHUNK_SIZE
+    }
+
+    fn retain_window(&self, wsize: usize) -> usize {
+        wsize.min(onepass_max_window(self.pos_bits))
+    }
+
+    fn run_chunks(
+        &mut self,
+        (prep_len, is_eof, stream_base): (Option<usize>, bool, usize),
+        data: &[u8],
+        range: core::ops::Range<usize>,
+        dict: Option<&PreparedDictionary>,
+        ring: &mut [u32; 2],
+        bw: &mut BitWriter<'_>,
+        avx2: OptAvx2,
+    ) {
+        if prep_len.is_some() {
+            self.icd_age = 0;
+            self.icd_adapted = false;
+        }
+        let raw_wsize = window_size(self.wbits);
+        let cap_wsize = self.retain_window(raw_wsize);
+        let dict_info = prepare_fast_ht(&mut self.ht, cap_wsize, prep_len, dict);
+        let (hd, bank, end) = (dict_info.0, fixed_bank(), range.end);
+        drive_fast_chunks(
+            (raw_wsize, cap_wsize, ONEPASS_CHUNK_SIZE),
+            dict_info,
+            (is_eof, stream_base),
+            data,
+            range,
+            bw,
+            |span, bw| self.encode_one_chunk(hd, span, (is_eof, end), ring, bw, bank, avx2),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metablock::test_helpers::{decompress_brotli, decompress_brotli_with_dict};
     use crate::metablock::{self, ContextMode};
+
+    fn check_eq<const MLS: u8>(
+        inp: &[u8],
+        dict: Option<(&PreparedDictionary, &[u8])>,
+        wbits: usize,
+        tok: OptAvx2,
+    ) -> Vec<u8> {
+        let (cap, prep) = (
+            fast_twopass_max_output_size_for(inp.len(), ONEPASS_CHUNK_SIZE),
+            dict.map(|(p, _)| p),
+        );
+        let enc = |avx| {
+            let mut buf = vec![0u8; cap];
+            let mut bw = BitWriter::new(&mut buf);
+            compress_fast_with_tok(
+                &mut OnePassEncoder::with_params(wbits, MLS, 13),
+                inp,
+                prep,
+                &mut bw,
+                avx,
+            );
+            bw.finalize().to_vec()
+        };
+        let o_scalar = enc(None);
+        if tok.is_some() {
+            assert_eq!(enc(tok), o_scalar);
+        }
+        let dec = dict.map_or_else(
+            || decompress_brotli(&o_scalar),
+            |(_, r)| decompress_brotli_with_dict(&o_scalar, r),
+        );
+        assert_eq!(dec.as_slice(), inp);
+        o_scalar
+    }
 
     #[test]
     fn test_baked_headers_match_metablock_header_write() {
@@ -1636,5 +2158,134 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_onepass_avx2_parity_regimes_dict_lw_and_stream() {
+        let tok = try_avx2(true);
+        #[cfg(target_arch = "x86_64")]
+        if let Some(t) = tok {
+            let bank = fixed_bank();
+            let all_256: Vec<u8> = (0u8..=255).collect();
+            let mut counts = [1u32; 256];
+            for (i, c) in counts[..10].iter_mut().enumerate() {
+                *c = 100_000 >> i;
+            }
+            let mut deep_lut = [HuffmanCodeEntry::default(); 256];
+            let _ = HuffmanCode::from_counts(&counts, 15, &mut deep_lut);
+            assert!(deep_lut.iter().any(|e| e.len == 15));
+            let miri_luts = [&bank.lit_luts[0], &deep_lut];
+            let full_luts = [
+                &bank.lit_luts[0],
+                &bank.lit_luts[1],
+                &bank.lit_luts[2],
+                &deep_lut,
+            ];
+            let luts = if cfg!(miri) {
+                &miri_luts[..]
+            } else {
+                &full_luts[..]
+            };
+            let lens: &[usize] = if cfg!(miri) {
+                &[0, 1, 16, 17, 33]
+            } else {
+                &[0, 1, 2, 3, 4, 5, 15, 16, 17, 31, 32, 37, 256]
+            };
+            let seeds: &[(usize, u64)] = if cfg!(miri) {
+                &[(7, 0b101_0011), (61, (1u64 << 61) - 5)]
+            } else {
+                &[(0, 0), (7, 0b101_0011), (61, (1u64 << 61) - 5)]
+            };
+            for &lut in luts {
+                for &len in lens {
+                    for &(seed_nb, seed_b) in seeds {
+                        let nb = BoundedUsize::<64>::new(seed_nb).unwrap();
+                        let (mut b1, mut b2) = ([0u8; 1024], [0u8; 1024]);
+                        let (mut w1, mut w2) = (BitWriter::new(&mut b1), BitWriter::new(&mut b2));
+                        {
+                            let mut c1 = w1.cursor();
+                            c1.put_bounded(nb, seed_b);
+                            crate::map_to_sym::emit_literals(t, &all_256[..len], lut, &mut c1);
+                        }
+                        {
+                            let mut c2 = w2.cursor();
+                            c2.put_bounded(nb, seed_b);
+                            crate::map_to_sym::emit_literals(Scalar, &all_256[..len], lut, &mut c2);
+                        }
+                        assert_eq!(
+                            (w1.total_bits(), w1.finalize()),
+                            (w2.total_bits(), w2.finalize())
+                        );
+                    }
+                }
+            }
+        }
+
+        if cfg!(miri) {
+            let mini = b"The quick brown fox jumps over the lazy dog in the afternoon. ".repeat(5);
+            check_eq::<5>(&mini, None, 12, tok);
+            return;
+        }
+
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next_u8 = || {
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (rng >> 56) as u8
+        };
+        let skewed: Vec<u8> = (0..180_013)
+            .map(|i| [0x85, 0x80 | (next_u8() & 0x0F)][usize::from(i % 5 != 0)])
+            .collect();
+
+        let mut rand_blob: Vec<u8> = (0..150_000).map(|_| next_u8()).collect();
+        rand_blob.extend_from_within(..150_000);
+        let mut rewind = vec![0u8; 2048];
+        rewind.fill_with(&mut next_u8);
+        rewind[..8].copy_from_slice(b"MATCH123");
+        rewind[64..72].copy_from_slice(b"MATCH123");
+        let prose =
+            br#"<div class="Item">{"title":"Fast Brotli Q0","tags":["avx2","huffman"]}</div>"#
+                .repeat(2400);
+        let english = b"The quick brown fox jumps over the lazy dog in the afternoon. ".repeat(30);
+        let rle = vec![b'A'; 140 * 1024];
+        let dict_raw = b"SHARED_PREFIX_DICTIONARY_MATCH123_0123456789abcdef!";
+        let prep = PreparedDictionary::with_lgwin(dict_raw, 0, 28);
+
+        let (p300, p1500, p9000, r150) = (
+            &prose[..300],
+            &prose[..1500],
+            &prose[..9000],
+            &rand_blob[..150_000],
+        );
+        for inp in [&[][..], b"tiny", p300, p1500, &english[..], p9000, &prose]
+            .into_iter()
+            .chain([rle.as_slice(), &skewed, r150, &rand_blob, &rewind])
+        {
+            assert!(check_eq::<5>(inp, None, 22, tok).len() <= inp.len() + 16);
+            assert!(check_eq::<4>(inp, None, 24, tok).len() <= inp.len() + 16);
+            assert!(check_eq::<5>(inp, None, 28, tok).len() <= inp.len() + 16);
+            check_eq::<5>(inp, Some((&prep, dict_raw)), 28, tok);
+            check_eq::<5>(
+                inp,
+                Some((&PreparedDictionary::with_lgwin(dict_raw, 0, 22), dict_raw)),
+                22,
+                tok,
+            );
+        }
+
+        // Regression test: 6-byte d0 match at distance >= 2 MiB (accepted via `dist == d0`).
+        let mut far_d0 = vec![0u8; (2 << 20) + 128];
+        far_d0.fill_with(&mut next_u8);
+        far_d0[16..24].copy_from_slice(b"ABCDEFGH");
+        let hi = (2 << 20) + 32;
+        far_d0[hi..hi + 8].copy_from_slice(b"ABCDEFGH");
+        far_d0[26..32].copy_from_slice(b"123456");
+        far_d0[hi + 10..hi + 16].copy_from_slice(b"123456");
+        check_eq::<5>(&far_d0, None, 24, tok);
+
+        // Regression test: > 600 KiB multi-chunk adaptive `TRACK` + streaming compaction.
+        let big_prose = prose.repeat(4);
+        check_eq::<5>(&big_prose, None, 24, tok);
     }
 }
