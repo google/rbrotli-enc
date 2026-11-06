@@ -286,6 +286,7 @@ struct PreparedDictInner {
     raw_len: usize,
     quality_hint: u8,
     entries: std::sync::OnceLock<Box<[DictEntry]>>,
+    dict_chain: std::sync::OnceLock<Option<crate::q11::DictChain>>,
     tables_cache: std::sync::RwLock<Vec<std::sync::Arc<PreparedDictTables>>>,
 }
 
@@ -318,15 +319,18 @@ impl PreparedDictionary {
         let dict = &dict[dict.len().saturating_sub(Self::MAX_RAW_LEN)..];
         let raw_len = dict.len();
         let bytes: Box<[u8]> = dict[raw_len.saturating_sub(window_size(wbits))..].into();
-        let entries = std::sync::OnceLock::new();
+        let (entries, dict_chain) = (std::sync::OnceLock::new(), std::sync::OnceLock::new());
         if quality <= 9 {
             let _ = entries.set(build_dict_entries(&bytes, quality as usize));
+        } else {
+            let _ = dict_chain.set(crate::q11::DictChain::new(&bytes));
         }
         let prep = Self(std::sync::Arc::new(PreparedDictInner {
             bytes,
             raw_len,
-            quality_hint: quality.min(9) as u8,
+            quality_hint: quality.min(12) as u8,
             entries,
+            dict_chain,
             tables_cache: std::sync::RwLock::new(Vec::new()),
         }));
         if !cfg!(miri) && quality <= 9 && !prep.0.bytes.is_empty() {
@@ -362,6 +366,14 @@ impl PreparedDictionary {
         self.0
             .entries
             .get_or_init(|| build_dict_entries(&self.0.bytes, self.0.quality_hint as usize))
+    }
+
+    #[inline]
+    pub(crate) fn dict_chain(&self) -> Option<&crate::q11::DictChain> {
+        self.0
+            .dict_chain
+            .get_or_init(|| crate::q11::DictChain::new(&self.0.bytes))
+            .as_ref()
     }
 
     fn build_dict_table_snapshot(&self, key: DictTableKey) -> PreparedDictTables {
