@@ -17,6 +17,7 @@
 use crate::constants::{dispatch_simd, SimdBackend};
 #[cfg(target_arch = "x86_64")]
 use simd_tokens::{simd_entry, SimdToken};
+use std::sync::OnceLock;
 
 const RFC7932_DICT: &[u8; 122_784] = include_bytes!("rfc7932_dict.bin");
 
@@ -591,6 +592,333 @@ fn apply_upper_rfc7932(dst: &mut [u8], word: &[u8], upper_all: bool) {
     }
 }
 
+pub(crate) const FAST_DICT_LOG2: usize = 11;
+pub(crate) const FAST_DICT_SLOTS: usize = 1 << FAST_DICT_LOG2;
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct FastDictCold {
+    w_tail: u64,
+    dict_idx: u32,
+    gain_base_q5: i16,
+    base_len: u16,
+}
+
+#[repr(C, align(64))]
+pub(crate) struct FastDictTable {
+    head: [u64; FAST_DICT_SLOTS],
+    cold: [FastDictCold; FAST_DICT_SLOTS],
+}
+
+fn expand_transform_rfc7932(out: &mut [u8; 64], bl: usize, wi: usize, tid: usize) -> usize {
+    let (pid, op, sid) = RAW_TRANSFORMS[tid];
+    let (pfx, sfx, word) = (cstr_slice(pid), cstr_slice(sid), dict_word(bl, wi));
+    out[..pfx.len()].copy_from_slice(pfx);
+    let mid = match op {
+        0 => word,
+        1..=9 => &word[..bl.saturating_sub(op as usize)],
+        10 | 11 => {
+            apply_upper_rfc7932(&mut out[pfx.len()..pfx.len() + bl], word, op == 11);
+            &[][..]
+        }
+        _ => &word[(op as usize - 11).min(bl)..],
+    };
+    let pos = pfx.len() + if matches!(op, 10 | 11) { bl } else { mid.len() };
+    if !matches!(op, 10 | 11) {
+        out[pfx.len()..pos].copy_from_slice(mid);
+    }
+    out[pos..pos + sfx.len()].copy_from_slice(sfx);
+    pos + sfx.len()
+}
+
+pub(crate) fn fast_dict() -> &'static FastDictTable {
+    static FAST: OnceLock<Box<FastDictTable>> = OnceLock::new();
+    FAST.get_or_init(|| {
+        let mut table = Box::new(FastDictTable {
+            head: [0x00FF_FFFF_FFFF_FFFF; FAST_DICT_SLOTS],
+            cold: [FastDictCold {
+                w_tail: 0,
+                dict_idx: 0,
+                gain_base_q5: 0,
+                base_len: 0,
+            }; FAST_DICT_SLOTS],
+        });
+        let mut best_scores = [0u64; FAST_DICT_SLOTS];
+        let mut buf = [0u8; 64];
+
+        for (tid, &(pid, op, sid)) in RAW_TRANSFORMS.iter().enumerate() {
+            let aff_len = cstr_slice(pid).len() + cstr_slice(sid).len();
+            if aff_len > 8 {
+                continue;
+            }
+            let omit = match op {
+                1..=9 => op as usize,
+                12..=20 => (op - 11) as usize,
+                _ => 0,
+            };
+            let min_bl = (5usize.saturating_sub(aff_len) + omit).max(4).max(omit + 3);
+            let max_bl = (12 - aff_len + omit).min(15);
+            if min_bl > max_bl {
+                continue;
+            }
+            for (base_len, &size_bits) in SIZE_BITS_BY_LEN
+                .iter()
+                .enumerate()
+                .take(max_bl + 1)
+                .skip(min_bl)
+            {
+                let nwords = 1usize << size_bits;
+                let limit = if cfg!(miri) {
+                    nwords.min(4)
+                } else if tid < 32 {
+                    nwords
+                } else {
+                    nwords.min(512)
+                };
+                let cc = crate::map_to_sym::copy_code_only(base_len as u32);
+                let copy_extra_q5 = (crate::map_to_sym::COPY_EXTRA[cc] << 5) as i32;
+                for word_idx in 0..limit {
+                    let out_len = expand_transform_rfc7932(&mut buf, base_len, word_idx, tid);
+                    if !(5..=12).contains(&out_len) {
+                        continue;
+                    }
+                    let dict_idx = encode_raw_dist(word_idx, base_len, tid);
+                    let est_raw = 8192u32.saturating_add(dict_idx);
+                    let dist_bits_q5 = ((31 ^ (est_raw | 1).leading_zeros()) << 5) as i32;
+                    let gain_base = (out_len as i32) * 168 - 352 - copy_extra_q5;
+                    let gain_q5 = gain_base - dist_bits_q5;
+                    if gain_q5 < 64 {
+                        continue;
+                    }
+                    let score =
+                        ((gain_q5 as u64) << 16) / ((word_idx as u64 + 24) * (tid as u64 + 3));
+                    let k4 = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                    let slot = (k4.wrapping_mul(DICT_HASH_MUL32) >> (32 - FAST_DICT_LOG2)) as usize;
+                    if score > best_scores[slot] {
+                        best_scores[slot] = score;
+                        let mut b12 = [0u8; 12];
+                        b12[..out_len].copy_from_slice(&buf[..out_len]);
+                        let w0 = u64::from_le_bytes(*b12.first_chunk::<8>().unwrap());
+                        let w_tail = u64::from_le_bytes(*b12.last_chunk::<8>().unwrap());
+                        table.head[slot] = (w0 & 0x00FF_FFFF_FFFF_FFFF) | ((out_len as u64) << 56);
+                        table.cold[slot] = FastDictCold {
+                            w_tail,
+                            dict_idx,
+                            gain_base_q5: gain_base as i16,
+                            base_len: base_len as u16,
+                        };
+                    }
+                }
+            }
+        }
+        table
+    })
+}
+
+#[inline(always)]
+pub(crate) fn lookup_fast(
+    table: &FastDictTable,
+    word64: u64,
+    hash32_4b: u32,
+    next4: &[u8; 4],
+    (base_dist, max_raw_dist): (u64, u32),
+    (lit_mult, cmd_off, min_gain): (i32, i32, i32),
+) -> Option<StaticDictMatch> {
+    let slot = (hash32_4b >> (32 - FAST_DICT_LOG2)) as usize;
+    let h = table.head[slot];
+    if ((word64 ^ h) << 24) != 0 {
+        return None;
+    }
+    let out_len = (h >> 56) as usize;
+    if out_len == 0 {
+        return None;
+    }
+    let cold = &table.cold[slot];
+    if out_len <= 7 {
+        if ((word64 ^ h) << ((8 - out_len) * 8)) != 0 {
+            return None;
+        }
+    } else if out_len == 8 {
+        if (word64 >> 32) != (cold.w_tail & 0xFFFF_FFFF) {
+            return None;
+        }
+    } else {
+        let tail_in = (word64 >> 32) | ((u32::from_le_bytes(*next4) as u64) << 32);
+        if ((tail_in ^ cold.w_tail) << ((12 - out_len) * 8)) != 0 {
+            return None;
+        }
+    }
+    let raw64 = base_dist + cold.dict_idx as u64;
+    if raw64 > max_raw_dist as u64 {
+        return None;
+    }
+    let raw_dist = raw64 as u32;
+    let dist_bits_q5 = ((31 ^ (raw_dist | 1).leading_zeros()) << 5) as i32;
+    let gain = if lit_mult == 168 && cmd_off == 352 {
+        (cold.gain_base_q5 as i32) - dist_bits_q5
+    } else {
+        let copy_extra_q5 = (out_len as i32) * 168 - 352 - (cold.gain_base_q5 as i32);
+        lit_mult * (out_len as i32) - (cmd_off + dist_bits_q5 + copy_extra_q5)
+    };
+    (gain >= min_gain).then_some(StaticDictMatch {
+        base_len: cold.base_len as u8,
+        out_len: out_len as u8,
+        raw_dist,
+        gain,
+    })
+}
+
+const EXT_BUCKETS_LOG2: usize = 15;
+const EXT_BUCKETS: usize = 1 << EXT_BUCKETS_LOG2;
+
+#[inline(always)]
+fn hash4_raw(k4: u32) -> usize {
+    (k4.wrapping_mul(DICT_HASH_MUL32) >> (32 - EXT_BUCKETS_LOG2)) as usize
+}
+
+struct Dict121Ext {
+    offsets: Box<[u16]>,
+    entries: Box<[u32]>,
+}
+
+impl Dict121Ext {
+    #[inline(always)]
+    fn bucket(&self, h: usize) -> &[u32] {
+        &self.entries[self.offsets[h] as usize..self.offsets[h + 1] as usize]
+    }
+}
+
+fn dict121_ext() -> &'static Dict121Ext {
+    static EXT: OnceLock<Dict121Ext> = OnceLock::new();
+    EXT.get_or_init(|| {
+        let pack = |wi, bl, ol, tid| {
+            (wi as u32) | ((bl as u32) << 11) | ((ol as u32) << 16) | ((tid as u32) << 21)
+        };
+        let mut items = Vec::with_capacity(64_000);
+        for wi in 0..if cfg!(miri) { 8 } else { 1024usize } {
+            let w = dict_word(4, wi);
+            let k4 = u32::from_le_bytes([w[0], w[1], w[2], b'i']);
+            items.push((hash4_raw(k4) as u16, pack(wi, 4, 7, 49)));
+        }
+        for (tid, &(_, op, _)) in RAW_TRANSFORMS
+            .iter()
+            .enumerate()
+            .filter(|&(_, &(_, op, _))| op >= 12)
+        {
+            let skip = (op - 11) as usize;
+            for (bl, &sb) in SIZE_BITS_BY_LEN.iter().enumerate().skip(skip + 4) {
+                let nwords = 1usize << sb;
+                let limit = if cfg!(miri) { nwords.min(4) } else { nwords };
+                for wi in 0..limit {
+                    let s = &dict_word(bl, wi)[skip..];
+                    let k4 = u32::from_le_bytes(*s.first_chunk::<4>().unwrap());
+                    items.push((hash4_raw(k4) as u16, pack(wi, bl, bl - skip, tid)));
+                }
+            }
+        }
+        let sub = |e: u32| {
+            let (wi, bl, ol) = (
+                (e & 0x7FF) as usize,
+                ((e >> 11) & 0x1F) as usize,
+                ((e >> 16) & 0x1F) as usize,
+            );
+            let w = dict_word(bl, wi);
+            if (e >> 21) == 49 {
+                &w[..3]
+            } else {
+                &w[bl - ol..]
+            }
+        };
+        items.sort_unstable_by(|&(ha, a), &(hb, b)| {
+            (ha, (a >> 11) & 0x1F, sub(a), a >> 21, a & 0x7FF).cmp(&(
+                hb,
+                (b >> 11) & 0x1F,
+                sub(b),
+                b >> 21,
+                b & 0x7FF,
+            ))
+        });
+        items.dedup_by(|&mut (hl, l), &mut (hk, k)| {
+            (hl, (l >> 11) & 0x3FF, sub(l)) == (hk, (k >> 11) & 0x3FF, sub(k))
+        });
+
+        let (mut offsets, mut entries) =
+            (vec![0u16; EXT_BUCKETS + 1], Vec::with_capacity(items.len()));
+        for (h, e) in items {
+            offsets[h as usize + 1] += 1;
+            entries.push(e);
+        }
+        for b in 0..EXT_BUCKETS {
+            offsets[b + 1] += offsets[b];
+        }
+        Dict121Ext {
+            offsets: offsets.into_boxed_slice(),
+            entries: entries.into_boxed_slice(),
+        }
+    })
+}
+
+pub(crate) fn warm_dict121() {
+    let _ = dict121_ext();
+}
+
+#[inline(never)]
+pub(crate) fn for_each_dict121_match(
+    slice: &[u8],
+    base_dist: u64,
+    max_raw_dist: u32,
+    min_out_len: usize,
+    mut on_match: impl FnMut(u32, u32, u32),
+) {
+    let (min_out, max_raw) = (min_out_len.max(4), max_raw_dist as u64);
+    if slice.len() < min_out || base_dist > max_raw {
+        return;
+    }
+    let mut emit = |base_len: usize, word_idx: usize, tid: u8, out_len: usize| {
+        let raw = base_dist + encode_raw_dist(word_idx, base_len, tid as usize) as u64;
+        if raw <= max_raw {
+            on_match(out_len as u32, base_len as u32, raw as u32);
+        }
+    };
+    let (mut best, cfg) = (None, (0, 0, 0, 0, 0, 0));
+    probe_base_csr::<true>(slice, 0, 0, min_out as u32, cfg, &mut best, &mut emit);
+    if matches!(slice[0], b' ' | b's' | b',' | b'e' | b'.' | 0xc2) {
+        for (pid_pos, &pid) in DISTINCT_PREFIX_IDS.iter().enumerate().skip(1) {
+            let pfx = cstr_slice(pid);
+            if pfx[0] == slice[0] && slice.starts_with(pfx) {
+                probe_base_csr::<true>(
+                    &slice[pfx.len()..],
+                    pid_pos,
+                    pfx.len(),
+                    min_out as u32,
+                    cfg,
+                    &mut best,
+                    &mut emit,
+                );
+            }
+        }
+    }
+    let raw_k4 = u32::from_le_bytes(*slice.first_chunk::<4>().unwrap());
+    for &e in dict121_ext().bucket(hash4_raw(raw_k4)) {
+        let (wi, bl, ol, tid) = (
+            (e & 0x7FF) as usize,
+            ((e >> 11) & 0x1F) as usize,
+            ((e >> 16) & 0x1F) as usize,
+            (e >> 21) as u8,
+        );
+        let w = dict_word(bl, wi);
+        let eq = (min_out..=slice.len()).contains(&ol)
+            && if tid == 49 {
+                w[..3] == slice[..3] && &slice[3..7] == b"ing "
+            } else {
+                w[bl - ol..] == slice[..ol]
+            };
+        if eq {
+            emit(bl, wi, tid, ol);
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -607,6 +935,50 @@ mod test {
         let mut dec = [0u8; 64];
         let n = TransformDictionaryWord(&mut dec, dict_word(len, widx), len as i32, tid) as usize;
         assert_eq!((n, &dec[..n]), (out_len as usize, &expected[..n]));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_all_121_transforms_discovered_and_verified() {
+        let mut buf = [0u8; 64];
+        for (base_len, &sb) in SIZE_BITS_BY_LEN.iter().enumerate().skip(4) {
+            for word_idx in 0..(1usize << sb) {
+                let w = dict_word(base_len, word_idx);
+                let h0 = hash_norm4(w[0], w[1], w[2], w[3]);
+                for tid in [0i32, 9, 44] {
+                    let tlen = TransformDictionaryWord(&mut buf, w, base_len as i32, tid) as usize;
+                    let phrase = &buf[..tlen];
+                    assert_eq!(hash_norm4(phrase[0], phrase[1], phrase[2], phrase[3]), h0);
+                    let mut found = false;
+                    for_each_dict121_match(phrase, 1, STD_MAX_RAW_STATIC_DIST, 4, |ol, bl, rd| {
+                        verify_word(phrase, ol, bl, rd - 1);
+                        found |= ol as usize == tlen;
+                    });
+                    assert!(
+                        found,
+                        "missing base_len={base_len} word_idx={word_idx} tid={tid}"
+                    );
+                }
+            }
+        }
+        for word_idx in [0usize, 10] {
+            let base_word = dict_word(14, word_idx);
+            for tid in 0..121i32 {
+                let tlen = TransformDictionaryWord(&mut buf, base_word, 14, tid) as usize;
+                let (phrase, mut found) = (&buf[..tlen], false);
+                for_each_dict121_match(phrase, 1, STD_MAX_RAW_STATIC_DIST, 4, |ol, bl, rd| {
+                    verify_word(phrase, ol, bl, rd - 1);
+                    found |= ol as usize == tlen;
+                });
+                assert!(found, "missing tid={tid} word_idx={word_idx}");
+            }
+        }
+        let mut found_timing = false;
+        for_each_dict121_match(b"timing ", 1, STD_MAX_RAW_STATIC_DIST, 4, |ol, bl, rd| {
+            verify_word(b"timing ", ol, bl, rd - 1);
+            found_timing |= ol == 7 && bl == 4 && ((rd - 1) >> 10) == 49;
+        });
+        assert!(found_timing);
     }
 
     #[test]
@@ -648,5 +1020,88 @@ mod test {
             m.base_len as u32,
             m.raw_dist - 100_000,
         );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_fast_dict_all_entries_match_rfc7932_decoder() {
+        let fd = fast_dict();
+        let mut populated = 0usize;
+        for slot in 0..FAST_DICT_SLOTS {
+            let h = fd.head[slot];
+            let out_len = (h >> 56) as u32;
+            if out_len == 0 {
+                continue;
+            }
+            populated += 1;
+            assert!((5..=12).contains(&out_len));
+            let cold = &fd.cold[slot];
+            let base_len = cold.base_len as u32;
+            let dict_idx = cold.dict_idx;
+            let mut phrase = [0u8; 16];
+            phrase[..7].copy_from_slice(&h.to_le_bytes()[..7]);
+            phrase[4..12].copy_from_slice(&cold.w_tail.to_le_bytes());
+            verify_word(&phrase[..out_len as usize], out_len, base_len, dict_idx);
+
+            let w64 = u64::from_le_bytes(*phrase.first_chunk::<8>().unwrap());
+            let h32 = (w64 as u32).wrapping_mul(DICT_HASH_MUL32);
+            assert_eq!((h32 >> (32 - FAST_DICT_LOG2)) as usize, slot);
+            let hit = lookup_fast(
+                fd,
+                w64,
+                h32,
+                phrase[8..12].first_chunk::<4>().unwrap(),
+                (1, STD_MAX_RAW_STATIC_DIST),
+                (168, 352, 48),
+            )
+            .expect("populated fast_dict slot must match its own phrase");
+            assert_eq!(
+                (hit.out_len as u32, hit.base_len as u32, hit.raw_dist),
+                (out_len, base_len, dict_idx + 1)
+            );
+        }
+        assert!(
+            populated >= 1950,
+            "unexpectedly low slot occupancy: {populated}"
+        );
+        // Verify branchless `hash_norm4` matches sequential RFC 7932 UTF-8 folding across boundaries.
+        let ref_norm4 = |b0: u8, b1: u8, b2: u8, b3: u8| {
+            let (mut b, mut i) = ([b0, b1, b2, b3], 0usize);
+            while i < 4 {
+                if b[i] < 0xc0 {
+                    b[i] = b[i].to_ascii_lowercase();
+                    i += 1;
+                } else if b[i] < 0xe0 {
+                    if i < 3 {
+                        b[i + 1] |= 0x20;
+                    }
+                    i += 2;
+                } else {
+                    if i < 2 {
+                        b[i + 2] |= 0x05;
+                    }
+                    i += 3;
+                }
+            }
+            u32::from_le_bytes(b).wrapping_mul(DICT_HASH_MUL32)
+        };
+        let bytes = [
+            0u8, 0x20, b'@', b'A', b'M', b'Z', b'[', b'`', b'a', b'z', b'{', 0x7f, 0x80, 0xbf,
+            0xc0, 0xdf, 0xe0, 0xff,
+        ];
+        for b0 in bytes {
+            for b1 in bytes {
+                for b2 in bytes {
+                    for b3 in bytes {
+                        let ref_h = ref_norm4(b0, b1, b2, b3);
+                        let expected = (
+                            (ref_h >> (32 - CSR_BUCKETS_LOG2)) as usize,
+                            (ref_h >> 10) as u8,
+                        );
+                        assert_eq!(hash_norm4(b0, b1, b2, b3), expected);
+                    }
+                }
+            }
+        }
     }
 }
