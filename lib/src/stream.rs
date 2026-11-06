@@ -1,4 +1,3 @@
-#![allow(unused_imports)]
 // Copyright 2026 Google LLC
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -854,7 +853,7 @@ mod tests {
     fn test_empty_streams_and_reset_all_qualities() {
         let sample = make_mixed_corpus(miri_or(128, dbg_or(32_768, 96_000)));
         let lgwin = miri_or(12, 22);
-        let qs: &[u32] = miri_or(&[0, 1, 5], &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        let qs: &[u32] = miri_or(&[0, 1, 5, 10], &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
         for &q in qs {
             let (mut enc, mut out) = (StreamingEncoder::with_lgwin(q, lgwin), [0u8; 64]);
             let res = enc
@@ -894,7 +893,7 @@ mod tests {
                 .repeat(miri_or(32, 60));
         let expected = [chunk.as_slice(), chunk.as_slice()].concat();
         let lgwin = miri_or(12, 20);
-        for &q in miri_or(&[0u32, 1, 5][..], &[0, 1, 4, 6, 9][..]) {
+        for &q in miri_or(&[0u32, 1, 5][..], &[0, 1, 4, 6, 9, 10, 11, 12][..]) {
             let (mut enc, mut comp, mut buf) = (
                 StreamingEncoder::with_lgwin(q, lgwin),
                 Vec::new(),
@@ -924,7 +923,7 @@ mod tests {
     fn test_one_byte_input_and_one_byte_output_backpressure() {
         let data = make_mixed_corpus(miri_or(96, dbg_or(6_500, 18_000)));
         let lgwin = miri_or(12, 18);
-        for &q in miri_or(&[0u32, 5][..], &[0, 2, 5, 8][..]) {
+        for &q in miri_or(&[0u32, 5, 10][..], &[0, 2, 5, 8, 10, 11][..]) {
             let (mut enc, mut comp, mut out1) =
                 (StreamingEncoder::with_lgwin(q, lgwin), Vec::new(), [0u8; 1]);
             for (idx, b) in data.iter().enumerate() {
@@ -937,6 +936,305 @@ mod tests {
             }
             pump_op(&mut enc, StreamOp::Finish, &[], &mut out1, &mut comp);
             assert_eq!(decompress_brotli(&comp), data, "1B/1B mismatch at q={q}");
+        }
+    }
+
+    #[test]
+    fn test_sliding_window_compaction_small_lgwin_and_dictionary() {
+        let dict_raw = b"custom-sliding-dictionary-header-for-compaction-test-9876543210-abcdef";
+        let payload = [
+            dict_raw.as_slice(),
+            &make_mixed_corpus(miri_or(2_500, dbg_or(28_000, 280_000))),
+        ]
+        .concat();
+        let rfc9841_past_win = cfg!(miri)
+            || crate::metablock::test_helpers::custom_dict_supports_rfc9841_past_window();
+        let dict_lgwin = if rfc9841_past_win {
+            10
+        } else {
+            miri_or(12, 19)
+        };
+        let chunk_sz = miri_or(600, 4096);
+        let reset_slice = &payload[..payload.len().min(miri_or(512, 8192))];
+
+        for &q in miri_or(&[0u32, 5][..], &[0u32, 1, 5, 8, 9, 10, 11, 12][..]) {
+            let dict = PreparedDictionary::with_lgwin(dict_raw, q, dict_lgwin);
+            let (mut enc, mut comp, mut out) = (
+                StreamingEncoder::with_lgwin(q, dict_lgwin),
+                Vec::new(),
+                [0u8; 2048],
+            );
+            enc.set_dictionary(&dict).unwrap();
+            for (ci, chunk) in payload.chunks(chunk_sz).enumerate() {
+                let op = if ci % 5 == 4 {
+                    StreamOp::Flush
+                } else {
+                    StreamOp::Process
+                };
+                pump_op(&mut enc, op, chunk, &mut out, &mut comp);
+            }
+            pump_op(&mut enc, StreamOp::Finish, &[], &mut out, &mut comp);
+            assert_eq!(
+                enc.set_dictionary(&dict),
+                Err(StreamError::DictionaryAfterStart)
+            );
+            assert_eq!(
+                decompress_brotli_with_dict(&comp, dict_raw),
+                payload,
+                "q={q}"
+            );
+            enc.reset();
+            comp.clear();
+            pump_op(&mut enc, StreamOp::Finish, reset_slice, &mut out, &mut comp);
+            assert_eq!(decompress_brotli(&comp), reset_slice, "reset q={q}");
+
+            if !rfc9841_past_win {
+                let mut enc10 = StreamingEncoder::with_lgwin(q, 10);
+                comp.clear();
+                for (ci, chunk) in payload.chunks(chunk_sz).enumerate() {
+                    let op = if ci % 5 == 4 {
+                        StreamOp::Flush
+                    } else {
+                        StreamOp::Process
+                    };
+                    pump_op(&mut enc10, op, chunk, &mut out, &mut comp);
+                }
+                pump_op(&mut enc10, StreamOp::Finish, &[], &mut out, &mut comp);
+                assert_eq!(decompress_brotli(&comp), payload, "lgwin=10 q={q}");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_large_window_streaming_above_16mib() {
+        let mut anchor = Vec::new();
+        append_lcg_bytes(&mut anchor, 65_536, 0x517C_C1B7_2722_0A95, 1);
+        let filler: Vec<u8> = (0..65_536)
+            .map(|i| ((i * 7 + (i >> 8)) & 0xFF) as u8)
+            .collect();
+
+        for &q in dbg_or(&[0u32, 5][..], &[0, 5, 10][..]) {
+            let mut writer = StreamingWriter::with_lgwin(Vec::new(), q, 26);
+            writer.write_all(&anchor).unwrap();
+            (0..272).for_each(|_| writer.write_all(&filler).unwrap());
+            writer.flush().unwrap();
+            let size_before_repeat = writer.get_ref().len();
+            writer.write_all(&anchor).unwrap();
+            let comp = writer.finish().unwrap();
+            assert!(comp.len() - size_before_repeat < 1024, "q={q}");
+            let plain = decompress_brotli(&comp);
+            assert_eq!(plain.len(), anchor.len() * 2 + 272 * filler.len());
+            assert_eq!(
+                (&plain[..anchor.len()], &plain[plain.len() - anchor.len()..]),
+                (&anchor[..], &anchor[..])
+            );
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_streaming_q10_q11_q12_mt_matches_1t_bit_for_bit() {
+        let (corpus_len, lgwin, chunk_sz, q_lens) = dbg_or(
+            (
+                180_000,
+                14,
+                16_384,
+                [(10u32, 180_000), (11, 150_000), (12, 140_000)],
+            ),
+            (
+                (8 << 20) + 700_000,
+                22,
+                131_072,
+                [
+                    (10, (8 << 20) + 700_000),
+                    (11, (4 << 20) + 300_000),
+                    (12, 1_500_000),
+                ],
+            ),
+        );
+        let corpus = make_mixed_corpus(corpus_len);
+        let split = corpus.len() - corpus.len() / 5;
+
+        for (q, slice_len) in q_lens {
+            let data = &corpus[..slice_len];
+            let mid = data.len() - (data.len() / 7).min(split);
+            let run = |threads: usize| -> Vec<u8> {
+                let mut w = StreamingWriter::with_threads(Vec::new(), q, lgwin, threads);
+                data[..mid]
+                    .chunks(chunk_sz)
+                    .for_each(|c| w.write_all(c).unwrap());
+                w.flush().unwrap();
+                data[mid..]
+                    .chunks(chunk_sz)
+                    .for_each(|c| w.write_all(c).unwrap());
+                w.finish().unwrap()
+            };
+            let out_1t = run(1);
+            assert_eq!(out_1t, run(4), "1T != 4T streaming mismatch at q={q}");
+            assert_eq!(decompress_brotli(&out_1t), data);
+        }
+    }
+
+    #[test]
+    fn test_streaming_writer_would_block_recovery_post_finish_flush_and_abandon() {
+        struct FlakyNonBlockingVec {
+            out: Vec<u8>,
+            step: usize,
+            flushes: usize,
+        }
+        impl Write for FlakyNonBlockingVec {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.step += 1;
+                if self.step % 2 == 1 {
+                    Err(io::Error::new(io::ErrorKind::WouldBlock, "try again"))
+                } else {
+                    let n = buf.len().min(7);
+                    self.out.extend_from_slice(&buf[..n]);
+                    Ok(n)
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.step += 1;
+                if self.step.is_multiple_of(3) {
+                    Err(io::Error::new(io::ErrorKind::WouldBlock, "flush blocked"))
+                } else {
+                    self.flushes += 1;
+                    Ok(())
+                }
+            }
+        }
+
+        let payload = make_mixed_corpus(miri_or(1_200, dbg_or(20_000, 150_000)));
+        let (lgwin, chunk_sz) = miri_or((12, 401), (18, 4099));
+        for &q in miri_or(&[0u32, 5][..], &[0, 5, 10][..]) {
+            let mut sw = StreamingWriter::with_lgwin(
+                FlakyNonBlockingVec {
+                    out: Vec::new(),
+                    step: 0,
+                    flushes: 0,
+                },
+                q,
+                lgwin,
+            );
+            for (ci, mut slice) in payload.chunks(chunk_sz).enumerate() {
+                while !slice.is_empty() {
+                    match sw.write(slice) {
+                        Ok(n) => slice = &slice[n..],
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                        Err(e) => panic!("unexpected write error: {e}"),
+                    }
+                }
+                if ci == 1 {
+                    loop {
+                        match sw.flush() {
+                            Ok(()) => break,
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                            Err(e) => panic!("unexpected flush error: {e}"),
+                        }
+                    }
+                }
+            }
+            loop {
+                match sw.try_finish() {
+                    Ok(()) => break,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                    Err(e) => panic!("unexpected try_finish error: {e}"),
+                }
+            }
+            // Post-finish `flush()` must delegate cleanly to `W::flush()` without `AlreadyFinished`.
+            loop {
+                match sw.flush() {
+                    Ok(()) => break,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                    Err(e) => panic!("unexpected post-finish flush error: {e}"),
+                }
+            }
+            let inner = sw.finish().unwrap();
+            assert!(inner.flushes >= 1);
+            assert_eq!(decompress_brotli(&inner.out), payload, "q={q}");
+        }
+
+        // `abandon()` must NOT emit an `ISLAST = 1` trailer on partial data.
+        let mut aborted = StreamingWriter::with_lgwin(Vec::new(), 5, miri_or(12, 22));
+        aborted.write_all(&payload[..1024]).unwrap();
+        let raw_partial = aborted.abandon();
+        let mut dec_out = Vec::new();
+        assert!(
+            brotli_decompressor::BrotliDecompress(&mut raw_partial.as_slice(), &mut dec_out)
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_q10_sparse_ldm_compaction_anchor_underflow_regression() {
+        // `lgwin = 21` (`wsize = 2_097_136 > 1 MiB` local_window_cap) activates `SparseLdmTable`
+        // (`sync_mask == 0`) and compacts after 8 waves (`4_194_304` B) with `drop_len = 2_097_168`.
+        // Repeating a 4 KiB tile keeps debug H10 fast while planting unique 32-byte anchors right
+        // across `drop_len - 5 .. drop_len + 5` (`p1 - drop_len in 1..=5`) and post-compaction.
+        let tile: Vec<u8> = (0..4096usize)
+            .map(|i| ((i.wrapping_mul(131) ^ (i >> 5)) & 0xFF) as u8)
+            .collect();
+        let mut data = tile.repeat(1056); // 4,325,376 bytes (> 4_194_304 compaction threshold)
+        let anchor = *b"SPARSE_LDM_COMPACTION_ANCHOR_32!";
+        for off in [2_097_163usize, 2_097_165, 2_097_168, 4_194_320] {
+            data[off..off + anchor.len()].copy_from_slice(&anchor);
+        }
+        let mut sw = StreamingWriter::with_threads(Vec::new(), 10, 21, 4);
+        for chunk in data.chunks(131_072) {
+            sw.write_all(chunk).unwrap();
+        }
+        let comp = sw.finish().unwrap();
+        assert_eq!(decompress_brotli(&comp), data);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_zero_copy_flush_and_finish_at_step_ingest_cap() {
+        let first = make_mixed_corpus(dbg_or(196_608, 393_216)); // >= Q1 192 KiB step_ingest_cap
+        let second = make_mixed_corpus(dbg_or(24_576, 98_304));
+        for &q in dbg_or(&[0u32, 1, 5][..], &[0u32, 1, 5, 10, 11][..]) {
+            let mut enc = StreamingEncoder::with_lgwin(q, 18);
+            let mut wire = Vec::new();
+            let mut rem = first.as_slice();
+            loop {
+                let r = enc.compress_stream(StreamOp::Flush, rem, &mut []).unwrap();
+                rem = &rem[r.bytes_consumed..];
+                wire.extend_from_slice(enc.take_output(usize::MAX));
+                if rem.is_empty() && !enc.has_more_output() && enc.is_flushed() {
+                    break;
+                }
+            }
+            assert!(enc.is_flushed());
+            // Streaming prefix decoder must immediately recover 100% of `first` before `second`.
+            let mut prefix_out = vec![0u8; first.len() + 64];
+            let mut dec = brotli_decompressor::Decompressor::new(wire.as_slice(), 4096);
+            let mut got = 0usize;
+            while got < first.len() {
+                let n = dec.read(&mut prefix_out[got..]).unwrap();
+                assert!(n > 0, "q={q}: zero-copy Flush left prefix incomplete");
+                got += n;
+            }
+            assert_eq!(&prefix_out[..first.len()], first.as_slice(), "q={q}");
+
+            // Subsequent `Process` and zero-copy `Finish` must succeed without `OpChangedWhileFlushing`.
+            let mut rem2 = second.as_slice();
+            while !rem2.is_empty() {
+                let r = enc
+                    .compress_stream(StreamOp::Process, rem2, &mut [])
+                    .unwrap();
+                rem2 = &rem2[r.bytes_consumed..];
+                wire.extend_from_slice(enc.take_output(usize::MAX));
+            }
+            while !enc.is_finished() {
+                let r = enc.compress_stream(StreamOp::Finish, &[], &mut []).unwrap();
+                assert_eq!(r.bytes_consumed, 0);
+                wire.extend_from_slice(enc.take_output(usize::MAX));
+            }
+            let mut expected = first.clone();
+            expected.extend_from_slice(&second);
+            assert_eq!(decompress_brotli(&wire), expected, "q={q}");
         }
     }
 

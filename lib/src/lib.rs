@@ -22,7 +22,6 @@ mod hashtable;
 mod huffman;
 mod map_to_sym;
 mod metablock;
-#[allow(dead_code)]
 mod q11;
 mod static_dict;
 mod stream;
