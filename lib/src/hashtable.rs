@@ -2064,6 +2064,726 @@ impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize, S: SimdBacken
     }
 }
 
+/// [`HugePageBuf`] paired with a high-water dirty length for lazy zeroing and shift-back sweeps.
+pub(crate) struct DirtyBuf<T: Copy + FromZeroes + 'static> {
+    buf: HugePageBuf<T>,
+    dirty_len: usize,
+}
+
+impl<T: Copy + FromZeroes + 'static> DirtyBuf<T> {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            buf: HugePageBuf::new(),
+            dirty_len: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn resize(&mut self, new_len: usize) {
+        let old_cap = self.buf.capacity();
+        self.buf.resize_or_grow_zeroed(new_len);
+        self.dirty_len = if new_len > old_cap {
+            new_len
+        } else {
+            self.dirty_len.max(new_len)
+        };
+    }
+
+    #[inline]
+    fn clear_dirty(&mut self) {
+        if self.dirty_len != 0 {
+            self.buf
+                .prefix_of_capacity_mut(self.dirty_len)
+                .fill(T::new_zeroed());
+            self.dirty_len = self.buf.len();
+        }
+    }
+
+    #[inline(always)]
+    fn dirty_mut(&mut self) -> &mut [T] {
+        self.buf.prefix_of_capacity_mut(self.dirty_len)
+    }
+
+    #[cfg(any(target_arch = "x86_64", test))]
+    #[inline(always)]
+    fn pow2_mut(&mut self, expect_elems: usize) -> Option<Pow2SliceMut<'_, T>> {
+        (self.buf.len() == expect_elems)
+            .then(|| Pow2SliceMut::new(&mut self.buf[..]))
+            .flatten()
+    }
+
+    #[cfg(any(target_arch = "x86_64", test))]
+    #[inline(always)]
+    fn pow2_chunks_mut<const N: usize>(
+        &mut self,
+        expect_elems: usize,
+    ) -> Option<Pow2SliceMut<'_, [T; N]>> {
+        (self.buf.len() == expect_elems)
+            .then(|| Pow2SliceMut::new(self.buf.as_chunks_mut::<N>().0))
+            .flatten()
+    }
+}
+
+impl<T: Copy + FromZeroes + 'static> std::ops::Deref for DirtyBuf<T> {
+    type Target = [T];
+    #[inline(always)]
+    fn deref(&self) -> &[T] {
+        &self.buf
+    }
+}
+
+impl<T: Copy + FromZeroes + 'static> std::ops::DerefMut for DirtyBuf<T> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut [T] {
+        &mut self.buf
+    }
+}
+
+#[inline(always)]
+fn scalar_insert_row(
+    (pos_bits, w, idx): (u8, usize, usize),
+    (vpos, sec): (u32, u32),
+    heads: &mut [u8],
+    tags: &mut [u16],
+    table: &mut [u32],
+) {
+    let off = idx * w;
+    if pos_bits == 31 {
+        if w == 32 {
+            if let (Some(h), Some(ts), Some(bs)) = (
+                heads.get_mut(idx),
+                tags.get_mut(off..).and_then(|s| s.first_chunk_mut::<32>()),
+                table.get_mut(off..).and_then(|s| s.first_chunk_mut::<32>()),
+            ) {
+                ring_insert(h, ts, bs, ring_tag16(sec), vpos);
+            }
+        } else if let Some(bs) = table.get_mut(off..off + w) {
+            if let Some(ts) = tags.get_mut(off..off + w) {
+                tags_insert_portable(ts, shift_tag16(sec));
+            }
+            buckets_insert_portable(bs, vpos);
+        }
+    } else if let Some(bs) = table.get_mut(off..off + w) {
+        buckets_insert_portable(bs, encode_vpos(pos_bits, vpos, sec));
+    }
+}
+
+#[inline(always)]
+fn scalar_search_row(
+    (pos_bits, w, idx): (u8, usize, usize),
+    (vpos, sec, wsize): (u32, u32, u32),
+    heads: &mut [u8],
+    tags: &mut [u16],
+    table: &mut [u32],
+    dists: &mut [u32; 32],
+) -> u32 {
+    let off = idx * w;
+    if pos_bits == 31 {
+        if w == 32 {
+            let (Some(h), Some(ts), Some(bs)) = (
+                heads.get_mut(idx),
+                tags.get_mut(off..).and_then(|s| s.first_chunk_mut::<32>()),
+                table.get_mut(off..).and_then(|s| s.first_chunk_mut::<32>()),
+            ) else {
+                return 0;
+            };
+            let tag = ring_tag16(sec);
+            let raw = tags_match_portable(ts, tag);
+            ring_finish_search(h, ts, bs, raw, (tag, vpos, wsize), dists)
+        } else if let Some(bs) = table.get_mut(off..off + w) {
+            let tm = tags.get_mut(off..off + w).map_or(u32::MAX, |ts| {
+                tags_shift_match_portable(ts, shift_tag16(sec))
+            });
+            let m = buckets_search_and_insert_portable(bs, vpos, wsize, dists) & tm;
+            if w == 1 && m == 0 {
+                dists[0] = 0;
+            }
+            m
+        } else {
+            0
+        }
+    } else if let Some(bs) = table.get_mut(off..off + w) {
+        buckets_search_and_insert_portable(bs, encode_vpos(pos_bits, vpos, sec), wsize, dists)
+    } else {
+        0
+    }
+}
+
+/// Type-erased flat [`HugePageBuf`] backing store for all `Q0..=Q9` hash tables; typed
+/// `[u32; WAYS]` / `[u16; WAYS]` [`Pow2SliceMut`] views are formed safely at slice entry.
+pub(crate) struct HashTable {
+    pub(crate) table: DirtyBuf<u32>,
+    pub(crate) tags: DirtyBuf<u16>,
+    pub(crate) heads: DirtyBuf<u8>,
+    pub(crate) ht4_near: DirtyBuf<u32>,
+    pub(crate) ht4_tags: DirtyBuf<u16>,
+    pub(crate) ht3: Option<Box<[u32; HT3_SIZE]>>,
+    pub(crate) ldm: Option<FastLdmTable>,
+    pub(crate) log: u32,
+    pub(crate) ht4_log: u32,
+    pub(crate) pos_bits: u8,
+    pub(crate) ways: u8,
+    pub(crate) ht4_ways: u8,
+    pub(crate) next_vpos: usize,
+    pub(crate) max_vpos_used: usize,
+    dirty: bool,
+}
+
+impl InteriorOps<Scalar> for HashTable {
+    #[inline(always)]
+    fn step_ht3(&mut self, _: Scalar, word64: u64, vpos: u32) -> u32 {
+        let Some(t3) = self.ht3.as_deref_mut() else {
+            return 0;
+        };
+        std::mem::replace(t3.bget_mut(compute_hash3(word64)), vpos)
+    }
+
+    #[inline(always)]
+    fn prefetch_ahead<C: MatchConfig>(
+        &self,
+        _: Scalar,
+        _: BoundedPrefix<'_, u8, INTERIOR_MARGIN>,
+        _: usize,
+    ) {
+    }
+
+    #[inline(always)]
+    fn insert_main(&mut self, _: Scalar, p64: u64, vpos: u32, sec_hash: u32) {
+        let idx = (p64 >> ((64 - self.log) & 63)) as usize;
+        scalar_insert_row(
+            (self.pos_bits, self.ways as usize, idx),
+            (vpos, sec_hash),
+            &mut self.heads,
+            &mut self.tags,
+            &mut self.table,
+        );
+    }
+
+    #[inline(always)]
+    fn search_main(
+        &mut self,
+        _: Scalar,
+        p64: u64,
+        vpos: u32,
+        sec_hash: u32,
+        wsize: u32,
+        dists: &mut [u32; 32],
+    ) -> u32 {
+        let idx = (p64 >> ((64 - self.log) & 63)) as usize;
+        scalar_search_row(
+            (self.pos_bits, self.ways as usize, idx),
+            (vpos, sec_hash, wsize),
+            &mut self.heads,
+            &mut self.tags,
+            &mut self.table,
+            dists,
+        )
+    }
+
+    #[inline(always)]
+    fn search_ht4(
+        &mut self,
+        _: Scalar,
+        p32: u32,
+        vpos: u32,
+        wsize: u32,
+        dists: &mut [u32; 32],
+    ) -> u32 {
+        let (idx, sec) = (
+            (p32 >> ((32 - self.ht4_log) & 31)) as usize,
+            p32 << (self.ht4_log & 31),
+        );
+        scalar_search_row(
+            (self.pos_bits, self.ht4_ways as usize, idx),
+            (vpos, sec, wsize),
+            &mut [],
+            &mut self.ht4_tags,
+            &mut self.ht4_near,
+            dists,
+        )
+    }
+
+    #[inline(always)]
+    fn insert_ht4(&mut self, _: Scalar, p32: u32, vpos: u32) {
+        let (idx, sec) = (
+            (p32 >> ((32 - self.ht4_log) & 31)) as usize,
+            p32 << (self.ht4_log & 31),
+        );
+        scalar_insert_row(
+            (self.pos_bits, self.ht4_ways as usize, idx),
+            (vpos, sec),
+            &mut [],
+            &mut self.ht4_tags,
+            &mut self.ht4_near,
+        );
+    }
+}
+
+impl HashTable {
+    pub(crate) fn new() -> Self {
+        Self {
+            table: DirtyBuf::new(),
+            tags: DirtyBuf::new(),
+            heads: DirtyBuf::new(),
+            ht4_near: DirtyBuf::new(),
+            ht4_tags: DirtyBuf::new(),
+            ht3: None,
+            ldm: None,
+            log: 0,
+            ht4_log: 0,
+            pos_bits: 25,
+            ways: 1,
+            ht4_ways: 1,
+            next_vpos: 0,
+            max_vpos_used: 0,
+            dirty: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_layout(pos_bits: u8, ways: u8, ht4_ways: u8, log: u32) -> Self {
+        let mut ht = Self::new();
+        ht.configure_layout(pos_bits, ways, ht4_ways, log, log);
+        ht
+    }
+
+    fn clear_dirty_buffers(&mut self) {
+        self.table.clear_dirty();
+        self.tags.clear_dirty();
+        self.heads.clear_dirty();
+        self.ht4_near.clear_dirty();
+        self.ht4_tags.clear_dirty();
+        if let Some(t3) = self.ht3.as_deref_mut() {
+            t3.fill(0);
+        }
+        if let Some(ldm) = self.ldm.as_mut() {
+            ldm.clear();
+        }
+        self.max_vpos_used = 0;
+        self.dirty = false;
+    }
+
+    pub(crate) fn configure_layout(
+        &mut self,
+        pos_bits: u8,
+        ways: u8,
+        ht4_ways: u8,
+        log: u32,
+        ht4_log: u32,
+    ) {
+        assert!(
+            (11..=31).contains(&pos_bits)
+                && (10..=20).contains(&log)
+                && (10..=20).contains(&ht4_log)
+        );
+        assert!(matches!(ways, 1 | 4 | 8 | 16 | 32) && matches!(ht4_ways, 1 | 4));
+        if self.dirty
+            && (self.pos_bits != pos_bits
+                || self.ht4_ways != ht4_ways
+                || (pos_bits == 31 && self.ways != ways))
+        {
+            self.clear_dirty_buffers();
+        }
+        (
+            self.pos_bits,
+            self.ways,
+            self.ht4_ways,
+            self.log,
+            self.ht4_log,
+        ) = (pos_bits, ways, ht4_ways, log, ht4_log);
+
+        let rows = 1usize << log;
+        let ts_u32 = rows * (ways as usize);
+        self.table.resize(ts_u32);
+        if pos_bits == 31 {
+            self.tags.resize(ts_u32);
+            if ways >= 32 {
+                self.heads.resize(rows);
+            }
+        }
+        if !self.ht4_near.is_empty() {
+            self.ensure_ht4_near();
+        }
+    }
+
+    #[inline]
+    pub(crate) fn ensure_ht4_near(&mut self) {
+        let rows4 = 1usize << self.ht4_log;
+        let n4 = rows4 * (self.ht4_ways as usize);
+        self.ht4_near.resize(n4);
+        if self.pos_bits == 31 && (self.ways > 1 || self.ht4_ways > 1) {
+            self.ht4_tags.resize(n4);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn slices1_mut(&mut self) -> TableSlices1<'_> {
+        debug_assert_eq!((self.ways, self.ht4_ways), (1, 1));
+        let pos_bits = self.pos_bits;
+        let tag_mask = if pos_bits >= 31 {
+            0
+        } else {
+            !pos_mask_u32(pos_bits)
+        };
+        let table =
+            Pow2SliceMut::new(&mut self.table[..]).expect("HashTable::configure_layout required");
+        let tags = (pos_bits >= 31)
+            .then(|| Pow2SliceMut::new(&mut self.tags[..]))
+            .flatten();
+        let ht4 = Pow2SliceMut::new(&mut self.ht4_near[..]);
+        TableSlices1 {
+            table,
+            tags,
+            ht4,
+            tag_mask,
+        }
+    }
+
+    #[cfg(any(target_arch = "x86_64", test))]
+    #[inline(always)]
+    pub(crate) fn interior_mut<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize>(
+        &mut self,
+        use_3b: bool,
+    ) -> Option<InteriorTables<'_, POS_BITS, WAYS, HT4_WAYS>> {
+        if !(10..=20).contains(&self.log) || !(10..=20).contains(&self.ht4_log) {
+            return None;
+        }
+        debug_assert_eq!(
+            (self.pos_bits, self.ways as usize, self.ht4_ways as usize),
+            (POS_BITS, WAYS, HT4_WAYS)
+        );
+        let (rows, rows4) = (1usize << self.log, 1usize << self.ht4_log);
+        let (main_elems, ht4_elems) = (rows * WAYS, rows4 * HT4_WAYS);
+        let table = self.table.pow2_chunks_mut::<WAYS>(main_elems)?;
+        let ht4_near = self.ht4_near.pow2_chunks_mut::<HT4_WAYS>(ht4_elems)?;
+        let (tags, heads, ht4_tags) = if POS_BITS == 31 {
+            (
+                Some(self.tags.pow2_chunks_mut::<WAYS>(main_elems)?),
+                if WAYS >= 32 {
+                    Some(self.heads.pow2_mut(rows)?)
+                } else {
+                    None
+                },
+                Some(self.ht4_tags.pow2_chunks_mut::<HT4_WAYS>(ht4_elems)?),
+            )
+        } else {
+            (None, None, None)
+        };
+        let ht3 = if use_3b {
+            Some(self.ht3.as_deref_mut()?)
+        } else {
+            None
+        };
+        Some(InteriorTables {
+            table,
+            tags,
+            heads,
+            ht4_near,
+            ht4_tags,
+            ht3,
+        })
+    }
+
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn scan_ldm_with_density(
+        &mut self,
+        density: u8,
+        data: &[u8],
+        chunk_start: usize,
+        chunk_end: usize,
+        eff_wsize: usize,
+        vpos_base: usize,
+        out: &mut Vec<FastLdmSpan>,
+        use_avx2: bool,
+    ) {
+        if eff_wsize <= 262_144 {
+            out.clear();
+            return;
+        }
+        self.ldm.get_or_insert_with(FastLdmTable::new).scan_into(
+            density,
+            data,
+            chunk_start,
+            chunk_end,
+            eff_wsize,
+            vpos_base,
+            out,
+            use_avx2,
+        );
+    }
+
+    fn reserve_vpos_start(
+        &mut self,
+        dirty_gap: usize,
+        prefix_len: usize,
+        input_len: usize,
+    ) -> (usize, bool) {
+        let first_max = input_len.min(METABLOCK_SIZE + MAX_COPY_LEN);
+        let mut wrapped = false;
+        if self.dirty
+            && self.max_vpos_used + dirty_gap + prefix_len + first_max
+                > max_virtual_pos(self.pos_bits)
+        {
+            self.clear_dirty_buffers();
+            wrapped = true;
+        }
+        self.dirty = true;
+        (self.max_vpos_used + dirty_gap, wrapped)
+    }
+
+    pub(crate) fn prepare_for_input(&mut self, wsize: usize, input_len: usize) -> bool {
+        let (next, wrapped) = self.reserve_vpos_start(wsize.min(input_len) + 1, 0, input_len);
+        self.next_vpos = next;
+        if let Some(ldm) = self.ldm.as_mut() {
+            ldm.scanned_vpos = next;
+        }
+        wrapped
+    }
+
+    pub(crate) fn ensure_vpos_capacity(&mut self, eff_wsize: usize, block_len: usize) {
+        if self.next_vpos + block_len > max_virtual_pos(self.pos_bits) {
+            let shift = self.next_vpos.saturating_sub(eff_wsize + 1);
+            if shift > 0 {
+                let (s32, pm) = (shift as u32, pos_mask_u32(self.pos_bits));
+                if self.pos_bits == 31 && !self.tags.is_empty() {
+                    shift_back_u32_with_u16(self.table.dirty_mut(), self.tags.dirty_mut(), pm, s32);
+                } else {
+                    shift_back_u32(self.table.dirty_mut(), pm, s32);
+                }
+                if !self.ht4_near.is_empty() {
+                    if self.pos_bits == 31 && !self.ht4_tags.is_empty() {
+                        shift_back_u32_with_u16(
+                            self.ht4_near.dirty_mut(),
+                            self.ht4_tags.dirty_mut(),
+                            pm,
+                            s32,
+                        );
+                    } else {
+                        shift_back_u32(self.ht4_near.dirty_mut(), pm, s32);
+                    }
+                }
+                if let Some(t3) = self.ht3.as_deref_mut() {
+                    t3.iter_mut().for_each(|s| *s = s.saturating_sub(s32));
+                }
+                if let Some(ldm) = self.ldm.as_mut() {
+                    ldm.shift_back(s32);
+                }
+                self.next_vpos -= shift;
+                self.max_vpos_used = self.next_vpos;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    #[cfg(target_arch = "x86_64")]
+    use super::X64V3;
+    use super::{
+        bucket_search_one, buckets_insert_portable, buckets_search_and_insert_portable,
+        encode_vpos, max_virtual_pos, HashTable, InteriorOps, Scalar,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use simd_tokens::{simd_entry, SimdToken};
+
+    #[test]
+    fn test_buckets_portable_and_shift_back() {
+        let (mut b, w, mut d) = ([0u32; 8], (1 << 24) - 16, [0u32; 32]);
+        for (o, s, m) in [(10, 0xAB, 0), (20, 0xAB, 1), (30, 0x12, 0), (50, 0xAB, 6)] {
+            let target = encode_vpos(25, w + 1 + o, s << 24);
+            assert_eq!(
+                buckets_search_and_insert_portable(&mut b, target, w, &mut d),
+                m
+            );
+        }
+        assert_eq!(
+            (d[1], d[2], (w + 51) - (b[1] & ((1 << 25) - 1))),
+            (30, 40, 20)
+        );
+
+        // POS_BITS == 31: 1-way stores pure vpos (no sec_hash filter); N-way filters by 16-bit tag.
+        let (mut b31, w30) = (0u32, (1 << 30) - 16);
+        assert_eq!(
+            bucket_search_one(&mut b31, encode_vpos(31, w30 + 10, 0x1111_0000), w30),
+            0
+        );
+        assert_eq!(
+            bucket_search_one(&mut b31, encode_vpos(31, w30 + 25, 0x9999_0000), w30),
+            15
+        );
+
+        let mut ht31 = HashTable::with_layout(31, 4, 1, 10);
+        ht31.ensure_ht4_near();
+        for (o, sh, m) in [
+            (10, 0x1234_0000, 0),
+            (20, 0x9234_0000, 0),
+            (35, 0x1234_FFFF, 2),
+        ] {
+            assert_eq!(
+                ht31.interior_mut::<31, 4, 1>(false).unwrap().search_main(
+                    Scalar,
+                    0,
+                    w30 + 1 + o,
+                    sh,
+                    w30,
+                    &mut d
+                ),
+                m
+            );
+        }
+        assert_eq!(d[1], 25);
+
+        let mut ht = HashTable::with_layout(12, 4, 1, 10);
+        ht.prepare_for_input(1000, 3000);
+        assert_eq!(ht.next_vpos, 1001);
+        buckets_insert_portable(&mut ht.table[0..4], encode_vpos(12, 1500, 0xABCD_0000));
+        buckets_insert_portable(&mut ht.table[0..4], encode_vpos(12, 3000, 0xEF01_0000));
+        (ht.next_vpos, ht.max_vpos_used) = (3500, 3500);
+        ht.ensure_vpos_capacity(1000, 1000);
+        assert_eq!(
+            (
+                ht.next_vpos,
+                1001 - (ht.table[0] & ((1 << 12) - 1)),
+                ht.table[1]
+            ),
+            (1001, 500, 0)
+        );
+
+        // 32-way shift_back expiration test (`POS_BITS == 31, WAYS == 32`).
+        let mut htr = HashTable::with_layout(31, 32, 4, 10);
+        htr.ensure_ht4_near();
+        let max_vp = max_virtual_pos(31) as u32;
+        let base_vp = max_vp - 7500;
+        (htr.next_vpos, htr.max_vpos_used) = (base_vp as usize, base_vp as usize);
+        for k in 0..35u32 {
+            let _ = htr.interior_mut::<31, 32, 4>(false).unwrap().search_main(
+                Scalar,
+                0,
+                base_vp + k * 200,
+                0xAB00_0000,
+                1000,
+                &mut d,
+            );
+        }
+        (htr.next_vpos, htr.max_vpos_used) = ((max_vp - 500) as usize, (max_vp - 500) as usize);
+        htr.ensure_vpos_capacity(1000, 1000);
+        // Only `k = 30..=34` (`max_vp - 1500 ..= max_vp - 700`) survive expiration.
+        let m_after = htr.interior_mut::<31, 32, 4>(false).unwrap().search_main(
+            Scalar,
+            0,
+            1001,
+            0xAB00_0000,
+            1000,
+            &mut d,
+        );
+        assert_eq!(
+            (m_after, d[0], d[1], d[2], d[3], d[4]),
+            (0b1_1111, 200, 400, 600, 800, 1000)
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
+    fn check_ht_seq<const P: u8, const W: usize, const H4W: usize>(simd: X64V3, wsize: u32) {
+        let (base, p64_7, p32_5) = (wsize + 1, 7u64 << 54, 5u32 << 22);
+        let steps = if cfg!(miri) { 16u32 } else { 70u32 };
+        if W == 1 {
+            let mut ht_s1 = HashTable::with_layout(P, 1, 1, 10);
+            ht_s1.ensure_ht4_near();
+            for step in 0..steps {
+                let (vp, sh) = (base + step * 100, (step % 5).wrapping_mul(0x8567_9ABC));
+                let mut s1 = ht_s1.slices1_mut();
+                if step % 7 == 5 {
+                    if P >= 31 {
+                        s1.insert_one_hash64::<0>(p64_7, vp, sh);
+                    } else {
+                        s1.insert_one_hash64::<1>(p64_7, vp, sh);
+                    }
+                    s1.insert_ht4_p32::<0>(p32_5, vp);
+                } else {
+                    let _ = if P >= 31 {
+                        s1.search_and_insert_one_hash64::<0>(p64_7, vp, sh, wsize)
+                    } else {
+                        s1.search_and_insert_one_hash64::<1>(p64_7, vp, sh, wsize)
+                    };
+                    let _ = s1.search_and_insert_ht4_one_p32::<0>(p32_5, vp, wsize);
+                }
+            }
+            return;
+        }
+        let (mut ht_a, mut ht_p) = (
+            HashTable::with_layout(P, W as u8, H4W as u8, 10),
+            HashTable::with_layout(P, W as u8, H4W as u8, 10),
+        );
+        ht_a.ensure_ht4_near();
+        ht_p.ensure_ht4_near();
+        let r = 7 * W..8 * W;
+        for step in 0..steps {
+            let (vp, sh) = (base + step * 100, (step % 5).wrapping_mul(0x8567_9ABC));
+            if step % 7 == 5 {
+                let mut ia = ht_a.interior_mut::<P, W, H4W>(false).unwrap();
+                ia.insert_main(simd, p64_7, vp, sh);
+                ia.insert_ht4(simd, p32_5, vp);
+                let mut ip = ht_p.interior_mut::<P, W, H4W>(false).unwrap();
+                ip.insert_main(Scalar, p64_7, vp, sh);
+                ip.insert_ht4(Scalar, p32_5, vp);
+                assert_eq!(
+                    (&ht_a.table[r.clone()], ht_a.tags.get(r.clone())),
+                    (&ht_p.table[r.clone()], ht_p.tags.get(r.clone()))
+                );
+                continue;
+            }
+            let (mut d_avx, mut d_port) = ([0u32; 32], [0u32; 32]);
+            let (m_avx, m_port) = (
+                ht_a.interior_mut::<P, W, H4W>(false)
+                    .unwrap()
+                    .search_main(simd, p64_7, vp, sh, wsize, &mut d_avx),
+                ht_p.interior_mut::<P, W, H4W>(false).unwrap().search_main(
+                    Scalar,
+                    p64_7,
+                    vp,
+                    sh,
+                    wsize,
+                    &mut d_port,
+                ),
+            );
+            assert_eq!(
+                (m_avx, &ht_a.table[r.clone()], ht_a.tags.get(r.clone())),
+                (m_port, &ht_p.table[r.clone()], ht_p.tags.get(r.clone()))
+            );
+            for i in 0..W {
+                assert!((m_avx & (1 << i)) == 0 || d_avx[i] == d_port[i]);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[simd_entry]
+    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
+    fn run_test_buckets_avx2(simd: X64V3, _token: impl SimdToken) {
+        let (w24, w30) = ((1 << 24) - 16, (1 << 30) - 16);
+        macro_rules! chk {
+            ($($p:literal : $(($w:literal, $h4w:literal)),+);+ $(;)?) => {
+                $($(check_ht_seq::<$p, $w, $h4w>(simd, if $p == 25 { w24 } else { w30 });)+)+
+            };
+        }
+        chk!(
+            25: (1, 1), (4, 1), (8, 1), (16, 4), (32, 4);
+            31: (1, 1), (4, 1), (8, 1), (16, 4), (32, 4)
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_buckets_avx2() {
+        if let Some(token) = X64V3::try_new() {
+            run_test_buckets_avx2(token, token);
+        }
+    }
+}
+
 pub(crate) mod legacy {
 
     use crate::compress::MetablockData;
