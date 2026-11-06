@@ -16,10 +16,14 @@ use crate::constants::*;
 use crate::huffman::HuffmanCodeEntry;
 use crate::metablock::{DIST_MODE_IMPLICIT_D0, DIST_MODE_STATIC_DICT};
 use bounded_utils::{BoundedArrayExt, BoundedPrefix, BoundedU16, BoundedU8, BoundedUsize};
+#[cfg(target_arch = "aarch64")]
+use core::arch::aarch64::*;
 use lsb_bitwriter::BitStreamCursor;
+#[cfg(target_arch = "aarch64")]
+use safe_unaligned_simd::aarch64::{vld1q_u16, vld1q_u32, vld1q_u8, vst1q_u32, vst1q_u64};
 #[cfg(target_arch = "x86_64")]
 use safe_unaligned_simd::x86_64::{_mm256_loadu_si256, _mm256_storeu_si256, _mm_loadu_si128};
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use simd_tokens::{simd_entry, SimdToken};
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -510,7 +514,7 @@ fn insert_len_to_sym_and_bits_simd(len: __m256i) -> (__m256i, __m256i, __m256i) 
     finish_len_simd(olen, nbits, _mm256_abs_epi32(lt130), nbitsadd, lt130)
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[derive(Default)]
 pub(crate) struct IcdBatchBufs {
     pub iac_bits: [u64; 8],
@@ -659,6 +663,259 @@ pub(crate) fn distance_to_sym_and_bits_simd(
     _mm256_storeu_si256(&mut bufs.dist_bits, bits);
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+fn finish_len_neon(
+    olen: int32x4_t,
+    nbits: int32x4_t,
+    nbitsshift: int32x4_t,
+    sym_add: int32x4_t,
+    low_mask: uint32x4_t,
+) -> (int32x4_t, int32x4_t, int32x4_t) {
+    let one = vdupq_n_s32(1);
+    let bits = vandq_s32(olen, vsubq_s32(vshlq_s32(one, nbits), one));
+    let sym = vaddq_s32(vshlq_s32(nbits, nbitsshift), sym_add);
+    let shifted = vreinterpretq_s32_u32(vshlq_u32(vreinterpretq_u32_s32(olen), vnegq_s32(nbits)));
+    (
+        vaddq_s32(sym, vandq_s32(vreinterpretq_s32_u32(low_mask), shifted)),
+        nbits,
+        bits,
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+fn copy_len_to_sym_and_bits_neon(len: int32x4_t) -> (int32x4_t, int32x4_t, int32x4_t) {
+    let less_134_u = vcltq_s32(len, vdupq_n_s32(134));
+    let less_134 = vreinterpretq_s32_u32(less_134_u);
+    let offmask = vshlq_n_s32::<3>(less_134);
+    let olen = vsubq_s32(len, vbicq_s32(vdupq_n_s32(70), offmask));
+    let addoff = vbicq_s32(vdupq_n_s32(12), offmask);
+    let pos_olen = vreinterpretq_u32_s32(vmaxq_s32(olen, vdupq_n_s32(1)));
+    let clz_nb = vsubq_s32(
+        vaddq_s32(vdupq_n_s32(31), less_134),
+        vreinterpretq_s32_u32(vclzq_u32(pos_olen)),
+    );
+    let nbits = vbicq_s32(
+        clz_nb,
+        vreinterpretq_s32_u32(vcltq_s32(len, vdupq_n_s32(10))),
+    );
+    let (sym, nbits, bits) = finish_len_neon(olen, nbits, vabsq_s32(less_134), addoff, less_134_u);
+    let thresh = vdupq_n_s32(2118);
+    let lt = vcltq_s32(len, thresh);
+    (
+        vbslq_s32(lt, sym, vdupq_n_s32(23)),
+        vbslq_s32(lt, nbits, vdupq_n_s32(24)),
+        vbslq_s32(lt, bits, vsubq_s32(len, thresh)),
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+fn insert_len_to_sym_and_bits_neon(len: int32x4_t) -> (int32x4_t, int32x4_t, int32x4_t) {
+    let gt5_u = vcgtq_s32(len, vdupq_n_s32(5));
+    let lt130_u = vcltq_s32(len, vdupq_n_s32(130));
+    let lt2114_u = vcltq_s32(len, vdupq_n_s32(2114));
+    let lt6210 = vreinterpretq_s32_u32(vcltq_s32(len, vdupq_n_s32(6210)));
+    let lt22594 = vreinterpretq_s32_u32(vcltq_s32(len, vdupq_n_s32(22594)));
+    let (gt5, lt130, lt2114) = (
+        vreinterpretq_s32_u32(gt5_u),
+        vreinterpretq_s32_u32(lt130_u),
+        vreinterpretq_s32_u32(lt2114_u),
+    );
+    let neg_num_lt = vaddq_s32(vaddq_s32(lt130, lt2114), vaddq_s32(lt6210, lt22594));
+    let idx = vreinterpretq_u8_s32(vaddq_s32(
+        vmulq_n_s32(neg_num_lt, -0x202),
+        vdupq_n_s32(0x302),
+    ));
+    let tbl_u16 = |arr: &[u16; 8]| vreinterpretq_u8_u16(vld1q_u16(arr));
+    let offset_tbl = tbl_u16(&[0, 22594, 6210, 2114, 66, 2, 0, 0]);
+    let nbitsoff_tbl = tbl_u16(&[0, 25, 15, 13, 1, 0, 0, 0]);
+    let addoff_tbl = tbl_u16(&[0, 0, 9, 10, 11, 3, 0, 0]);
+    let shuf_s32 = |tbl| vreinterpretq_s32_u8(vqtbl1q_u8(tbl, idx));
+
+    let olen = vsubq_s32(len, shuf_s32(offset_tbl));
+    let nbitsoff = vaddq_s32(shuf_s32(nbitsoff_tbl), gt5);
+    let nbitsadd = vsubq_s32(shuf_s32(addoff_tbl), vdupq_n_s32(1));
+    let pos_olen = vreinterpretq_u32_s32(vmaxq_s32(olen, vdupq_n_s32(1)));
+    let clz_nb = vsubq_s32(vdupq_n_s32(31), vreinterpretq_s32_u32(vclzq_u32(pos_olen)));
+    let nbits = vaddq_s32(vandq_s32(vandq_s32(gt5, lt2114), clz_nb), nbitsoff);
+    finish_len_neon(olen, nbits, vabsq_s32(lt130), nbitsadd, lt130_u)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+pub(crate) fn insert_copy_len_to_sym_and_bits_simd<const TWO_DIST_CTX: bool>(
+    insert: &[u32; 8],
+    copy: &[u32; 8],
+    bufs: &mut IcdBatchBufs,
+) {
+    let table = vld1q_u8(&[0, 2, 3, 6, 0, 4, 5, 8, 0, 7, 9, 10, 0, 0, 0, 0]);
+    let mask7 = vdupq_n_u32(0x7);
+    let one = vdupq_n_u32(1);
+    let (ins_chunks, copy_chunks) = (insert.as_chunks::<4>().0, copy.as_chunks::<4>().0);
+    let ctx_chunks = bufs.dist_ctx.as_chunks_mut::<4>().0;
+    let sym_chunks = bufs.iac_sym.as_chunks_mut::<4>().0;
+    let bits_chunks = bufs.iac_bits.as_chunks_mut::<2>().0;
+
+    for h in 0..2 {
+        let (ins_v, copy_v) = (
+            vreinterpretq_s32_u32(vld1q_u32(&ins_chunks[h])),
+            vreinterpretq_s32_u32(vld1q_u32(&copy_chunks[h])),
+        );
+        if TWO_DIST_CTX {
+            let ctx = vshrq_n_u32::<31>(vcgtq_s32(copy_v, vdupq_n_s32(4)));
+            vst1q_u32(&mut ctx_chunks[h], ctx);
+        }
+        let (ic, inb, ib) = insert_len_to_sym_and_bits_neon(ins_v);
+        let (cc, _, cb) = copy_len_to_sym_and_bits_neon(copy_v);
+        let (cb_u, inb_u, ib_u) = (
+            vreinterpretq_u32_s32(cb),
+            vreinterpretq_u32_s32(inb),
+            vreinterpretq_u32_s32(ib),
+        );
+        let lo = vorrq_u64(
+            vshlq_u64(
+                vmovl_u32(vget_low_u32(cb_u)),
+                vreinterpretq_s64_u64(vmovl_u32(vget_low_u32(inb_u))),
+            ),
+            vmovl_u32(vget_low_u32(ib_u)),
+        );
+        let hi = vorrq_u64(
+            vshlq_u64(
+                vmovl_high_u32(cb_u),
+                vreinterpretq_s64_u64(vmovl_high_u32(inb_u)),
+            ),
+            vmovl_high_u32(ib_u),
+        );
+        vst1q_u64(&mut bits_chunks[h * 2], lo);
+        vst1q_u64(&mut bits_chunks[h * 2 + 1], hi);
+
+        let (ic_u, cc_u) = (vreinterpretq_u32_s32(ic), vreinterpretq_u32_s32(cc));
+        let bits64 = vorrq_u32(
+            vandq_u32(cc_u, mask7),
+            vshlq_n_u32::<3>(vandq_u32(ic_u, mask7)),
+        );
+        let idx = vorrq_u32(
+            vaddq_u32(one, vshrq_n_u32::<3>(cc_u)),
+            vshlq_n_u32::<2>(vshrq_n_u32::<3>(ic_u)),
+        );
+        let offset = vshlq_n_u32::<6>(vreinterpretq_u32_u8(vqtbl1q_u8(
+            table,
+            vreinterpretq_u8_u32(idx),
+        )));
+        vst1q_u32(&mut sym_chunks[h], vorrq_u32(bits64, offset));
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+fn distance_to_sym_and_bits_neon_quad(
+    [d0, d1, d2, d3]: [int32x4_t; 4],
+    raw: int32x4_t,
+    npostfix: u8,
+    ndirect: u8,
+    lut: uint8x16_t,
+) -> (int32x4_t, int32x4_t) {
+    let is_dict = vcltq_s32(raw, vdupq_n_s32(0));
+    let (zero, one, two) = (vdupq_n_s32(0), vdupq_n_s32(1), vdupq_n_s32(2));
+    let distance = vmaxq_s32(vandq_s32(raw, vdupq_n_s32(0x7FFF_FFFF)), one);
+
+    let ndirect_p1 = vdupq_n_s32(ndirect as i32 + 1);
+    let is_direct = vcgtq_s32(ndirect_p1, distance);
+    let direct_code = vaddq_s32(distance, vdupq_n_s32(15));
+
+    let d_minus = vmaxq_s32(vsubq_s32(distance, ndirect_p1), zero);
+    let v_npostfix = vdupq_n_s32(npostfix as i32);
+    let postfix = vandq_s32(d_minus, vdupq_n_s32((1i32 << npostfix) - 1));
+    let u = vaddq_s32(
+        vreinterpretq_s32_u32(vshlq_u32(
+            vreinterpretq_u32_s32(d_minus),
+            vnegq_s32(v_npostfix),
+        )),
+        vdupq_n_s32(4),
+    );
+    let nbits = vsubq_s32(
+        vdupq_n_s32(30),
+        vreinterpretq_s32_u32(vclzq_u32(vreinterpretq_u32_s32(u))),
+    );
+    let hcode = vandq_s32(
+        one,
+        vreinterpretq_s32_u32(vshlq_u32(vreinterpretq_u32_s32(u), vnegq_s32(nbits))),
+    );
+    let raw_bits = vsubq_s32(u, vshlq_s32(vaddq_s32(two, hcode), nbits));
+    let prefix_idx = vaddq_s32(vshlq_n_s32::<1>(nbits), vsubq_s32(hcode, two));
+    let raw_code = vaddq_s32(
+        vaddq_s32(vdupq_n_s32(16 + ndirect as i32), postfix),
+        vshlq_s32(prefix_idx, v_npostfix),
+    );
+
+    let non_cache_code = vbslq_s32(is_direct, direct_code, raw_code);
+    let non_cache_bits =
+        vreinterpretq_s32_u32(vbicq_u32(vreinterpretq_u32_s32(raw_bits), is_direct));
+
+    let (four, eight) = (vdupq_n_s32(4), vdupq_n_s32(8));
+    let diff0 = vaddq_s32(vsubq_s32(distance, d0), four);
+    let diff1 = vaddq_s32(vsubq_s32(distance, d1), four);
+    let near0 = vandq_u32(vcgtq_s32(diff0, zero), vcgtq_s32(eight, diff0));
+    let near1 = vandq_u32(vcgtq_s32(diff1, zero), vcgtq_s32(eight, diff1));
+    let eq0 = vceqq_s32(distance, d0);
+    let eq1 = vceqq_s32(distance, d1);
+    let eq2 = vceqq_s32(distance, d2);
+    let eq3 = vceqq_s32(distance, d3);
+
+    let tbl_s32 = |d: int32x4_t| vreinterpretq_s32_u8(vqtbl1q_u8(lut, vreinterpretq_u8_s32(d)));
+    let s1 = vandq_s32(vdupq_n_s32(0x0F), tbl_s32(diff1));
+    let s0 = vreinterpretq_s32_u32(vshrq_n_u32::<4>(vreinterpretq_u32_s32(tbl_s32(diff0))));
+    let mut code = vbslq_s32(near1, s1, non_cache_code);
+    code = vbslq_s32(near0, s0, code);
+    code = vbslq_s32(eq3, vdupq_n_s32(3), code);
+    code = vbslq_s32(eq2, two, code);
+    code = vbslq_s32(eq1, one, code);
+    code = vbslq_s32(eq0, zero, code);
+    code = vbslq_s32(is_dict, non_cache_code, code);
+
+    let any_short = vbicq_u32(
+        vorrq_u32(vorrq_u32(near0, near1), vorrq_u32(eq2, eq3)),
+        is_dict,
+    );
+    let bits = vreinterpretq_s32_u32(vbicq_u32(vreinterpretq_u32_s32(non_cache_bits), any_short));
+    (code, bits)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+pub(crate) fn distance_to_sym_and_bits_simd(
+    [d0, d1, d2, d3]: [[int32x4_t; 2]; 4],
+    raw: [int32x4_t; 2],
+    npostfix: u8,
+    ndirect: u8,
+    bufs: &mut IcdBatchBufs,
+) {
+    let lut = vld1q_u8(&[
+        0x00u8, 0x8e, 0x6c, 0x4a, 0x01, 0x5b, 0x7d, 0x9f, 0, 0, 0, 0, 0, 0, 0, 0,
+    ]);
+    let sym_out = bufs.dist_sym.as_chunks_mut::<4>().0;
+    let bits_out = bufs.dist_bits.as_chunks_mut::<4>().0;
+    for h in 0..2 {
+        let (code, bits) = distance_to_sym_and_bits_neon_quad(
+            [d0[h], d1[h], d2[h], d3[h]],
+            raw[h],
+            npostfix,
+            ndirect,
+            lut,
+        );
+        vst1q_u32(&mut sym_out[h], vreinterpretq_u32_s32(code));
+        vst1q_u32(&mut bits_out[h], vreinterpretq_u32_s32(bits));
+    }
+}
+
 /// Matches `d` (`1..=2^30`) against `ring` slots enabled in `valid_mask` (`bit k` = `ring[k]` valid).
 #[inline(always)]
 pub(crate) fn match_short_dist_code_masked(d: u32, ring: [u32; 4], valid_mask: u8) -> Option<u8> {
@@ -724,6 +981,55 @@ pub(crate) fn pack_even_odd_16_avx2(
     let (mut n, mut ba) = ([0u64; 4], [0u64; 4]);
     _mm256_storeu_si256(&mut n, nbits64);
     _mm256_storeu_si256(&mut ba, bits64);
+    let [n0, n1, n2, n3] = n;
+    (
+        [
+            bound64_from_u63(n0 as usize),
+            bound64_from_u63(n1 as usize),
+            bound64_from_u63(n2 as usize),
+            bound64_from_u63(n3 as usize),
+        ],
+        ba,
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+pub(crate) fn pack_even_odd_16_neon(
+    even: [u32; 8],
+    odd: [u32; 8],
+) -> ([BoundedUsize<64>; 4], [u64; 4]) {
+    let mask16 = vdupq_n_u32(0x0000_FFFF);
+    let mask32 = vdupq_n_u64(0x0000_0000_FFFF_FFFF);
+    let (e_chunks, o_chunks) = (even.as_chunks::<4>().0, odd.as_chunks::<4>().0);
+    let (mut n, mut ba) = ([0u64; 4], [0u64; 4]);
+    let (n_chunks, b_chunks) = (n.as_chunks_mut::<2>().0, ba.as_chunks_mut::<2>().0);
+    for h in 0..2 {
+        let (h_even, h_odd) = (vld1q_u32(&e_chunks[h]), vld1q_u32(&o_chunks[h]));
+        let nbits = vorrq_u32(vshlq_n_u32::<16>(h_odd), vandq_u32(mask16, h_even));
+        let bits = vorrq_u32(vshrq_n_u32::<16>(h_even), vbicq_u32(h_odd, mask16));
+
+        let nbits_lo = vandq_u32(mask16, nbits);
+        let nbits32 = vaddq_u32(vshrq_n_u32::<16>(nbits), nbits_lo);
+        let bits32 = vorrq_u32(
+            vandq_u32(mask16, bits),
+            vshlq_u32(vshrq_n_u32::<16>(bits), vreinterpretq_s32_u32(nbits_lo)),
+        );
+
+        let (nb32_64, b32_64) = (
+            vreinterpretq_u64_u32(nbits32),
+            vreinterpretq_u64_u32(bits32),
+        );
+        let nbits32_lo = vandq_u64(mask32, nb32_64);
+        let nbits64 = vaddq_u64(vshrq_n_u64::<32>(nb32_64), nbits32_lo);
+        let bits64 = vorrq_u64(
+            vandq_u64(mask32, b32_64),
+            vshlq_u64(vshrq_n_u64::<32>(b32_64), vreinterpretq_s64_u64(nbits32_lo)),
+        );
+        vst1q_u64(&mut n_chunks[h], nbits64);
+        vst1q_u64(&mut b_chunks[h], bits64);
+    }
     let [n0, n1, n2, n3] = n;
     (
         [
@@ -859,7 +1165,7 @@ macro_rules! with_detached {
         $body;
     }};
 }
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub(crate) use with_detached;
 
 #[inline(always)]
@@ -876,7 +1182,7 @@ fn emit_literals_scalar(
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[cold]
 #[inline(never)]
 fn emit_literals_slow(
@@ -885,6 +1191,78 @@ fn emit_literals_slow(
     cur: &mut BitStreamCursor<'_, '_>,
 ) {
     emit_literals_scalar(slice, lut, cur);
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+macro_rules! emit_literals_body {
+    ($slice:ident, $lut:ident, $cur:ident, $pack16:path) => {{
+        let mut local = $cur.detach();
+        let rem = if $slice.len() >= 16 {
+            let (chunks, rem) = $slice.as_chunks::<16>();
+            let Ok(mut batch) = local.try_batch_iter::<4, _>(chunks.iter()) else {
+                drop(local);
+                emit_literals_slow($slice, $lut, $cur);
+                return;
+            };
+            while let Some((c16, slot)) = batch.next_slot() {
+                let (na, ba) = $pack16(
+                    [
+                        $lut[c16[0] as usize].to_u32(),
+                        $lut[c16[2] as usize].to_u32(),
+                        $lut[c16[4] as usize].to_u32(),
+                        $lut[c16[6] as usize].to_u32(),
+                        $lut[c16[8] as usize].to_u32(),
+                        $lut[c16[10] as usize].to_u32(),
+                        $lut[c16[12] as usize].to_u32(),
+                        $lut[c16[14] as usize].to_u32(),
+                    ],
+                    [
+                        $lut[c16[1] as usize].to_u32(),
+                        $lut[c16[3] as usize].to_u32(),
+                        $lut[c16[5] as usize].to_u32(),
+                        $lut[c16[7] as usize].to_u32(),
+                        $lut[c16[9] as usize].to_u32(),
+                        $lut[c16[11] as usize].to_u32(),
+                        $lut[c16[13] as usize].to_u32(),
+                        $lut[c16[15] as usize].to_u32(),
+                    ],
+                );
+                slot.put::<4>(na, ba);
+            }
+            rem
+        } else {
+            $slice
+        };
+        if !rem.is_empty() {
+            let Some(slot) = local.try_slot::<4>() else {
+                drop(local);
+                emit_literals_slow(rem, $lut, $cur);
+                return;
+            };
+            let (quads, tail) = rem.as_chunks::<4>();
+            let (nt, bt) = pack_lits_1_to_4_bounded(tail, $lut);
+            match quads {
+                [] => slot.put([nt], [bt]),
+                [q0] => {
+                    let (n0, b0) = pack_quad_bounded(q0, $lut);
+                    slot.put([n0, nt], [b0, bt]);
+                }
+                [q0, q1] => {
+                    let ((n0, b0), (n1, b1)) =
+                        (pack_quad_bounded(q0, $lut), pack_quad_bounded(q1, $lut));
+                    slot.put([n0, n1, nt], [b0, b1, bt]);
+                }
+                [q0, q1, q2, ..] => {
+                    let ((n0, b0), (n1, b1), (n2, b2)) = (
+                        pack_quad_bounded(q0, $lut),
+                        pack_quad_bounded(q1, $lut),
+                        pack_quad_bounded(q2, $lut),
+                    );
+                    slot.put([n0, n1, n2, nt], [b0, b1, b2, bt]);
+                }
+            }
+        }
+    }};
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -897,56 +1275,20 @@ pub(crate) fn emit_literals_avx2(
     cur: &mut BitStreamCursor<'_, '_>,
     _tok: impl SimdToken,
 ) {
-    let mut local = cur.detach();
-    let rem = if slice.len() >= 16 {
-        let (chunks, rem) = slice.as_chunks::<16>();
-        let Ok(mut batch) = local.try_batch_iter::<4, _>(chunks.iter()) else {
-            drop(local);
-            emit_literals_slow(slice, lut, cur);
-            return;
-        };
-        while let Some((c16, slot)) = batch.next_slot() {
-            macro_rules! lut8 {
-                ($($i:literal),+) => { [$(lut[c16[$i] as usize].to_u32()),+] };
-            }
-            let (na, ba) = pack_even_odd_16_avx2(
-                lut8!(0, 2, 4, 6, 8, 10, 12, 14),
-                lut8!(1, 3, 5, 7, 9, 11, 13, 15),
-            );
-            slot.put::<4>(na, ba);
-        }
-        rem
-    } else {
-        slice
-    };
-    if !rem.is_empty() {
-        let Some(slot) = local.try_slot::<4>() else {
-            drop(local);
-            emit_literals_slow(rem, lut, cur);
-            return;
-        };
-        let (quads, tail) = rem.as_chunks::<4>();
-        let (nt, bt) = pack_lits_1_to_4_bounded(tail, lut);
-        match quads {
-            [] => slot.put([nt], [bt]),
-            [q0] => {
-                let (n0, b0) = pack_quad_bounded(q0, lut);
-                slot.put([n0, nt], [b0, bt]);
-            }
-            [q0, q1] => {
-                let ((n0, b0), (n1, b1)) = (pack_quad_bounded(q0, lut), pack_quad_bounded(q1, lut));
-                slot.put([n0, n1, nt], [b0, b1, bt]);
-            }
-            [q0, q1, q2, ..] => {
-                let ((n0, b0), (n1, b1), (n2, b2)) = (
-                    pack_quad_bounded(q0, lut),
-                    pack_quad_bounded(q1, lut),
-                    pack_quad_bounded(q2, lut),
-                );
-                slot.put([n0, n1, n2, nt], [b0, b1, b2, bt]);
-            }
-        }
-    }
+    emit_literals_body!(slice, lut, cur, pack_even_odd_16_avx2);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[simd_entry]
+#[inline]
+#[target_feature(enable = "neon")]
+pub(crate) fn emit_literals_neon(
+    slice: &[u8],
+    lut: &[HuffmanCodeEntry; 256],
+    cur: &mut BitStreamCursor<'_, '_>,
+    _tok: impl SimdToken,
+) {
+    emit_literals_body!(slice, lut, cur, pack_even_odd_16_neon);
 }
 
 #[inline(always)]
@@ -958,16 +1300,21 @@ pub(crate) fn emit_literals_mode<S: SimdBackend, const DETACH: bool>(
 ) {
     dispatch_simd!(
         simd,
-        S => |tok| if DETACH {
+        S => x64: |tok| if DETACH {
             with_detached!(cur, |d| emit_literals_avx2(slice, lut, &mut d, tok))
         } else {
             emit_literals_avx2(slice, lut, cur, tok)
         },
-        if DETACH {
+        neon: |tok| if DETACH {
+            with_detached!(cur, |d| emit_literals_neon(slice, lut, &mut d, tok))
+        } else {
+            emit_literals_neon(slice, lut, cur, tok)
+        },
+        scalar: if DETACH {
             with_detached!(cur, |d| emit_literals_scalar(slice, lut, &mut d))
         } else {
             emit_literals_scalar(slice, lut, cur)
-        }
+        },
     );
 }
 

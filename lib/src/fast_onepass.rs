@@ -443,7 +443,7 @@ fn or_rows_avx2(c32s: &[[u8; 32]], _tok: impl SimdToken) -> u16 {
     fold8_avx2(alo) | (fold8_avx2(ahi) << 8)
 }
 
-fn compute_present_rows(chunk: &[u8], mut mask: u16, avx2: OptAvx2) -> u16 {
+fn compute_present_rows(chunk: &[u8], mut mask: u16, avx2: OptSimd) -> u16 {
     for block in chunk.chunks(4096) {
         if mask == 0xFFFF {
             return 0xFFFF;
@@ -1182,7 +1182,7 @@ macro_rules! def_fast_parse_chunk {
             ldm_spans: &[FastLdmSpan],
             ring: &mut [u32; 2],
             init: I,
-            avx2: OptAvx2,
+            avx2: OptSimd,
         ) -> bool {
             let dict_no_lw = cfg.2 && !cfg.0;
             let dict23 = dict_no_lw && IS_Q0 && ts.tag_mask == !((1u32 << 23) - 1);
@@ -1629,7 +1629,7 @@ pub(crate) fn compress_fast_with_tok<E: ChunkStreamEncoder>(
     data: &[u8],
     dict: Option<&PreparedDictionary>,
     bw: &mut BitWriter<'_>,
-    avx2: OptAvx2,
+    avx2: OptSimd,
 ) {
     let (wbits, n) = (enc.wbits(), data.len());
     write_window_bits(wbits, wbits > STD_MAX_WBITS, bw);
@@ -1822,7 +1822,7 @@ impl OnePassEncoder {
         ring: &mut [u32; 2],
         bw: &mut BitWriter,
         bank: &FixedBank,
-        avx2: OptAvx2,
+        avx2: OptSimd,
     ) -> (usize, bool) {
         let mut raw_chunk = &span.prefix[span.start..];
         let mut chunk_len = raw_chunk.len();
@@ -2459,7 +2459,7 @@ fn count_fast_cmd_lits(
     known_lits: usize,
     cmds: &[FastCmd],
     out: &mut [u32; 256],
-    avx2: OptAvx2,
+    avx2: OptSimd,
 ) {
     match avx2 {
         #[cfg(target_arch = "x86_64")]
@@ -2475,7 +2475,7 @@ fn encode_twopass_chunk(
     span: ChunkSpan<'_>,
     ring: &mut [u32; 2],
     bw: &mut BitWriter,
-    avx2: OptAvx2,
+    avx2: OptSimd,
 ) -> bool {
     let raw_chunk = &span.prefix[span.start..];
     let chunk_len = raw_chunk.len();
@@ -2681,7 +2681,7 @@ impl ChunkStreamEncoder for OnePassEncoder {
         dict: Option<&PreparedDictionary>,
         ring: &mut [u32; 2],
         bw: &mut BitWriter<'_>,
-        avx2: OptAvx2,
+        avx2: OptSimd,
     ) {
         if prep_len.is_some() {
             self.icd_age = 0;
@@ -2720,7 +2720,7 @@ impl ChunkStreamEncoder for FastTwoPassEncoder {
         dict: Option<&PreparedDictionary>,
         ring: &mut [u32; 2],
         bw: &mut BitWriter<'_>,
-        avx2: OptAvx2,
+        avx2: OptSimd,
     ) {
         let raw_wsize = window_size(self.wbits);
         let dict_info = prepare_fast_ht(&mut self.ht, raw_wsize, prep_len, dict);
@@ -2759,7 +2759,7 @@ mod tests {
         inp: &[u8],
         dict: Option<(&PreparedDictionary, &[u8])>,
         wbits: usize,
-        tok: OptAvx2,
+        tok: OptSimd,
     ) -> Vec<u8> {
         let (cap, prep) = (
             fast_twopass_max_output_size_for(inp.len(), ONEPASS_CHUNK_SIZE),
@@ -2793,7 +2793,7 @@ mod tests {
         inp: &[u8],
         dict: Option<(&PreparedDictionary, &[u8])>,
         wbits: usize,
-        tok: OptAvx2,
+        tok: OptSimd,
     ) -> Vec<u8> {
         let (cap, prep) = (
             fast_twopass_max_output_size_for(inp.len(), CHUNK),
@@ -2878,7 +2878,7 @@ mod tests {
 
     #[test]
     fn test_onepass_avx2_parity_regimes_dict_lw_and_stream() {
-        let tok = try_avx2(true);
+        let tok = try_simd(true);
         #[cfg(target_arch = "x86_64")]
         if let Some(t) = tok {
             let bank = fixed_bank();
@@ -3110,7 +3110,7 @@ mod tests {
         let hi_span = make_span(&sparse);
         let expected = &sparse[HIST_START..HI_START + CHUNK];
 
-        let tok = try_avx2(true);
+        let tok = try_simd(true);
         let bank = fixed_bank();
         for avx in [None, tok] {
             let mut enc0 = OnePassEncoder::with_params(30, 5, 13);
@@ -3136,7 +3136,7 @@ mod tests {
         }
 
         for (mode, mls) in [(1u8, 6u8), (2u8, 4u8)] {
-            let run_tp = |avx: OptAvx2| {
+            let run_tp = |avx: OptSimd| {
                 let mut enc = FastTwoPassEncoder::new(mode, 30, FAST_TWOPASS_CHUNK_SIZE);
                 enc.configure_with_pos_bits(29, mls, 13, 13);
                 enc.ht.prepare_for_input(524_288, CHUNK * 2);

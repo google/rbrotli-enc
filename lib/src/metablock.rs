@@ -16,7 +16,7 @@ use bounded_utils::BoundedUsize;
 use lsb_bitwriter::{BitStreamCursor, BitWriter};
 
 use crate::block_split::{BlockSplit, MetablockPlan};
-use crate::constants::{try_avx2, Scalar, MAX_IAC, MAX_LIT};
+use crate::constants::{try_simd, Scalar, MAX_IAC, MAX_LIT};
 use crate::context;
 use crate::huffman::{ContextMap, HuffmanCode, HuffmanCodeEntry};
 use crate::map_to_sym::{
@@ -512,7 +512,7 @@ pub(crate) fn write_compressed_metablock(
 
     let (mut lut0, mut lut1, mut single_lit_tree, mut ctx_trees) =
         resolve_lit_bt(lit_cur.cur_type() as usize);
-    let avx2 = try_avx2(true);
+    let simd = try_simd(true);
     let mut stream_pos = mb_start;
     let mut cur = bw.cursor();
 
@@ -538,8 +538,8 @@ pub(crate) fn write_compressed_metablock(
                 }
                 let avail = (ins_end - sp).min(lit_cur.rem);
                 if let Some(lut) = single_lit_tree {
-                    match avx2 {
-                        #[cfg(target_arch = "x86_64")]
+                    match simd {
+                        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
                         Some(tok) => emit_literals(tok, &data[sp..sp + avail], lut, cur),
                         _ => emit_literals(Scalar, &data[sp..sp + avail], lut, cur),
                     }

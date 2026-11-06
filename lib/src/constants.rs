@@ -16,44 +16,60 @@
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Scalar;
 
+#[cfg(target_arch = "aarch64")]
+pub(crate) use bounded_utils::safe_aarch64::{A64Neon, A64NeonExt};
 #[cfg(target_arch = "x86_64")]
 pub(crate) use bounded_utils::safe_x86_64::{X64V3Ext, X64V3};
 
 #[cfg(target_arch = "x86_64")]
-pub(crate) type OptAvx2 = Option<X64V3>;
-#[cfg(not(target_arch = "x86_64"))]
-pub(crate) type OptAvx2 = Option<core::convert::Infallible>;
+pub(crate) type OptSimd = Option<X64V3>;
+#[cfg(target_arch = "aarch64")]
+pub(crate) type OptSimd = Option<A64Neon>;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub(crate) type OptSimd = Option<core::convert::Infallible>;
 
 #[inline(always)]
-pub(crate) fn try_avx2(use_avx2: bool) -> OptAvx2 {
+pub(crate) fn try_simd(use_simd: bool) -> OptSimd {
     #[cfg(target_arch = "x86_64")]
     {
-        use_avx2
+        use_simd
             .then(<X64V3 as simd_tokens::SimdToken>::try_new)
             .flatten()
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
     {
-        let _ = use_avx2;
+        use_simd
+            .then(<A64Neon as simd_tokens::SimdToken>::try_new)
+            .flatten()
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = use_simd;
         None
     }
 }
 
 /// Zero-cost SIMD/scalar capability backend allowing hot loops to be written once as generic
 /// functions over `S: SimdBackend` and instantiated inside `#[simd_entry]` / scalar entrypoints.
-#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_arch = "x86_64", target_arch = "aarch64")),
+    allow(dead_code)
+)]
 pub(crate) trait SimdBackend: Copy + Send + Sync + 'static {
-    const IS_AVX2: bool;
+    const IS_SIMD: bool;
 
     fn prefetch_et0<T>(self, r: &T);
     fn prefetch_t0<T>(self, r: &T);
 
     #[cfg(target_arch = "x86_64")]
     fn into_x64v3(self) -> X64V3;
+
+    #[cfg(target_arch = "aarch64")]
+    fn into_neon(self) -> A64Neon;
 }
 
 impl SimdBackend for Scalar {
-    const IS_AVX2: bool = false;
+    const IS_SIMD: bool = false;
 
     #[inline(always)]
     fn prefetch_et0<T>(self, _r: &T) {}
@@ -66,11 +82,17 @@ impl SimdBackend for Scalar {
     fn into_x64v3(self) -> X64V3 {
         unreachable!()
     }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    fn into_neon(self) -> A64Neon {
+        unreachable!()
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
 impl SimdBackend for X64V3 {
-    const IS_AVX2: bool = true;
+    const IS_SIMD: bool = true;
 
     #[inline(always)]
     fn prefetch_et0<T>(self, r: &T) {
@@ -88,23 +110,60 @@ impl SimdBackend for X64V3 {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+impl SimdBackend for A64Neon {
+    const IS_SIMD: bool = true;
+
+    #[inline(always)]
+    fn prefetch_et0<T>(self, r: &T) {
+        A64NeonExt::prefetch_et0(self, r);
+    }
+
+    #[inline(always)]
+    fn prefetch_t0<T>(self, r: &T) {
+        A64NeonExt::prefetch_t0(self, r);
+    }
+
+    #[inline(always)]
+    fn into_neon(self) -> A64Neon {
+        self
+    }
+}
+
 macro_rules! dispatch_simd {
-    ($simd:expr, $S:ty => |$tok:ident| $avx2:expr, $scalar:expr) => {{
+    ($simd:expr, $S:ty => x64: |$tx:ident| $x64:expr, neon: |$tn:ident| $neon:expr, scalar: $scalar:expr $(,)?) => {{
         #[cfg(target_arch = "x86_64")]
-        if const { <$S as $crate::constants::SimdBackend>::IS_AVX2 } {
-            let $tok: $crate::constants::X64V3 =
+        if const { <$S as $crate::constants::SimdBackend>::IS_SIMD } {
+            let $tx: $crate::constants::X64V3 =
                 <$S as $crate::constants::SimdBackend>::into_x64v3($simd);
-            $avx2
+            $x64
         } else {
             let _ = $simd;
             $scalar
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        if const { <$S as $crate::constants::SimdBackend>::IS_SIMD } {
+            let $tn: $crate::constants::A64Neon =
+                <$S as $crate::constants::SimdBackend>::into_neon($simd);
+            $neon
+        } else {
+            let _ = $simd;
+            $scalar
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             let _ = $simd;
             $scalar
         }
     }};
+    ($simd:expr, $S:ty => |$tok:ident| $simd_arm:expr, $scalar:expr) => {
+        dispatch_simd!(
+            $simd,
+            $S => x64: |$tok| $simd_arm,
+            neon: |$tok| $simd_arm,
+            scalar: $scalar
+        )
+    };
 }
 pub(crate) use dispatch_simd;
 

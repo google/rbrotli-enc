@@ -16,10 +16,16 @@
 
 use crate::constants::MAX_LIT;
 use crate::metablock::ContextMode;
+#[cfg(target_arch = "aarch64")]
+use core::arch::aarch64::*;
+#[cfg(target_arch = "aarch64")]
+use safe_unaligned_simd::aarch64::vld1q_u32;
 #[cfg(target_arch = "x86_64")]
 use safe_unaligned_simd::x86_64::_mm256_loadu_si256;
 #[cfg(target_arch = "x86_64")]
 use simd_tokens::{simd_entry, Avx2Token, SimdToken};
+#[cfg(target_arch = "aarch64")]
+use simd_tokens::{simd_entry, NeonToken, SimdToken};
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
@@ -252,6 +258,56 @@ fn histogram_distance_slice_avx2(
     (dist_q8 >> 8).max(0)
 }
 
+#[cfg(target_arch = "aarch64")]
+#[simd_entry]
+#[target_feature(enable = "neon")]
+fn histogram_distance_slice_neon(
+    a: &[u32],
+    total_a: u32,
+    b: &[u32],
+    total_b: u32,
+    _token: impl SimdToken,
+) -> i32 {
+    debug_assert_eq!(a.len(), b.len());
+    if total_a == 0 || total_b == 0 {
+        return 0;
+    }
+    let (inv_a_s, inv_b_s, inv_tot_s) = (
+        1.0f32 / (total_a as f32),
+        1.0f32 / (total_b as f32),
+        1.0f32 / ((total_a + total_b) as f32),
+    );
+    let (inv_a, inv_b, inv_total, bias) = (
+        vdupq_n_f32(inv_a_s),
+        vdupq_n_f32(inv_b_s),
+        vdupq_n_f32(inv_tot_s),
+        vdupq_n_s32(127 << 8),
+    );
+    let [mut td0, mut td1, mut td2] = [vdupq_n_s32(0); 3];
+    let ((a_chunks, a_rem), (b_chunks, b_rem)) = (a.as_chunks::<4>(), b.as_chunks::<4>());
+    macro_rules! accum {
+        ($acc:ident, $v:expr, $inv:expr) => {{
+            let p = vmulq_f32(vcvtq_f32_u32($v), $inv);
+            let nl = vsubq_s32(
+                bias,
+                vreinterpretq_s32_u32(vshrq_n_u32::<15>(vreinterpretq_u32_f32(p))),
+            );
+            $acc = vmlaq_s32($acc, nl, vreinterpretq_s32_u32($v));
+        }};
+    }
+    for (ac, bc) in a_chunks.iter().zip(b_chunks.iter()) {
+        let (av, bv) = (vld1q_u32(ac), vld1q_u32(bc));
+        let totv = vaddq_u32(av, bv);
+        accum!(td0, totv, inv_total);
+        accum!(td1, av, inv_a);
+        accum!(td2, bv, inv_b);
+    }
+    let v = vsubq_s32(td0, vaddq_s32(td1, td2));
+    let dist_q8 = vaddvq_s32(v)
+        .wrapping_add(jsd_accum_scalar_q8(a_rem, b_rem, inv_a_s, inv_b_s, inv_tot_s) as i32);
+    (dist_q8 >> 8).max(0)
+}
+
 /// Fast JSD bit-cost divergence over arbitrary-length `[u32]` histograms (`Literal`, `IAC`, `Distance`).
 #[inline]
 pub(crate) fn histogram_distance_slice(a: &[u32], total_a: u32, b: &[u32], total_b: u32) -> i32 {
@@ -259,6 +315,12 @@ pub(crate) fn histogram_distance_slice(a: &[u32], total_a: u32, b: &[u32], total
     if (total_a as u64) + (total_b as u64) <= 8_000_000 {
         if let Some(token) = Avx2Token::try_new() {
             return histogram_distance_slice_avx2(a, total_a, b, total_b, token);
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    if (total_a as u64) + (total_b as u64) <= 8_000_000 {
+        if let Some(token) = NeonToken::try_new() {
+            return histogram_distance_slice_neon(a, total_a, b, total_b, token);
         }
     }
     histogram_distance_slice_portable(a, total_a, b, total_b)

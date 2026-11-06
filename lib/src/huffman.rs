@@ -43,7 +43,7 @@ pub(crate) struct HuffmanCodeEntry {
     pub(crate) bits: u16,
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 impl HuffmanCodeEntry {
     #[inline(always)]
     pub(crate) fn to_u32(self) -> u32 {

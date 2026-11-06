@@ -101,7 +101,7 @@ pub(crate) trait MatchConfig: Send + Sync + 'static {
         env: &SliceEnv<'_>,
         state: &mut SliceParseState,
         md: &mut MetablockSink<'_>,
-        avx2: OptAvx2,
+        avx2: OptSimd,
     );
 }
 
@@ -144,7 +144,7 @@ macro_rules! def_arch {
                 env: &SliceEnv<'_>,
                 state: &mut SliceParseState,
                 md: &mut MetablockSink<'_>,
-                avx2: OptAvx2,
+                avx2: OptSimd,
             ) {
                 #[cfg(target_arch = "x86_64")]
                 if let Some(tok) = avx2 {
@@ -859,8 +859,10 @@ fn shift_tagged_search<const WAYS: usize, S: SimdBackend>(
 ) -> u32 {
     let tag = shift_tag16(sec_hash);
     let tm = dispatch_simd!(
-        simd, S => |tok| tags_shift_match_avx2(tags, tag, tok),
-        tags_shift_match_portable(tags, tag)
+        simd,
+        S => x64: |tok| tags_shift_match_avx2(tags, tag, tok),
+        neon: |_tok| tags_shift_match_portable(tags, tag),
+        scalar: tags_shift_match_portable(tags, tag),
     );
     if tm == 0 {
         buckets_insert(buckets, simd, vpos);
@@ -926,8 +928,10 @@ fn ring_search<const WAYS: usize, S: SimdBackend>(
     };
     let tag = ring_tag16(sec_hash);
     let raw = dispatch_simd!(
-        simd, S => |tok| tags_match_ring_avx2(ts, tag, tok),
-        tags_match_portable(ts, tag)
+        simd,
+        S => x64: |tok| tags_match_ring_avx2(ts, tag, tok),
+        neon: |_tok| tags_match_portable(ts, tag),
+        scalar: tags_match_portable(ts, tag),
     );
     ring_finish_search(head, ts, bs, raw, (tag, vpos, wsize), dists)
 }
@@ -1095,8 +1099,10 @@ fn buckets_insert<const WAYS: usize, S: SimdBackend>(slot: &mut [u32; WAYS], sim
         return;
     }
     dispatch_simd!(
-        simd, S => |tok| buckets_insert_avx2(slot, target, tok),
-        buckets_insert_portable(slot, target)
+        simd,
+        S => x64: |tok| buckets_insert_avx2(slot, target, tok),
+        neon: |_tok| buckets_insert_portable(slot, target),
+        scalar: buckets_insert_portable(slot, target),
     );
 }
 
@@ -1111,8 +1117,10 @@ fn buckets_search_and_insert_masked<const WAYS: usize, S: SimdBackend>(
     dists: &mut [u32; 32],
 ) -> u32 {
     dispatch_simd!(
-        simd, S => |tok| buckets_search_and_insert_avx2(slot, target, wsize, tag_mask, dists, tok),
-        buckets_search_and_insert_portable(slot, target, wsize, dists) & tag_mask
+        simd,
+        S => x64: |tok| buckets_search_and_insert_avx2(slot, target, wsize, tag_mask, dists, tok),
+        neon: |_tok| buckets_search_and_insert_portable(slot, target, wsize, dists) & tag_mask,
+        scalar: buckets_search_and_insert_portable(slot, target, wsize, dists) & tag_mask,
     )
 }
 
@@ -1184,7 +1192,8 @@ pub(crate) fn find_closest_2b<S: SimdBackend>(
     }
     let [b0, b1] = [data[pos], data[pos + 1]];
     let lo = dispatch_simd!(
-        simd, S => |tok| {
+        simd,
+        S => x64: |tok| {
             if pos >= 32 {
                 let w = &data[pos - 32..pos + 1];
                 let m0 = eq2_mask32(w.first_chunk().unwrap(), w.last_chunk().unwrap(), b0, b1, tok);
@@ -1206,7 +1215,8 @@ pub(crate) fn find_closest_2b<S: SimdBackend>(
                 1usize
             }
         },
-        1usize
+        neon: |_tok| 1usize,
+        scalar: 1usize,
     );
     (lo..=lim)
         .find(|&d| data[pos - d..pos - d + 2] == [b0, b1])
@@ -1230,7 +1240,8 @@ fn common_prefix_from<const START: usize, S: SimdBackend>(
     max_len: usize,
 ) -> usize {
     dispatch_simd!(
-        simd, S => |tok| {
+        simd,
+        S => x64: |tok| {
             let Some(pair) = PairedPrefix::new(data, pos1, pos2, max_len) else {
                 return 0;
             };
@@ -1288,7 +1299,7 @@ fn common_prefix_from<const START: usize, S: SimdBackend>(
             }
             max
         },
-        {
+        neon: |_tok| {
             let max = data.len().saturating_sub(pos2.max(pos1)).min(max_len);
             if START > 0 && max <= START {
                 return max;
@@ -1297,7 +1308,17 @@ fn common_prefix_from<const START: usize, S: SimdBackend>(
                 return max.min(START);
             };
             START + common_prefix_len(a, b, max - START)
-        }
+        },
+        scalar: {
+            let max = data.len().saturating_sub(pos2.max(pos1)).min(max_len);
+            if START > 0 && max <= START {
+                return max;
+            }
+            let (Some(a), Some(b)) = (data.get(pos1 + START..), data.get(pos2 + START..)) else {
+                return max.min(START);
+            };
+            START + common_prefix_len(a, b, max - START)
+        },
     )
 }
 
@@ -1836,7 +1857,7 @@ impl FastLdmTable {
             out,
         ) {
             let params = fast_ldm_params(density);
-            match try_avx2(use_avx2) {
+            match try_simd(use_avx2) {
                 #[cfg(target_arch = "x86_64")]
                 Some(tok) => sc.scan_avx2(params, scan_start, scan_end, tok, tok),
                 _ => sc.scan_portable(params, scan_start, scan_end),
@@ -2709,7 +2730,7 @@ impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize, S: SimdBacken
         pos_pf: usize,
     ) {
         const { assert!(WAYS >= 4) };
-        if const { S::IS_AVX2 } {
+        if const { S::IS_SIMD } {
             let p64 = u64::from_le_bytes(*pfx_pf.get_sub_clamped::<8, 0>(pos_pf))
                 .wrapping_mul(HASH_MUL64);
             if const { POS_BITS == 31 } {
@@ -2752,8 +2773,10 @@ impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize, S: SimdBacken
                 if let Some(t) = self.tags.as_mut() {
                     let row = t.get_hash64_mut(p64);
                     dispatch_simd!(
-                        simd, S => |tok| tags_insert_avx2(row, tag, tok),
-                        tags_insert_portable(row, tag)
+                        simd,
+                        S => x64: |tok| tags_insert_avx2(row, tag, tok),
+                        neon: |_tok| tags_insert_portable(row, tag),
+                        scalar: tags_insert_portable(row, tag),
                     );
                 }
                 buckets_insert(self.table.get_hash64_mut(p64), simd, vpos);
@@ -2879,8 +2902,10 @@ impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize, S: SimdBacken
                     row[0] = tag;
                 } else {
                     dispatch_simd!(
-                        simd, S => |tok| tags_insert_avx2(row, tag, tok),
-                        tags_insert_portable(row, tag)
+                        simd,
+                        S => x64: |tok| tags_insert_avx2(row, tag, tok),
+                        neon: |_tok| tags_insert_portable(row, tag),
+                        scalar: tags_insert_portable(row, tag),
                     );
                 }
             }
@@ -4144,7 +4169,7 @@ impl HashTable {
             use_sd,
         };
         if interior_end > slice_start {
-            C::run_interior(self, &env, state, md, try_avx2(use_avx2));
+            C::run_interior(self, &env, state, md, try_simd(use_avx2));
         }
         if target_end == data_len {
             let tail = state.anchor.max(interior_end).max(slice_start);

@@ -15,7 +15,7 @@
 //! Unified RFC 7932 built-in static dictionary (`kBrotliDictionary` + all 121 transforms).
 
 use crate::constants::{dispatch_simd, SimdBackend};
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use simd_tokens::{simd_entry, SimdToken};
 use std::sync::OnceLock;
 
@@ -520,7 +520,7 @@ fn lookup_impl(
     best
 }
 
-#[cfg_attr(target_arch = "x86_64", cold)]
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), cold)]
 #[inline(never)]
 fn lookup_with_mode(
     s: &[u8],
@@ -547,6 +547,21 @@ fn lookup_avx2(
     lookup_impl(s, bd, mrd_mo, lm_co, mg_fast)
 }
 
+#[cfg(target_arch = "aarch64")]
+#[simd_entry]
+#[target_feature(enable = "neon")]
+#[inline(never)]
+fn lookup_neon(
+    s: &[u8],
+    bd: u64,
+    mrd_mo: u64,
+    lm_co: u64,
+    mg_fast: u64,
+    _tok: impl SimdToken,
+) -> Option<StaticDictMatch> {
+    lookup_impl(s, bd, mrd_mo, lm_co, mg_fast)
+}
+
 #[inline(always)]
 pub(crate) fn lookup_simd<S: SimdBackend>(
     simd: S,
@@ -558,8 +573,10 @@ pub(crate) fn lookup_simd<S: SimdBackend>(
     let lm_co = (lm as u32 as u64) | ((co as u32 as u64) << 32);
     let mg_fast = ((mg as u32 as u64) << 1) | (fast as u64);
     dispatch_simd!(
-        simd, S => |tok| lookup_avx2(s, bd, mrd_mo, lm_co, mg_fast, tok),
-        lookup_with_mode(s, bd, mrd_mo, lm_co, mg_fast)
+        simd,
+        S => x64: |tok| lookup_avx2(s, bd, mrd_mo, lm_co, mg_fast, tok),
+        neon: |tok| lookup_neon(s, bd, mrd_mo, lm_co, mg_fast, tok),
+        scalar: lookup_with_mode(s, bd, mrd_mo, lm_co, mg_fast),
     )
 }
 

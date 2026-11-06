@@ -16,7 +16,7 @@
 
 #[cfg(target_arch = "x86_64")]
 use crate::constants::X64V3;
-use crate::constants::{try_avx2, Scalar, SimdBackend, HASH_MUL32, STD_MAX_RAW_STATIC_DIST};
+use crate::constants::{try_simd, Scalar, SimdBackend, HASH_MUL32, STD_MAX_RAW_STATIC_DIST};
 use crate::hashtable::{
     common_prefix_at, common_prefix_len, common_suffix_len, find_closest_2b, hash5_p64,
     load_word64_padded, FastLdmSpan,
@@ -453,7 +453,7 @@ impl SparseLdm {
         }
         self.dirty_to = self.dirty_to.max(n_bkt);
         let bounds = (scan_start, capped_end, local_window_cap, do_probe);
-        match try_avx2(true) {
+        match try_simd(true) {
             #[cfg(target_arch = "x86_64")]
             Some(tok) => self.scan_avx2(env, bounds, out, tok, tok),
             _ => self.scan_loop(Scalar, env, bounds, out),
@@ -590,7 +590,7 @@ impl DictChain {
 
     #[inline(always)]
     fn prefetch_ahead<S: SimdBackend>(&self, simd: S, data: &[u8], sp_head: usize, sp_item: usize) {
-        if const { S::IS_AVX2 } && !self.heads5.is_empty() {
+        if const { S::IS_SIMD } && !self.heads5.is_empty() {
             if sp_head + 8 <= data.len() {
                 let (h_hd, _, _) = hash5_p64(u64::from_le_bytes(
                     *data[sp_head..sp_head + 8].first_chunk::<8>().unwrap(),
@@ -1305,7 +1305,7 @@ pub(super) fn build_chunk_matches(
     scratch: &mut MatchGenScratch,
     out: &mut ChunkMatches,
 ) {
-    match try_avx2(true) {
+    match try_simd(true) {
         #[cfg(target_arch = "x86_64")]
         Some(tok) => build_chunk_matches_avx2(cfg, scratch, out, tok, tok),
         _ => build_chunk_matches_scalar(cfg, scratch, out),

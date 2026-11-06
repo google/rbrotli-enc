@@ -23,7 +23,7 @@ use lsb_bitwriter::{BitWriter, OutSlice};
 
 use crate::compress::build_stream_engine;
 use crate::constants::{
-    try_avx2, window_size, OptAvx2, INITIAL_LAST_DISTANCES, LARGE_MAX_WBITS, MIN_WBITS,
+    try_simd, window_size, OptSimd, INITIAL_LAST_DISTANCES, LARGE_MAX_WBITS, MIN_WBITS,
     STD_MAX_WBITS, WBITS,
 };
 use crate::fast_onepass::fast_twopass_max_output_size_for;
@@ -135,7 +135,7 @@ pub(crate) trait ChunkStreamEncoder: Send + Sync {
         dict: Option<&PreparedDictionary>,
         ring: &mut [u32; 2],
         bw: &mut BitWriter<'_>,
-        avx2: OptAvx2,
+        simd: OptSimd,
     );
 }
 
@@ -222,7 +222,7 @@ impl<E: ChunkStreamEncoder> StreamEngine for ChunkStreamBackend<E> {
             dict,
             &mut self.ring,
             bw,
-            try_avx2(true),
+            try_simd(true),
         );
         eof
     }

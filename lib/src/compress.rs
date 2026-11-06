@@ -1588,7 +1588,7 @@ impl MetablockData {
         let (saved_ring, trailing_literals) =
             (self.dist_ring, self.total_literals - self.iac_literals);
         let (start_bits, cp) = (bw.total_bits(), bw.checkpoint());
-        let avx2_tok = try_avx2(use_avx2);
+        let avx2_tok = try_simd(use_avx2);
 
         let mut multi_ctx = self.prepare_lit_clusters(cfg, histo_buf, ctx_counted);
         let (use_multi_ctx, cmap) = multi_ctx
@@ -2219,7 +2219,7 @@ impl EncoderImpl for (OnePassEncoder, [(u8, u8); 3]) {
     fn compress_into(&mut self, data: &[u8], dict: OptDict<'_>, bw: &mut BitWriter<'_>) {
         let (_, (mls, log)) = select_tier(self.0.wbits(), data.len(), dict, self.1);
         self.0.configure(mls, log as u32);
-        compress_fast_with_tok(&mut self.0, data, dict, bw, try_avx2(true));
+        compress_fast_with_tok(&mut self.0, data, dict, bw, try_simd(true));
     }
 }
 
@@ -2228,7 +2228,7 @@ impl EncoderImpl for (FastTwoPassEncoder, [(u8, u8, u8); 3]) {
         let (eff_len, (mls, log, slog)) = select_tier(self.0.wbits(), data.len(), dict, self.1);
         self.0
             .configure_tiered(eff_len, mls, log as u32, slog as u32);
-        compress_fast_with_tok(&mut self.0, data, dict, bw, try_avx2(true));
+        compress_fast_with_tok(&mut self.0, data, dict, bw, try_simd(true));
     }
 }
 

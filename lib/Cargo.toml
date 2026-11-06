@@ -12,7 +12,7 @@ lsb-bitwriter = { path = "../lsb-bitwriter" }
 zerocopy = { version = "0.7.32", features = ["derive"] }
 bounded-utils = { path = "../bounded-utils" }
 
-[target.'cfg(target_arch = "x86_64")'.dependencies]
+[target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]
 simd_tokens = "0.2.0"
 safe_unaligned_simd = "0.2.5"
 
