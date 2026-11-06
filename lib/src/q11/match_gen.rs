@@ -14,6 +14,8 @@
 
 //! Subquadratic $O(N \log N)$ Pareto-frontier match generator for `Q10`..=`Q12`.
 
+#[cfg(target_arch = "aarch64")]
+use crate::constants::A64Neon;
 #[cfg(target_arch = "x86_64")]
 use crate::constants::X64V3;
 use crate::constants::{try_simd, Scalar, SimdBackend, HASH_MUL32, STD_MAX_RAW_STATIC_DIST};
@@ -24,7 +26,7 @@ use crate::hashtable::{
 use crate::map_to_sym::copy_code_only;
 use crate::static_dict;
 use hugepage_buffer::HugePageBuf;
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use simd_tokens::{simd_entry, SimdToken};
 
 use super::ChunkEnv;
@@ -383,6 +385,21 @@ impl SparseLdm {
         self.scan_loop(simd, env, bounds, out);
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[simd_entry]
+    #[target_feature(enable = "neon")]
+    #[inline(never)]
+    fn scan_neon(
+        &mut self,
+        env: ChunkEnv<'_>,
+        bounds: (usize, usize, usize, bool),
+        out: &mut ChunkLdmMatches,
+        simd: A64Neon,
+        _tok: impl SimdToken,
+    ) {
+        self.scan_loop(simd, env, bounds, out);
+    }
+
     pub(super) fn extract(
         &mut self,
         env: ChunkEnv<'_>,
@@ -456,6 +473,8 @@ impl SparseLdm {
         match try_simd(true) {
             #[cfg(target_arch = "x86_64")]
             Some(tok) => self.scan_avx2(env, bounds, out, tok, tok),
+            #[cfg(target_arch = "aarch64")]
+            Some(tok) => self.scan_neon(env, bounds, out, tok, tok),
             _ => self.scan_loop(Scalar, env, bounds, out),
         }
         self.indexed_end = self.indexed_end.max(capped_end);
@@ -1290,7 +1309,21 @@ fn build_chunk_matches_avx2(
     build_chunk_matches_impl(simd, cfg, scratch, out);
 }
 
-#[cfg_attr(target_arch = "x86_64", cold)]
+#[cfg(target_arch = "aarch64")]
+#[simd_entry]
+#[target_feature(enable = "neon")]
+#[inline(never)]
+fn build_chunk_matches_neon(
+    cfg: MatchGenCfg<'_>,
+    scratch: &mut MatchGenScratch,
+    out: &mut ChunkMatches,
+    simd: A64Neon,
+    _tok: impl SimdToken,
+) {
+    build_chunk_matches_impl(simd, cfg, scratch, out);
+}
+
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), cold)]
 #[inline(never)]
 fn build_chunk_matches_scalar(
     cfg: MatchGenCfg<'_>,
@@ -1308,6 +1341,8 @@ pub(super) fn build_chunk_matches(
     match try_simd(true) {
         #[cfg(target_arch = "x86_64")]
         Some(tok) => build_chunk_matches_avx2(cfg, scratch, out, tok, tok),
+        #[cfg(target_arch = "aarch64")]
+        Some(tok) => build_chunk_matches_neon(cfg, scratch, out, tok, tok),
         _ => build_chunk_matches_scalar(cfg, scratch, out),
     }
 }
@@ -1374,16 +1409,37 @@ pub(super) mod tests {
                 if let Some(tok) = X64V3::try_new() {
                     assert_eq!(find_closest_2b(tok, &data, pos, max_d2), exp);
                 }
+                #[cfg(target_arch = "aarch64")]
+                if let Some(tok) = A64Neon::try_new() {
+                    assert_eq!(find_closest_2b(tok, &data, pos, max_d2), exp);
+                }
             }
         }
-        #[cfg(target_arch = "x86_64")]
-        if let Some(tok) = X64V3::try_new() {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        if let Some(tok) = try_simd(true) {
             let (mut s_a, mut s_p) = (MatchGenScratch::default(), MatchGenScratch::default());
             for &eff in miri_or(&[10u8, 12][..], &[10u8, 11, 12][..]) {
                 let env = ChunkEnv::new(&data, chunk_start, data.len(), 1024, &[]);
                 let ldm = ChunkLdmMatches::default();
                 let (mut cm_a, mut cm_p) = (ChunkMatches::default(), ChunkMatches::default());
+                #[cfg(target_arch = "x86_64")]
                 build_chunk_matches_avx2(
+                    MatchGenCfg {
+                        env,
+                        local_window_cap: 1024,
+                        large_window: false,
+                        effort: eff,
+                        full_dict_len: 0,
+                        dict_chain: None,
+                        ldm: &ldm,
+                    },
+                    &mut s_a,
+                    &mut cm_a,
+                    tok,
+                    tok,
+                );
+                #[cfg(target_arch = "aarch64")]
+                build_chunk_matches_neon(
                     MatchGenCfg {
                         env,
                         local_window_cap: 1024,
