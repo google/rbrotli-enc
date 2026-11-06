@@ -156,10 +156,10 @@ pub struct Header<'a> {
     pub ndirect: u8,
     pub context_mode: Vec<ContextMode>,
     pub literals_codes: Vec<HuffmanCode<'a>>,
-    pub literals_cmap: ContextMap,
+    pub literals_cmap: ContextMap<'static>,
     pub insert_and_copy_codes: Vec<HuffmanCode<'a>>,
     pub distance_codes: Vec<HuffmanCode<'a>>,
-    pub distance_cmap: ContextMap,
+    pub distance_cmap: ContextMap<'static>,
 }
 
 impl<'a> Header<'a> {
