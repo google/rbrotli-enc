@@ -7,8 +7,10 @@ license = "Apache-2.0"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-libc = "0.2.153"
 zerocopy = { version = "0.7.32" }
+
+[target.'cfg(all(target_os = "linux", not(miri)))'.dependencies]
+libc = "0.2.153"
 
 [lints]
 workspace = true
