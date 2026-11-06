@@ -13,10 +13,14 @@
 // limitations under the License.
 
 #[cfg(target_arch = "x86_64")]
+use crate::map_to_sym::pack_even_odd_16_avx2;
+#[cfg(target_arch = "aarch64")]
+use crate::map_to_sym::pack_even_odd_16_neon;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use crate::map_to_sym::{
     distance_to_sym_and_bits_simd, emit_cmd_and_lits, emit_cmd_no_lits,
     insert_copy_len_to_sym_and_bits_simd, mask_huff_entry, pack_entries_quad_bounded,
-    pack_even_odd_16_avx2, with_detached, IcdBatchBufs,
+    with_detached, IcdBatchBufs,
 };
 use crate::{
     block_split::{select_distance_params_from_samples, try_plan_metablock, PlanOpts},
@@ -45,13 +49,17 @@ use crate::{
     stream::{ChunkStreamBackend, ChunkStreamEncoder, StreamEngine, StreamOp},
 };
 use bounded_utils::Pow2SliceMut;
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use bounded_utils::{BoundedArrayExt, BoundedPrefix, BoundedUsize};
+#[cfg(target_arch = "aarch64")]
+use core::arch::aarch64::*;
 use hugepage_buffer::HugePageBuf;
 use lsb_bitwriter::{BitStreamCursor, BitWriter, BitWriterCheckpoint};
+#[cfg(target_arch = "aarch64")]
+use safe_unaligned_simd::aarch64::{vld1q_u32, vld1q_u8, vld1q_u8_x4, vst1q_u16};
 #[cfg(target_arch = "x86_64")]
 use safe_unaligned_simd::x86_64::{_mm256_loadu_si256, _mm256_storeu_si256, _mm_loadu_si128};
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use simd_tokens::{simd_entry, SimdToken};
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -323,10 +331,10 @@ fn copy_long_literals(
     copy_tail_literals_cold(literals.as_padded_mut_slice(), tl, data, anchor, match_pos);
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const IMP_D0_SYM: u32 = 0x7FF;
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline(always)]
 fn step_dist_ring_batch(dist_slice: &[u32; 8], limit: usize, ring: &mut [u32; 4]) -> [[u32; 8]; 4] {
     let mut d = [[0u32; 8]; 4];
@@ -389,7 +397,7 @@ struct MetablockData {
     insert_len: HugePageBuf<u32>,
     copy_len: HugePageBuf<u32>,
     distance: HugePageBuf<u32>,
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     enc_icds: HugePageBuf<u64>,
     histogram_buf: HugePageBuf<HuffmanCodeEntry>,
     lit_ctx: Option<HugePageBuf<u8>>,
@@ -505,7 +513,7 @@ impl MetablockData {
             insert_len: HugePageBuf::new(),
             copy_len: HugePageBuf::new(),
             distance: HugePageBuf::new(),
-            #[cfg(target_arch = "x86_64")]
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             enc_icds: HugePageBuf::new(),
             histogram_buf: HugePageBuf::new(),
             lit_ctx: None,
@@ -535,7 +543,7 @@ impl MetablockData {
         self.insert_len.resize_or_grow_zeroed(icd_buf);
         self.copy_len.resize_or_grow_zeroed(icd_buf);
         self.distance.resize_or_grow_zeroed(icd_buf);
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         self.enc_icds.resize_or_grow_zeroed(icd_buf);
         self.histogram_buf.resize_or_grow_zeroed(HISTOGRAM_BUF_SIZE);
         if multi_ctx {
@@ -764,6 +772,66 @@ impl MetablockData {
         ]
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn map_multi_ctx_syms_neon(
+        lits: uint8x16_t,
+        ctxs: uint8x16_t,
+        cmap_luts: uint8x16x4_t,
+    ) -> [uint16x8_t; 2] {
+        let hi = vqtbl4q_u8(cmap_luts, vandq_u8(ctxs, vdupq_n_u8(63)));
+        [
+            vreinterpretq_u16_u8(vzip1q_u8(lits, hi)),
+            vreinterpretq_u16_u8(vzip2q_u8(lits, hi)),
+        ]
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    #[target_feature(enable = "neon")]
+    fn cmap_luts_neon(cmap: &[u8; 64]) -> uint8x16x4_t {
+        const LIT_HI: u8 = (LIT_BASE >> 8) as u8;
+        let mut hi = [0u8; 64];
+        let mut c = 0;
+        while c < 64 {
+            hi[c] = LIT_HI.wrapping_add(cmap[c]);
+            c += 1;
+        }
+        vld1q_u8_x4(hi.as_chunks::<16>().0.first_chunk::<4>().unwrap())
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[inline(always)]
+    fn commit_icd_batch<const TWO_DIST_CTX: bool>(
+        base_i: usize,
+        limit: usize,
+        bufs: &IcdBatchBufs,
+        enc_icds: &mut Pow2SliceMut<'_, u64, 8>,
+        iac_hist: &mut [u32; IAC_HIST_BUF_SIZE],
+        dist_hist: &mut [u32; DIST_HIST_BUF_SIZE],
+    ) {
+        for ii in 0..limit {
+            let (raw_iac, d_sym) = (bufs.iac_sym[ii], bufs.dist_sym[ii]);
+            let imp_d0 = d_sym == 0 && raw_iac < 256;
+            let iac_sym = if imp_d0 { raw_iac - 128 } else { raw_iac };
+            let d_ctx = if TWO_DIST_CTX { bufs.dist_ctx[ii] } else { 0 };
+            let d_sym_enc = if imp_d0 { IMP_D0_SYM } else { d_sym };
+            debug_assert!(iac_sym < MAX_IAC as u32 && d_sym < MAX_HUFFMAN_ALPHABET as u32);
+            debug_assert!(bufs.dist_bits[ii] < (1 << 29));
+            *enc_icds.get_masked_mut(base_i + ii) = (iac_sym as u64)
+                | ((d_sym_enc as u64) << 10)
+                | ((d_ctx as u64) << 21)
+                | ((bufs.dist_bits[ii] as u64) << 22)
+                | (bufs.iac_bits[ii] << 51);
+            *iac_hist.bget_masked_mut(iac_sym as usize) += 1;
+            if !imp_d0 {
+                let dist_idx = d_ctx as usize * MAX_HUFFMAN_ALPHABET + d_sym as usize;
+                *dist_hist.bget_masked_mut(dist_idx) += 1;
+            }
+        }
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[simd_entry]
     #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
@@ -834,25 +902,14 @@ impl MetablockData {
                 ]
             };
             distance_to_sym_and_bits_simd(vd, v_raw, npostfix, ndirect, &mut bufs);
-            for ii in 0..limit {
-                let (raw_iac, d_sym) = (bufs.iac_sym[ii], bufs.dist_sym[ii]);
-                let imp_d0 = d_sym == 0 && raw_iac < 256;
-                let iac_sym = if imp_d0 { raw_iac - 128 } else { raw_iac };
-                let d_ctx = if TWO_DIST_CTX { bufs.dist_ctx[ii] } else { 0 };
-                let d_sym_enc = if imp_d0 { IMP_D0_SYM } else { d_sym };
-                debug_assert!(iac_sym < MAX_IAC as u32 && d_sym < MAX_HUFFMAN_ALPHABET as u32);
-                debug_assert!(bufs.dist_bits[ii] < (1 << 29));
-                *enc_icds.get_masked_mut(base_i + ii) = (iac_sym as u64)
-                    | ((d_sym_enc as u64) << 10)
-                    | ((d_ctx as u64) << 21)
-                    | ((bufs.dist_bits[ii] as u64) << 22)
-                    | (bufs.iac_bits[ii] << 51);
-                *iac_hist.bget_masked_mut(iac_sym as usize) += 1;
-                if !imp_d0 {
-                    let dist_idx = d_ctx as usize * MAX_HUFFMAN_ALPHABET + d_sym as usize;
-                    *dist_hist.bget_masked_mut(dist_idx) += 1;
-                }
-            }
+            Self::commit_icd_batch::<TWO_DIST_CTX>(
+                base_i,
+                limit,
+                &bufs,
+                &mut enc_icds,
+                iac_hist,
+                dist_hist,
+            );
         }
         self.dist_ring = ring;
         if trailing_literals != 0 {
@@ -861,7 +918,84 @@ impl MetablockData {
         }
     }
 
-    #[cfg_attr(target_arch = "x86_64", cold)]
+    #[cfg(target_arch = "aarch64")]
+    #[simd_entry]
+    #[target_feature(enable = "neon")]
+    #[inline(never)]
+    fn encode_symbols_neon<const TWO_DIST_CTX: bool>(
+        &mut self,
+        npostfix: u8,
+        ndirect: u8,
+        trailing_literals: u32,
+        iac_hist: &mut [u32; IAC_HIST_BUF_SIZE],
+        dist_hist: &mut [u32; DIST_HIST_BUF_SIZE],
+        _token: impl SimdToken,
+    ) {
+        let mut bufs = IcdBatchBufs::default();
+        let total_icd = self.total_icd as usize;
+        let n_batches = total_icd.div_ceil(8);
+        debug_assert!(self.icd_limit + 1 >= total_icd);
+        let ins_chunks = &self.insert_len.as_chunks::<8>().0[..n_batches];
+        let copy_chunks = &self.copy_len.as_chunks::<8>().0[..n_batches];
+        let dist_chunks = &self.distance.as_chunks::<8>().0[..n_batches];
+        let mut enc_icds =
+            Pow2SliceMut::<u64, 8>::from_padded(&mut self.enc_icds[..]).expect("icd_buf");
+
+        let mut ring = self.dist_ring;
+        for (b, ((ins_arr, copy_arr), dist_slice)) in ins_chunks
+            .iter()
+            .zip(copy_chunks)
+            .zip(dist_chunks)
+            .enumerate()
+        {
+            let base_i = b * 8;
+            let limit = (total_icd - base_i).min(8);
+            insert_copy_len_to_sym_and_bits_simd::<TWO_DIST_CTX>(ins_arr, copy_arr, &mut bufs);
+            let [d_lo, d_hi] = dist_slice.as_chunks::<4>().0.first_chunk::<2>().unwrap();
+            let (lo, hi) = (vld1q_u32(d_lo), vld1q_u32(d_hi));
+            let prev = vld1q_u32(&[ring[3], ring[2], ring[1], ring[0]]);
+            let (c0_lo, c0_hi) = (vextq_u32::<3>(prev, lo), vextq_u32::<3>(lo, hi));
+            let fl = vorrq_u32(
+                vorrq_u32(lo, vceqq_u32(lo, c0_lo)),
+                vorrq_u32(hi, vceqq_u32(hi, c0_hi)),
+            );
+            let skip = (vmaxvq_u32(fl) >> 31) != 0;
+            let pair =
+                |a: uint32x4_t, c: uint32x4_t| [vreinterpretq_s32_u32(a), vreinterpretq_s32_u32(c)];
+            let vd = if limit == 8 && !skip {
+                ring = [dist_slice[7], dist_slice[6], dist_slice[5], dist_slice[4]];
+                [
+                    pair(c0_lo, c0_hi),
+                    pair(vextq_u32::<2>(prev, lo), vextq_u32::<2>(lo, hi)),
+                    pair(vextq_u32::<1>(prev, lo), vextq_u32::<1>(lo, hi)),
+                    pair(prev, lo),
+                ]
+            } else {
+                let [a0, a1, a2, a3] = step_dist_ring_batch(dist_slice, limit, &mut ring);
+                let ld2 = |a: &[u32; 8]| {
+                    let [l, r] = a.as_chunks::<4>().0.first_chunk::<2>().unwrap();
+                    pair(vld1q_u32(l), vld1q_u32(r))
+                };
+                [ld2(&a0), ld2(&a1), ld2(&a2), ld2(&a3)]
+            };
+            distance_to_sym_and_bits_simd(vd, pair(lo, hi), npostfix, ndirect, &mut bufs);
+            Self::commit_icd_batch::<TWO_DIST_CTX>(
+                base_i,
+                limit,
+                &bufs,
+                &mut enc_icds,
+                iac_hist,
+                dist_hist,
+            );
+        }
+        self.dist_ring = ring;
+        if trailing_literals != 0 {
+            let (sym, _, _) = encode_iac(trailing_literals, 4, false);
+            *iac_hist.bget_masked_mut(sym as usize) += 1;
+        }
+    }
+
+    #[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), cold)]
     #[inline(never)]
     fn emit_lits_range<const MULTI_CTX: bool>(
         &self,
@@ -890,7 +1024,7 @@ impl MetablockData {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[inline(always)]
     fn pack_mc_quad(
         huff_arr: &[HuffmanCodeEntry; HISTOGRAM_BUF_SIZE],
@@ -912,7 +1046,7 @@ impl MetablockData {
         ])
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[inline(always)]
     fn emit_mc_lits_tail(
         cur: &mut BitStreamCursor<'_, '_>,
@@ -1207,6 +1341,31 @@ def_emit_bits_arch!(
                 luts,
             ),
         );
+        sym_arr
+    }
+);
+
+#[cfg(target_arch = "aarch64")]
+def_emit_bits_arch!(
+    cfg = "aarch64",
+    feat = "neon",
+    simd = A64Neon,
+    luts = uint8x16x4_t,
+    mc_fn = emit_mc_lits_neon,
+    emit_fn = emit_bits_neon,
+    pack16 = pack_even_odd_16_neon,
+    zero_luts = {
+        let z = vdupq_n_u8(0);
+        uint8x16x4_t(z, z, z, z)
+    },
+    make_luts = |cmap| MetablockData::cmap_luts_neon(cmap),
+    map_syms = |lit_arr, ctx_arr, luts| {
+        let mut sym_arr = [0u16; 16];
+        let [s0, s1] =
+            MetablockData::map_multi_ctx_syms_neon(vld1q_u8(lit_arr), vld1q_u8(ctx_arr), *luts);
+        let chunks = sym_arr.as_chunks_mut::<8>().0;
+        vst1q_u16(&mut chunks[0], s0);
+        vst1q_u16(&mut chunks[1], s1);
         sym_arr
     }
 );
@@ -1561,7 +1720,7 @@ impl MetablockData {
         full_data: &[u8],
         (anchor, mb_start, mb_end): (usize, usize, usize),
         (precomputed_lit_hist, ctx_counted): (Option<&LiteralHistogram>, usize),
-        use_avx2: bool,
+        use_simd: bool,
     ) -> bool {
         self.add_remaining_literals(cfg.multi_context, full_data, anchor, mb_end);
         let block_data = &full_data[mb_start..mb_end];
@@ -1588,7 +1747,7 @@ impl MetablockData {
         let (saved_ring, trailing_literals) =
             (self.dist_ring, self.total_literals - self.iac_literals);
         let (start_bits, cp) = (bw.total_bits(), bw.checkpoint());
-        let avx2_tok = try_simd(use_avx2);
+        let simd_tok = try_simd(use_simd);
 
         let mut multi_ctx = self.prepare_lit_clusters(cfg, histo_buf, ctx_counted);
         let (use_multi_ctx, cmap) = multi_ctx
@@ -1603,10 +1762,21 @@ impl MetablockData {
         }
         assert!(self.total_icd as usize + 8 <= self.insert_len.len());
 
-        match avx2_tok {
+        match simd_tok {
             #[cfg(target_arch = "x86_64")]
             Some(tok) => with_const_bool!(cfg.two_dist_ctx, |TD| {
                 self.encode_symbols_avx2::<TD>(
+                    npostfix,
+                    ndirect,
+                    trailing_literals,
+                    &mut histo_buf.iac_hist,
+                    &mut histo_buf.dist_hist,
+                    tok,
+                )
+            }),
+            #[cfg(target_arch = "aarch64")]
+            Some(tok) => with_const_bool!(cfg.two_dist_ctx, |TD| {
+                self.encode_symbols_neon::<TD>(
                     npostfix,
                     ndirect,
                     trailing_literals,
@@ -1664,10 +1834,14 @@ impl MetablockData {
             return false;
         }
 
-        match avx2_tok {
+        match simd_tok {
             #[cfg(target_arch = "x86_64")]
             Some(tok) => with_const_bool!(use_multi_ctx, |MC| {
                 self.emit_bits_avx2::<MC>(bw, (npostfix, ndirect), &cmap, tok, tok)
+            }),
+            #[cfg(target_arch = "aarch64")]
+            Some(tok) => with_const_bool!(use_multi_ctx, |MC| {
+                self.emit_bits_neon::<MC>(bw, (npostfix, ndirect), &cmap, tok, tok)
             }),
             _ => with_const_bool!(cfg.two_dist_ctx, use_multi_ctx, |TD, MC| {
                 self.emit_payload_portable::<TD, MC>(bw, saved_ring, npostfix, ndirect, &cmap)
@@ -1897,7 +2071,7 @@ impl<C: MatchConfig> EncoderInternal<C> {
         flush_end: usize,
         use_mb_hists: bool,
         bw: &mut BitWriter,
-        use_avx2: bool,
+        use_simd: bool,
     ) {
         let fcfg = self.flush_cfg();
         let _ = self.md.flush_metablock(
@@ -1907,7 +2081,7 @@ impl<C: MatchConfig> EncoderInternal<C> {
             data,
             (st.parse.anchor, st.mb_start, flush_end),
             (use_mb_hists.then_some(&self.mb_lit_hist), st.ctx_cursor),
-            use_avx2,
+            use_simd,
         );
         st.parse.last_distances = self.md.dist_ring;
         (st.mb_start, st.parse.anchor, st.ctx_cursor) = (flush_end, flush_end, 0);
@@ -1920,13 +2094,13 @@ impl<C: MatchConfig> EncoderInternal<C> {
         st: &mut EncoderSliceState,
         data: &[u8],
         bw: &mut BitWriter,
-        use_avx2: bool,
+        use_simd: bool,
     ) -> SliceSnapshot {
         let max_mb = self.md.max_mb;
         if max_mb > SLICE_SIZE {
             if st.mb_has_slice && st.parse.pos - st.mb_start > max_mb - SLICE_SIZE {
                 let flush_end = st.parse.pos;
-                self.flush_open_mb(st, data, flush_end, true, bw, use_avx2);
+                self.flush_open_mb(st, data, flush_end, true, bw, use_simd);
             }
             if st.need_ctx_mode {
                 let next_mode = choose_ctx_mode_for::<C>(&data[st.parse.pos..]);
@@ -1975,14 +2149,14 @@ impl<C: MatchConfig> EncoderInternal<C> {
         eff_wsize: usize,
         mode: StreamOp,
         bw: &mut BitWriter,
-        use_avx2: bool,
+        use_simd: bool,
     ) {
         let max_mb = self.md.max_mb;
         if max_mb <= SLICE_SIZE
             || (mode == StreamOp::Finish && !st.mb_has_slice && st.parse.pos >= data.len())
         {
             let end = st.parse.pos;
-            self.flush_open_mb(st, data, end, false, bw, use_avx2);
+            self.flush_open_mb(st, data, end, false, bw, use_simd);
             return;
         }
 
@@ -2047,7 +2221,7 @@ impl<C: MatchConfig> EncoderInternal<C> {
                 data,
                 (snap.saved_anchor, st.mb_start, s_start),
                 (Some(&self.mb_lit_hist), st.ctx_cursor),
-                use_avx2,
+                use_simd,
             );
 
             let new_mode = if self.qcfg.ctx_block_split || slice_cmds == 0 {
@@ -2106,7 +2280,7 @@ impl<C: MatchConfig> EncoderInternal<C> {
         dict: Option<&PreparedDictionary>,
         mode: StreamOp,
         bw: &mut BitWriter,
-        use_avx2: bool,
+        use_simd: bool,
     ) {
         let dict = dict.filter(|d| !d.is_empty());
         let has_dict = dict.is_some();
@@ -2121,7 +2295,7 @@ impl<C: MatchConfig> EncoderInternal<C> {
         } else {
             st.parse.pos < in_buf.len()
         } {
-            let snap = self.prepare_next_slice(st, in_buf, bw, use_avx2);
+            let snap = self.prepare_next_slice(st, in_buf, bw, use_simd);
             let target_end = if max_mb <= SLICE_SIZE {
                 in_buf.len()
             } else {
@@ -2144,10 +2318,10 @@ impl<C: MatchConfig> EncoderInternal<C> {
                     &mut st.parse,
                     sink,
                     cost_model,
-                    use_avx2,
+                    use_simd,
                 );
             });
-            self.finish_parsed_slice(st, snap, in_buf, eff_wsize, mode, bw, use_avx2);
+            self.finish_parsed_slice(st, snap, in_buf, eff_wsize, mode, bw, use_simd);
         }
         if st.mb_has_slice {
             let end = if mode != StreamOp::Process {
@@ -2156,7 +2330,7 @@ impl<C: MatchConfig> EncoderInternal<C> {
                 (st.parse.pos - st.mb_start > max_mb - SLICE_SIZE).then_some(st.parse.pos)
             };
             if let Some(flush_end) = end {
-                self.flush_open_mb(st, in_buf, flush_end, true, bw, use_avx2);
+                self.flush_open_mb(st, in_buf, flush_end, true, bw, use_simd);
             }
         }
     }
@@ -2166,14 +2340,14 @@ impl<C: MatchConfig> EncoderInternal<C> {
         data: &[u8],
         dict: Option<&PreparedDictionary>,
         bw: &mut BitWriter,
-        use_avx2: bool,
+        use_simd: bool,
     ) {
         write_window_bits(self.wbits, self.large_window, bw);
         if !data.is_empty() {
             let dict = dict.filter(|d| !d.is_empty());
             self.seed_stream_state(data, data.len(), dict);
             let mut st = EncoderSliceState::default();
-            self.advance_slices(&mut st, data, dict, StreamOp::Finish, bw, use_avx2);
+            self.advance_slices(&mut st, data, dict, StreamOp::Finish, bw, use_simd);
         }
         write_empty_last_metablock(bw);
     }
@@ -2649,8 +2823,6 @@ impl Encoder {
 mod test {
     use super::*;
     use crate::metablock::test_helpers::{decompress_brotli, decompress_brotli_with_dict};
-    #[cfg(target_arch = "x86_64")]
-    use simd_tokens::Avx2Token;
 
     const LCG_MUL: u64 = 6364136223846793005;
     const LCG_INC: u64 = 1442695040888963407;
@@ -2873,7 +3045,7 @@ mod test {
             .1
         }
 
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         fn assert_parity(
             layout: (u8, u8, u8),
             data: &[u8],
@@ -2909,7 +3081,7 @@ mod test {
             (md, fa)
         }
 
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         fn assert_stream_parity<I: AsRef<[u8]>>(
             layout: (u8, u8, u8),
             wbits: usize,
@@ -2926,10 +3098,10 @@ mod test {
             );
             for case in cases {
                 let inp = case.as_ref();
-                let run = |enc: &mut Self, avx2| {
+                let run = |enc: &mut Self, use_simd| {
                     let mut out = vec![0u8; max_two_pass_output_size(inp.len())];
                     let mut bw = BitWriter::new(&mut out);
-                    enc.compress_one_shot(inp, prep, &mut bw, avx2);
+                    enc.compress_one_shot(inp, prep, &mut bw, use_simd);
                     bw.finalize().to_vec()
                 };
                 let (fa, fp) = (run(&mut enc_a, true), run(&mut enc_p, false));
@@ -3392,10 +3564,10 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
         assert!(compress_vec(8, 24, &sv).len() < c7_len && compress_vec(9, 24, &sv).len() < c7_len);
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn test_avx2_portable_parity_suite() {
-        if Avx2Token::try_new().is_none() {
+        if try_simd(true).is_none() {
             return;
         }
         let (mut fib, mut a, mut b) = (Vec::new(), 1usize, 1usize);

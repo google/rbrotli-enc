@@ -19,17 +19,23 @@ use crate::map_to_sym::{
 };
 use crate::metablock::ContextMode;
 use crate::static_dict;
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use bounded_utils::PairedPrefix;
 use bounded_utils::{
     BoundedArrayExt, BoundedPrefix, BoundedPrefixCursor, BoundedUsize, Pow2SliceMut,
 };
+#[cfg(target_arch = "aarch64")]
+use core::arch::aarch64::*;
 use hugepage_buffer::HugePageBuf;
+#[cfg(target_arch = "aarch64")]
+use safe_unaligned_simd::aarch64::{
+    vld1_u16, vld1q_s16, vld1q_u16, vld1q_u16_x4, vld1q_u32, vld1q_u8, vst1q_u16, vst1q_u32,
+};
 #[cfg(target_arch = "x86_64")]
 use safe_unaligned_simd::x86_64::{
     _mm256_loadu_si256, _mm256_storeu_si256, _mm_loadu_si128, _mm_storeu_si128,
 };
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use simd_tokens::{simd_entry, SimdToken};
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -101,7 +107,7 @@ pub(crate) trait MatchConfig: Send + Sync + 'static {
         env: &SliceEnv<'_>,
         state: &mut SliceParseState,
         md: &mut MetablockSink<'_>,
-        avx2: OptSimd,
+        simd: OptSimd,
     );
 }
 
@@ -144,16 +150,21 @@ macro_rules! def_arch {
                 env: &SliceEnv<'_>,
                 state: &mut SliceParseState,
                 md: &mut MetablockSink<'_>,
-                avx2: OptSimd,
+                simd: OptSimd,
             ) {
-                #[cfg(target_arch = "x86_64")]
-                if let Some(tok) = avx2 {
+                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+                if let Some(tok) = simd {
                     let eff_lw = env.large_window && env.win.1 > FAST_LDM_MIN_DIST;
                     if !env.has_dict {
                         match (ht.pos_bits, ht.ways, ht.ht4_ways, eff_lw) {
                             $(($pb, $w, $h4w, $lw) => {
                                 if let Some(it) = ht.interior_mut::<$pb, $w, $h4w>(Self::USE_3B_TABLE) {
+                                    #[cfg(target_arch = "x86_64")]
                                     return parse_slice_interior_avx2::<$pb, $w, $h4w, Self, $lw, false>(
+                                        it, env, state, md, tok, tok,
+                                    );
+                                    #[cfg(target_arch = "aarch64")]
+                                    return parse_slice_interior_neon::<$pb, $w, $h4w, Self, $lw, false>(
                                         it, env, state, md, tok, tok,
                                     );
                                 }
@@ -164,7 +175,12 @@ macro_rules! def_arch {
                         match (ht.pos_bits, ht.ways, ht.ht4_ways) {
                             $(($dpb, $dw, $dh4w) => {
                                 if let Some(it) = ht.interior_mut::<$dpb, $dw, $dh4w>(Self::USE_3B_TABLE) {
+                                    #[cfg(target_arch = "x86_64")]
                                     return parse_slice_interior_avx2::<$dpb, $dw, $dh4w, Self, false, true>(
+                                        it, env, state, md, tok, tok,
+                                    );
+                                    #[cfg(target_arch = "aarch64")]
+                                    return parse_slice_interior_neon::<$dpb, $dw, $dh4w, Self, false, true>(
                                         it, env, state, md, tok, tok,
                                     );
                                 }
@@ -173,7 +189,7 @@ macro_rules! def_arch {
                         }
                     }
                 }
-                let _ = avx2;
+                let _ = simd;
                 parse_slice_interior_portable::<Self>(ht, env, state, md);
             }
         }
@@ -848,7 +864,104 @@ fn tags_match_ring_avx2<const WAYS: usize>(
     }
 }
 
-#[cfg(any(target_arch = "x86_64", test))]
+#[cfg(target_arch = "aarch64")]
+#[simd_entry]
+#[inline]
+#[target_feature(enable = "neon")]
+fn tags_insert_neon<const WAYS: usize>(slot: &mut [u16; WAYS], tag: u16, _tok: impl SimdToken) {
+    let vt = vdupq_n_u16(tag);
+    match WAYS {
+        4 => {
+            let s = slot.first_chunk_mut::<4>().unwrap();
+            let old: u64 = zerocopy::transmute!(*s);
+            *s = zerocopy::transmute!((old << 16) | (tag as u64));
+        }
+        8 => {
+            let s = slot.first_chunk_mut::<8>().unwrap();
+            vst1q_u16(s, vextq_u16::<7>(vt, vld1q_u16(s)));
+        }
+        16 => {
+            let [c0, c1] = slot.as_chunks_mut::<8>().0.first_chunk_mut::<2>().unwrap();
+            let (p0, p1) = (vld1q_u16(c0), vld1q_u16(c1));
+            vst1q_u16(c0, vextq_u16::<7>(vt, p0));
+            vst1q_u16(c1, vextq_u16::<7>(p0, p1));
+        }
+        _ => tags_insert_portable(slot, tag),
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[simd_entry]
+#[inline]
+#[target_feature(enable = "neon")]
+fn tags_shift_match_neon<const WAYS: usize>(
+    slot: &mut [u16; WAYS],
+    tag: u16,
+    _tok: impl SimdToken,
+) -> u32 {
+    let vt = vdupq_n_u16(tag);
+    match WAYS {
+        4 => {
+            let s = slot.first_chunk_mut::<4>().unwrap();
+            let old: u64 = zerocopy::transmute!(*s);
+            *s = zerocopy::transmute!((old << 16) | (tag as u64));
+            let eq = vceq_u16(vreinterpret_u16_u64(vcreate_u64(old)), vget_low_u16(vt));
+            let w = vld1_u16(&[1u16, 2, 4, 8]);
+            vaddv_u16(vand_u16(eq, w)) as u32
+        }
+        8 => {
+            let s = slot.first_chunk_mut::<8>().unwrap();
+            let cur = vld1q_u16(s);
+            vst1q_u16(s, vextq_u16::<7>(vt, cur));
+            let w = vld1q_u16(&[1u16, 2, 4, 8, 16, 32, 64, 128]);
+            vaddvq_u16(vandq_u16(vceqq_u16(cur, vt), w)) as u32
+        }
+        16 => {
+            let [c0, c1] = slot.as_chunks_mut::<8>().0.first_chunk_mut::<2>().unwrap();
+            let (p0, p1) = (vld1q_u16(c0), vld1q_u16(c1));
+            vst1q_u16(c0, vextq_u16::<7>(vt, p0));
+            vst1q_u16(c1, vextq_u16::<7>(p0, p1));
+            let w0 = vld1q_u16(&[1u16, 2, 4, 8, 16, 32, 64, 128]);
+            let w1 = vld1q_u16(&[256u16, 512, 1024, 2048, 4096, 8192, 16384, 32768]);
+            let lo = vandq_u16(vceqq_u16(p0, vt), w0);
+            let hi = vandq_u16(vceqq_u16(p1, vt), w1);
+            vaddvq_u16(vorrq_u16(lo, hi)) as u32
+        }
+        _ => tags_shift_match_portable(slot, tag),
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[simd_entry]
+#[inline]
+#[target_feature(enable = "neon")]
+fn tags_match_ring_neon<const WAYS: usize>(
+    slot: &[u16; WAYS],
+    tag: u16,
+    _tok: impl SimdToken,
+) -> u32 {
+    match WAYS {
+        32 => {
+            let vt = vdupq_n_u16(tag);
+            let chunks = slot.as_chunks::<8>().0.first_chunk::<4>().unwrap();
+            let x = vld1q_u16_x4(chunks);
+            let w0 = vld1q_u16(&[1u16, 2, 4, 8, 16, 32, 64, 128]);
+            let w1 = vld1q_u16(&[256u16, 512, 1024, 2048, 4096, 8192, 16384, 32768]);
+            let lo = vorrq_u16(
+                vandq_u16(vceqq_u16(x.0, vt), w0),
+                vandq_u16(vceqq_u16(x.1, vt), w1),
+            );
+            let hi = vorrq_u16(
+                vandq_u16(vceqq_u16(x.2, vt), w0),
+                vandq_u16(vceqq_u16(x.3, vt), w1),
+            );
+            (vaddvq_u16(lo) as u32) | ((vaddvq_u16(hi) as u32) << 16)
+        }
+        _ => tags_match_portable(slot, tag),
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
 #[inline(always)]
 fn shift_tagged_search<const WAYS: usize, S: SimdBackend>(
     simd: S,
@@ -861,7 +974,7 @@ fn shift_tagged_search<const WAYS: usize, S: SimdBackend>(
     let tm = dispatch_simd!(
         simd,
         S => x64: |tok| tags_shift_match_avx2(tags, tag, tok),
-        neon: |_tok| tags_shift_match_portable(tags, tag),
+        neon: |tok| tags_shift_match_neon(tags, tag, tok),
         scalar: tags_shift_match_portable(tags, tag),
     );
     if tm == 0 {
@@ -910,7 +1023,7 @@ fn ring_finish_search(
     out
 }
 
-#[cfg(any(target_arch = "x86_64", test))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
 #[inline(always)]
 fn ring_search<const WAYS: usize, S: SimdBackend>(
     simd: S,
@@ -930,7 +1043,7 @@ fn ring_search<const WAYS: usize, S: SimdBackend>(
     let raw = dispatch_simd!(
         simd,
         S => x64: |tok| tags_match_ring_avx2(ts, tag, tok),
-        neon: |_tok| tags_match_portable(ts, tag),
+        neon: |tok| tags_match_ring_neon(ts, tag, tok),
         scalar: tags_match_portable(ts, tag),
     );
     ring_finish_search(head, ts, bs, raw, (tag, vpos, wsize), dists)
@@ -1091,7 +1204,77 @@ pub(crate) fn buckets_search_and_insert_avx2<const WAYS: usize>(
     }
 }
 
-#[cfg(any(target_arch = "x86_64", test))]
+#[cfg(target_arch = "aarch64")]
+#[simd_entry]
+#[inline]
+#[target_feature(enable = "neon")]
+pub(crate) fn buckets_insert_neon<const WAYS: usize>(
+    slot: &mut [u32; WAYS],
+    target: u32,
+    _tok: impl SimdToken,
+) {
+    match WAYS {
+        4 | 8 | 16 | 32 => {
+            let mut prev = vdupq_n_u32(target);
+            for chunk in slot.as_chunks_mut::<4>().0 {
+                let p = vld1q_u32(chunk);
+                vst1q_u32(chunk, vextq_u32::<3>(prev, p));
+                prev = p;
+            }
+        }
+        _ => buckets_insert_portable(slot, target),
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[simd_entry]
+#[inline]
+#[target_feature(enable = "neon")]
+pub(crate) fn buckets_search_and_insert_neon<const WAYS: usize>(
+    slot: &mut [u32; WAYS],
+    target: u32,
+    wsize: u32,
+    tag_mask: u32,
+    dists: &mut [u32; 32],
+    _tok: impl SimdToken,
+) -> u32 {
+    const {
+        assert!(WAYS == 1 || WAYS == 4 || WAYS == 8 || WAYS == 16 || WAYS == 32);
+    }
+    if WAYS == 1 {
+        let d = bucket_search_one(&mut slot[0], target, wsize);
+        dists[0] = d;
+        return u32::from(d != 0) & tag_mask;
+    }
+    let vt = vdupq_n_u32(target);
+    let vwsize = vdupq_n_u32(wsize);
+    let mut prev = vt;
+    let mut ds = [vdupq_n_u32(0); 8];
+    let w_base = vld1q_u32(&[1u32, 2, 4, 8]);
+    let mut mask_vec = vdupq_n_u32(0);
+    for (i, chunk) in slot.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        let p = vld1q_u32(chunk);
+        vst1q_u32(chunk, vextq_u32::<3>(prev, p));
+        prev = p;
+        let d = vsubq_u32(vt, p);
+        ds[i] = d;
+        let cmp = vcleq_u32(d, vwsize);
+        let w = vshlq_u32(w_base, vdupq_n_s32((i * 4) as i32));
+        mask_vec = vorrq_u32(mask_vec, vandq_u32(cmp, w));
+    }
+    let mask = vaddvq_u32(mask_vec) & tag_mask;
+    if mask != 0 {
+        for (i, out_chunk) in dists.as_chunks_mut::<4>().0[..WAYS / 4]
+            .iter_mut()
+            .enumerate()
+        {
+            vst1q_u32(out_chunk, ds[i]);
+        }
+    }
+    mask
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
 #[inline(always)]
 fn buckets_insert<const WAYS: usize, S: SimdBackend>(slot: &mut [u32; WAYS], simd: S, target: u32) {
     if const { WAYS == 1 } {
@@ -1101,12 +1284,12 @@ fn buckets_insert<const WAYS: usize, S: SimdBackend>(slot: &mut [u32; WAYS], sim
     dispatch_simd!(
         simd,
         S => x64: |tok| buckets_insert_avx2(slot, target, tok),
-        neon: |_tok| buckets_insert_portable(slot, target),
+        neon: |tok| buckets_insert_neon(slot, target, tok),
         scalar: buckets_insert_portable(slot, target),
     );
 }
 
-#[cfg(any(target_arch = "x86_64", test))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
 #[inline(always)]
 fn buckets_search_and_insert_masked<const WAYS: usize, S: SimdBackend>(
     slot: &mut [u32; WAYS],
@@ -1119,12 +1302,12 @@ fn buckets_search_and_insert_masked<const WAYS: usize, S: SimdBackend>(
     dispatch_simd!(
         simd,
         S => x64: |tok| buckets_search_and_insert_avx2(slot, target, wsize, tag_mask, dists, tok),
-        neon: |_tok| buckets_search_and_insert_portable(slot, target, wsize, dists) & tag_mask,
+        neon: |tok| buckets_search_and_insert_neon(slot, target, wsize, tag_mask, dists, tok),
         scalar: buckets_search_and_insert_portable(slot, target, wsize, dists) & tag_mask,
     )
 }
 
-#[cfg(any(target_arch = "x86_64", test))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
 #[inline(always)]
 fn buckets_search_and_insert<const WAYS: usize, S: SimdBackend>(
     slot: &mut [u32; WAYS],
@@ -1157,6 +1340,29 @@ fn shift_back_u32_with_u16(table: &mut [u32], tags: &mut [u16], pos_mask: u32, a
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+fn movemask_u8x16_neon(v: uint8x16_t) -> u32 {
+    let w = vld1q_u8(&[1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128]);
+    let m = vandq_u8(v, w);
+    let p0 = vpaddq_u8(m, m);
+    let p1 = vpaddq_u8(p0, p0);
+    let p2 = vpaddq_u8(p1, p1);
+    vgetq_lane_u16::<0>(vreinterpretq_u16_u8(p2)) as u32
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+fn movemask_u8x32_neon(lo: uint8x16_t, hi: uint8x16_t) -> u32 {
+    let w = vld1q_u8(&[1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128]);
+    let p0 = vpaddq_u8(vandq_u8(lo, w), vandq_u8(hi, w));
+    let p1 = vpaddq_u8(p0, p0);
+    let p2 = vpaddq_u8(p1, p1);
+    vgetq_lane_u32::<0>(vreinterpretq_u32_u8(p2))
+}
+
 #[cfg(target_arch = "x86_64")]
 #[simd_entry]
 #[inline]
@@ -1168,6 +1374,22 @@ fn diff_mask32(a: &[u8; 32], b: &[u8; 32], _tok: impl SimdToken) -> u32 {
     )) as u32)
 }
 
+#[cfg(target_arch = "aarch64")]
+#[simd_entry]
+#[inline]
+#[target_feature(enable = "neon")]
+fn diff_mask32(a: &[u8; 32], b: &[u8; 32], _tok: impl SimdToken) -> u32 {
+    let d0 = vmvnq_u8(vceqq_u8(
+        vld1q_u8(a.const_sub::<16, 0>()),
+        vld1q_u8(b.const_sub::<16, 0>()),
+    ));
+    let d1 = vmvnq_u8(vceqq_u8(
+        vld1q_u8(a.const_sub::<16, 16>()),
+        vld1q_u8(b.const_sub::<16, 16>()),
+    ));
+    movemask_u8x32_neon(d0, d1)
+}
+
 #[cfg(target_arch = "x86_64")]
 #[simd_entry]
 #[inline]
@@ -1176,6 +1398,23 @@ fn eq2_mask32(a0: &[u8; 32], a1: &[u8; 32], b0: u8, b1: u8, _tok: impl SimdToken
     let e0 = _mm256_cmpeq_epi8(_mm256_loadu_si256(a0), _mm256_set1_epi8(b0 as i8));
     let e1 = _mm256_cmpeq_epi8(_mm256_loadu_si256(a1), _mm256_set1_epi8(b1 as i8));
     _mm256_movemask_epi8(_mm256_and_si256(e0, e1)) as u32
+}
+
+#[cfg(target_arch = "aarch64")]
+#[simd_entry]
+#[inline]
+#[target_feature(enable = "neon")]
+fn eq2_mask32(a0: &[u8; 32], a1: &[u8; 32], b0: u8, b1: u8, _tok: impl SimdToken) -> u32 {
+    let (vb0, vb1) = (vdupq_n_u8(b0), vdupq_n_u8(b1));
+    let m0 = vandq_u8(
+        vceqq_u8(vld1q_u8(a0.const_sub::<16, 0>()), vb0),
+        vceqq_u8(vld1q_u8(a1.const_sub::<16, 0>()), vb1),
+    );
+    let m1 = vandq_u8(
+        vceqq_u8(vld1q_u8(a0.const_sub::<16, 16>()), vb0),
+        vceqq_u8(vld1q_u8(a1.const_sub::<16, 16>()), vb1),
+    );
+    movemask_u8x32_neon(m0, m1)
 }
 
 /// Returns the smallest `d` in `1..=max_d2.min(pos).min(64)` with `data[pos-d..pos-d+2] == data[pos..pos+2]`, or `u32::MAX`.
@@ -1192,8 +1431,7 @@ pub(crate) fn find_closest_2b<S: SimdBackend>(
     }
     let [b0, b1] = [data[pos], data[pos + 1]];
     let lo = dispatch_simd!(
-        simd,
-        S => x64: |tok| {
+        simd, S => |tok| {
             if pos >= 32 {
                 let w = &data[pos - 32..pos + 1];
                 let m0 = eq2_mask32(w.first_chunk().unwrap(), w.last_chunk().unwrap(), b0, b1, tok);
@@ -1215,8 +1453,7 @@ pub(crate) fn find_closest_2b<S: SimdBackend>(
                 1usize
             }
         },
-        neon: |_tok| 1usize,
-        scalar: 1usize,
+        1usize
     );
     (lo..=lim)
         .find(|&d| data[pos - d..pos - d + 2] == [b0, b1])
@@ -1231,6 +1468,14 @@ fn diff_mask16(a: &[u8; 16], b: &[u8; 16], _tok: impl SimdToken) -> u32 {
     !(_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(a), _mm_loadu_si128(b))) as u32) & 0xFFFF
 }
 
+#[cfg(target_arch = "aarch64")]
+#[simd_entry]
+#[inline]
+#[target_feature(enable = "neon")]
+fn diff_mask16(a: &[u8; 16], b: &[u8; 16], _tok: impl SimdToken) -> u32 {
+    movemask_u8x16_neon(vmvnq_u8(vceqq_u8(vld1q_u8(a), vld1q_u8(b))))
+}
+
 #[inline(always)]
 fn common_prefix_from<const START: usize, S: SimdBackend>(
     simd: S,
@@ -1240,8 +1485,7 @@ fn common_prefix_from<const START: usize, S: SimdBackend>(
     max_len: usize,
 ) -> usize {
     dispatch_simd!(
-        simd,
-        S => x64: |tok| {
+        simd, S => |tok| {
             let Some(pair) = PairedPrefix::new(data, pos1, pos2, max_len) else {
                 return 0;
             };
@@ -1299,7 +1543,7 @@ fn common_prefix_from<const START: usize, S: SimdBackend>(
             }
             max
         },
-        neon: |_tok| {
+        {
             let max = data.len().saturating_sub(pos2.max(pos1)).min(max_len);
             if START > 0 && max <= START {
                 return max;
@@ -1308,17 +1552,7 @@ fn common_prefix_from<const START: usize, S: SimdBackend>(
                 return max.min(START);
             };
             START + common_prefix_len(a, b, max - START)
-        },
-        scalar: {
-            let max = data.len().saturating_sub(pos2.max(pos1)).min(max_len);
-            if START > 0 && max <= START {
-                return max;
-            }
-            let (Some(a), Some(b)) = (data.get(pos1 + START..), data.get(pos2 + START..)) else {
-                return max.min(START);
-            };
-            START + common_prefix_len(a, b, max - START)
-        },
+        }
     )
 }
 
@@ -1787,7 +2021,75 @@ impl<'a> LdmScanner<'a> {
         self.scan_scalar(simd, params, p, scan_end);
     }
 
-    #[cfg_attr(target_arch = "x86_64", cold)]
+    #[cfg(target_arch = "aarch64")]
+    #[simd_entry]
+    #[target_feature(enable = "neon")]
+    #[inline(never)]
+    fn scan_neon(
+        &mut self,
+        params @ (mask32, tag32): (u32, u32),
+        mut p: usize,
+        scan_end: usize,
+        simd: A64Neon,
+        _tok: impl SimdToken,
+    ) {
+        let coeff = vld1q_s16(&[
+            FAST_LDM_COEFF0,
+            FAST_LDM_COEFF1,
+            FAST_LDM_COEFF0,
+            FAST_LDM_COEFF1,
+            FAST_LDM_COEFF0,
+            FAST_LDM_COEFF1,
+            FAST_LDM_COEFF0,
+            FAST_LDM_COEFF1,
+        ]);
+        let coeff_lo = vget_low_s16(coeff);
+        let mask_v = vdupq_n_u32(mask32);
+        let tag_v = vdupq_n_u32(tag32);
+        let (c0xff, c0xff00, c0xff_0000) = (
+            vdupq_n_u32(0x0000_00FF),
+            vdupq_n_u32(0x0000_FF00),
+            vdupq_n_u32(0x00FF_0000),
+        );
+        if let Some(pfx20) = BoundedPrefix::<u8, 20>::from_prefix(self.data, scan_end + 4) {
+            while let Some(bs) = pfx20.cursor_at(p) {
+                macro_rules! eq {
+                    ($off:literal) => {{
+                        let s = vreinterpretq_s16_u8(vld1q_u8(bs.sub_array::<16, $off>()));
+                        let plo = vmull_s16(vget_low_s16(s), coeff_lo);
+                        let phi = vmull_high_s16(s, coeff);
+                        let m = vreinterpretq_u32_s32(vpaddq_s32(plo, phi));
+                        vceqq_u32(vandq_u32(m, mask_v), tag_v)
+                    }};
+                }
+                let (eq0, eq1, eq2, eq3) = (eq!(0), eq!(1), eq!(2), eq!(3));
+                let any = vorrq_u32(vorrq_u32(eq0, eq1), vorrq_u32(eq2, eq3));
+                let mut jumped = false;
+                if vmaxvq_u32(any) != 0 {
+                    let m01 = vorrq_u32(vandq_u32(eq0, c0xff), vandq_u32(eq1, c0xff00));
+                    let m23 = vorrq_u32(vandq_u32(eq2, c0xff_0000), vshlq_n_u32::<24>(eq3));
+                    let mut mask = movemask_u8x16_neon(vreinterpretq_u8_u32(vorrq_u32(m01, m23)));
+                    while mask != 0 {
+                        let pos = p + (mask.trailing_zeros() as usize);
+                        mask &= mask - 1;
+                        self.step_anchor(simd, pos);
+                        if self.probe_resume > pos + 64 {
+                            p = (self.probe_resume - 16).min(scan_end);
+                            self.prev_w64 = u64::MAX;
+                            jumped = true;
+                            break;
+                        }
+                    }
+                }
+                if !jumped {
+                    p += 16;
+                }
+            }
+        }
+        self.scan_scalar(simd, params, p, scan_end);
+    }
+
+    #[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), cold)]
     #[inline(never)]
     fn scan_portable(&mut self, params: (u32, u32), p: usize, scan_end: usize) {
         self.scan_scalar(Scalar, params, p, scan_end);
@@ -1831,7 +2133,7 @@ impl FastLdmTable {
         eff_wsize: usize,
         vpos_base: usize,
         out: &mut Vec<FastLdmSpan>,
-        use_avx2: bool,
+        use_simd: bool,
     ) {
         out.clear();
         let scan_end = chunk_end.min(data.len().saturating_sub(8));
@@ -1857,9 +2159,11 @@ impl FastLdmTable {
             out,
         ) {
             let params = fast_ldm_params(density);
-            match try_simd(use_avx2) {
+            match try_simd(use_simd) {
                 #[cfg(target_arch = "x86_64")]
                 Some(tok) => sc.scan_avx2(params, scan_start, scan_end, tok, tok),
+                #[cfg(target_arch = "aarch64")]
+                Some(tok) => sc.scan_neon(params, scan_start, scan_end, tok, tok),
                 _ => sc.scan_portable(params, scan_start, scan_end),
             }
         }
@@ -2661,8 +2965,8 @@ trait InteriorOps<S: SimdBackend> {
     }
 }
 
-/// Typed table view for `Q3..=Q9` (`(POS_BITS, WAYS, HT4_WAYS)` specialized AVX2 hot paths).
-#[cfg(any(target_arch = "x86_64", test))]
+/// Typed table view for `Q3..=Q9` (`(POS_BITS, WAYS, HT4_WAYS)` specialized SIMD hot paths).
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
 pub(crate) struct InteriorTables<'a, const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize> {
     table: Pow2SliceMut<'a, [u32; WAYS]>,
     tags: Option<Pow2SliceMut<'a, [u16; WAYS]>>,
@@ -2672,7 +2976,7 @@ pub(crate) struct InteriorTables<'a, const POS_BITS: u8, const WAYS: usize, cons
     ht3: Option<&'a mut [u32; HT3_SIZE]>,
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize>
     InteriorTables<'_, POS_BITS, WAYS, HT4_WAYS>
 {
@@ -2705,7 +3009,7 @@ impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize>
     }
 }
 
-#[cfg(any(target_arch = "x86_64", test))]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
 impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize, S: SimdBackend> InteriorOps<S>
     for InteriorTables<'_, POS_BITS, WAYS, HT4_WAYS>
 {
@@ -2775,7 +3079,7 @@ impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize, S: SimdBacken
                     dispatch_simd!(
                         simd,
                         S => x64: |tok| tags_insert_avx2(row, tag, tok),
-                        neon: |_tok| tags_insert_portable(row, tag),
+                        neon: |tok| tags_insert_neon(row, tag, tok),
                         scalar: tags_insert_portable(row, tag),
                     );
                 }
@@ -2904,7 +3208,7 @@ impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize, S: SimdBacken
                     dispatch_simd!(
                         simd,
                         S => x64: |tok| tags_insert_avx2(row, tag, tok),
-                        neon: |_tok| tags_insert_portable(row, tag),
+                        neon: |tok| tags_insert_neon(row, tag, tok),
                         scalar: tags_insert_portable(row, tag),
                     );
                 }
@@ -2980,7 +3284,7 @@ impl<T: Copy + FromZeroes + 'static> DirtyBuf<T> {
         self.buf.prefix_of_capacity_mut(self.dirty_len)
     }
 
-    #[cfg(any(target_arch = "x86_64", test))]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
     #[inline(always)]
     fn pow2_mut(&mut self, expect_elems: usize) -> Option<Pow2SliceMut<'_, T>> {
         (self.buf.len() == expect_elems)
@@ -2988,7 +3292,7 @@ impl<T: Copy + FromZeroes + 'static> DirtyBuf<T> {
             .flatten()
     }
 
-    #[cfg(any(target_arch = "x86_64", test))]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
     #[inline(always)]
     fn pow2_chunks_mut<const N: usize>(
         &mut self,
@@ -3315,7 +3619,7 @@ impl HashTable {
         }
     }
 
-    #[cfg(any(target_arch = "x86_64", test))]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
     #[inline(always)]
     pub(crate) fn interior_mut<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize>(
         &mut self,
@@ -3371,7 +3675,7 @@ impl HashTable {
         eff_wsize: usize,
         vpos_base: usize,
         out: &mut Vec<FastLdmSpan>,
-        use_avx2: bool,
+        use_simd: bool,
     ) {
         if eff_wsize <= 262_144 {
             out.clear();
@@ -3385,7 +3689,7 @@ impl HashTable {
             eff_wsize,
             vpos_base,
             out,
-            use_avx2,
+            use_simd,
         );
     }
 
@@ -3604,7 +3908,35 @@ macro_rules! def_parse_slice_interior {
             $body
         }
 
-        #[cfg_attr(target_arch = "x86_64", cold)]
+        #[cfg(target_arch = "aarch64")]
+        #[simd_entry]
+        #[target_feature(enable = "neon")]
+        #[inline(never)]
+        fn parse_slice_interior_neon<
+            const POS_BITS: u8,
+            const WAYS: usize,
+            const HT4_WAYS: usize,
+            C: MatchConfig,
+            const LW: bool,
+            const HD: bool,
+        >(
+            mut it: InteriorTables<'_, POS_BITS, WAYS, HT4_WAYS>,
+            env_ref: &SliceEnv<'_>,
+            $state: &mut SliceParseState,
+            $md: &mut MetablockSink<'_>,
+            $simd: A64Neon,
+            _tok: impl SimdToken,
+        ) {
+            type $S = A64Neon;
+            if !it.invariants_hold::<C>() {
+                return;
+            }
+            let $ht = &mut it;
+            let ($env, $lw, $hd) = (*env_ref, LW, HD);
+            $body
+        }
+
+        #[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), cold)]
         #[inline(never)]
         fn parse_slice_interior_portable<C: MatchConfig>(
             $ht: &mut HashTable,
@@ -4114,7 +4446,7 @@ impl HashTable {
         state: &mut SliceParseState,
         md: &mut MetablockSink<'_>,
         model: &SliceCostModel,
-        use_avx2: bool,
+        use_simd: bool,
     ) {
         let slice_start = state.pos;
         if slice_start >= target_end {
@@ -4147,7 +4479,7 @@ impl HashTable {
                 eff_wsize,
                 vpos_base,
                 &mut spans,
-                use_avx2,
+                use_simd,
             );
             spans
         } else {
@@ -4169,7 +4501,7 @@ impl HashTable {
             use_sd,
         };
         if interior_end > slice_start {
-            C::run_interior(self, &env, state, md, try_simd(use_avx2));
+            C::run_interior(self, &env, state, md, try_simd(use_simd));
         }
         if target_end == data_len {
             let tail = state.anchor.max(interior_end).max(slice_start);
@@ -4189,13 +4521,16 @@ impl HashTable {
 
 #[cfg(test)]
 mod test {
+    #[cfg(target_arch = "aarch64")]
+    use super::A64Neon;
     #[cfg(target_arch = "x86_64")]
     use super::X64V3;
     use super::{
         bucket_search_one, buckets_insert_portable, buckets_search_and_insert_portable,
         encode_vpos, max_virtual_pos, HashTable, InteriorOps, PreparedDictionary, Scalar,
+        SimdBackend,
     };
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     use simd_tokens::{simd_entry, SimdToken};
 
     #[test]
@@ -4294,9 +4629,11 @@ mod test {
         );
     }
 
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
-    fn check_ht_seq<const P: u8, const W: usize, const H4W: usize>(simd: X64V3, wsize: u32) {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn check_ht_seq<const P: u8, const W: usize, const H4W: usize, S: SimdBackend>(
+        simd: S,
+        wsize: u32,
+    ) {
         let (base, p64_7, p32_5) = (wsize + 1, 7u64 << 54, 5u32 << 22);
         let steps = if cfg!(miri) { 16u32 } else { 70u32 };
         if W == 1 {
@@ -4376,7 +4713,7 @@ mod test {
         let (w24, w30) = ((1 << 24) - 16, (1 << 30) - 16);
         macro_rules! chk {
             ($($p:literal : $(($w:literal, $h4w:literal)),+);+ $(;)?) => {
-                $($(check_ht_seq::<$p, $w, $h4w>(simd, if $p == 25 { w24 } else { w30 });)+)+
+                $($(check_ht_seq::<$p, $w, $h4w, X64V3>(simd, if $p == 25 { w24 } else { w30 });)+)+
             };
         }
         chk!(
@@ -4390,6 +4727,30 @@ mod test {
     fn test_buckets_avx2() {
         if let Some(token) = X64V3::try_new() {
             run_test_buckets_avx2(token, token);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[simd_entry]
+    #[target_feature(enable = "neon")]
+    fn run_test_buckets_neon(simd: A64Neon, _token: impl SimdToken) {
+        let (w24, w30) = ((1 << 24) - 16, (1 << 30) - 16);
+        macro_rules! chk {
+            ($($p:literal : $(($w:literal, $h4w:literal)),+);+ $(;)?) => {
+                $($(check_ht_seq::<$p, $w, $h4w, A64Neon>(simd, if $p == 25 { w24 } else { w30 });)+)+
+            };
+        }
+        chk!(
+            25: (1, 1), (4, 1), (8, 1), (16, 4), (32, 4);
+            31: (1, 1), (4, 1), (8, 1), (16, 4), (32, 4)
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_buckets_neon() {
+        if let Some(token) = A64Neon::try_new() {
+            run_test_buckets_neon(token, token);
         }
     }
 
