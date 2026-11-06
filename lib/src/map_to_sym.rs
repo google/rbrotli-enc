@@ -13,93 +13,448 @@
 // limitations under the License.
 
 use crate::constants::*;
-use bounded_utils::{BoundedSlice, BoundedUsize};
-use safe_unaligned_simd::x86_64::{_mm256_loadu_si256, _mm256_storeu_si256};
+use crate::huffman::HuffmanCodeEntry;
+const DIST_MODE_IMPLICIT_D0: u8 = 1;
+const DIST_MODE_STATIC_DICT: u8 = 2;
+use bounded_utils::{BoundedArrayExt, BoundedPrefix, BoundedU16, BoundedU8, BoundedUsize};
+use lsb_bitwriter::BitStreamCursor;
+#[cfg(target_arch = "x86_64")]
+use safe_unaligned_simd::x86_64::{_mm256_loadu_si256, _mm256_storeu_si256, _mm_loadu_si128};
+#[cfg(target_arch = "x86_64")]
+use simd_tokens::{simd_entry, SimdToken};
+#[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
-const INS_BASE: [u32; 24] = [
+pub(crate) const INS_BASE: [u32; 24] = [
     0, 1, 2, 3, 4, 5, 6, 8, 10, 14, 18, 26, 34, 50, 66, 98, 130, 194, 322, 578, 1090, 2114, 6210,
     22594,
 ];
-const INS_EXTRA: [u32; 24] = [
+pub(crate) const INS_EXTRA: [u32; 24] = [
     0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 12, 14, 24,
 ];
 
-const COPY_BASE: [u32; 24] = [
+pub(crate) const COPY_BASE: [u32; 24] = [
     2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 18, 22, 30, 38, 54, 70, 102, 134, 198, 326, 582, 1094, 2118,
 ];
-const COPY_EXTRA: [u32; 24] = [
+pub(crate) const COPY_EXTRA: [u32; 24] = [
     0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 24,
 ];
 
-fn insert_len_to_sym_and_bits(len: u32) -> (u32, u32, u32) {
-    let sym = if len < 6 {
-        len
-    } else if len < 130 {
-        let nbits = (len - 2).ilog2() - 1;
-        (nbits << 1) + ((len - 2) >> nbits) + 2
-    } else if len < 2114 {
-        (len - 66).ilog2() + 10
+/// Upper inclusive bound of `copy_len` for each `copy_code` `0..24`.
+pub(crate) const COPY_MAX: [u32; 24] = {
+    let (mut t, mut i) = ([u32::MAX; 24], 0);
+    while i < 23 {
+        t[i] = COPY_BASE[i] + ((1u32 << COPY_EXTRA[i]) - 1);
+        i += 1;
+    }
+    t
+};
+
+const INS_CODE_SMALL: [BoundedU8<23>; 130] = {
+    let (mut t, mut l) = ([BoundedU8::<23>::constant::<0>(); 130], 0);
+    while l < 130 {
+        let len = l as u32;
+        let c = if len < 6 {
+            len as u8
+        } else {
+            let nb = 30 - (len - 2).leading_zeros();
+            ((nb << 1) + ((len - 2) >> nb) + 2) as u8
+        };
+        t[l] = BoundedU8::<23>::new_clamped(c);
+        l += 1;
+    }
+    t
+};
+
+const COPY_CODE_SMALL: [BoundedU8<23>; 134] = {
+    let (mut t, mut l) = ([BoundedU8::<23>::constant::<0>(); 134], 0);
+    while l < 134 {
+        let len = if l < 2 { 2 } else { l as u32 };
+        let c = if len < 10 {
+            (len - 2) as u8
+        } else {
+            let nb = 30 - (len - 6).leading_zeros();
+            ((nb << 1) + ((len - 6) >> nb) + 4) as u8
+        };
+        t[l] = BoundedU8::<23>::new_clamped(c);
+        l += 1;
+    }
+    t
+};
+
+const SHORT_D0_SYM: [u8; 7] = [8, 6, 4, 0, 5, 7, 9];
+const SHORT_D1_SYM: [u8; 7] = [14, 12, 10, 1, 11, 13, 15];
+
+#[rustfmt::skip]
+pub(crate) const SHORT_CODE_SPEC: [(u8, i8); 16] = [
+    (0, 0), (1, 0), (2, 0), (3, 0),
+    (0, -1), (0, 1), (0, -2), (0, 2), (0, -3), (0, 3),
+    (1, -1), (1, 1), (1, -2), (1, 2), (1, -3), (1, 3),
+];
+
+/// Returns `true` iff `(ins_len, copy_len)` can use RFC 7932 implicit-`d0` (`iac_sym < 128`).
+#[inline(always)]
+pub(crate) const fn can_use_implicit_d0(ins_len: u32, copy_len: u32) -> bool {
+    ins_len < 10 && copy_len < 70
+}
+
+#[inline(always)]
+pub(crate) fn resolve_short_dist_code(
+    sc: u8,
+    rb: [u32; 4],
+    valid_mask: u8,
+    max_dist: u32,
+) -> Option<u32> {
+    let &(slot, delta) = SHORT_CODE_SPEC.get(sc as usize)?;
+    if (valid_mask & (1u8 << slot)) == 0 {
+        return None;
+    }
+    let d = (rb[slot as usize] as i64 + delta as i64).min(u32::MAX as i64);
+    (1..=max_dist as i64).contains(&d).then_some(d as u32)
+}
+
+#[inline(always)]
+pub(crate) fn advance_dist_rb(
+    rb: [u32; 4],
+    valid_mask: u8,
+    dist: u32,
+    dist_mode: u8,
+) -> ([u32; 4], u8) {
+    match dist_mode {
+        0 | DIST_MODE_IMPLICIT_D0 | DIST_MODE_STATIC_DICT => (rb, valid_mask),
+        _ => ([dist, rb[0], rb[1], rb[2]], ((valid_mask << 1) | 1) & 0x0F),
+    }
+}
+
+/// Advances `[d0, d1, d2, d3]` after emitting an explicit non-static-dictionary distance `dist`.
+/// Per RFC 7932 Section 4, `dist_rb` is unchanged when `sc == 0` (`dist == ring[0]`).
+#[inline(always)]
+pub(crate) fn push_last_distance(ring: &mut [u32; 4], dist: u32) {
+    debug_assert!(dist >= 1 && (dist & STATIC_DICT_DIST_FLAG) == 0);
+    if dist != ring[0] {
+        *ring = [dist, ring[0], ring[1], ring[2]];
+    }
+}
+
+#[inline(always)]
+pub(crate) fn ins_code_bounded(len: u32) -> BoundedUsize<23> {
+    if let Some(idx) = BoundedUsize::<129>::new(len as usize) {
+        return (*INS_CODE_SMALL.bget(idx)).into();
+    }
+    if len < 2114 {
+        BoundedUsize::<23>::new_clamped((41 - (((len - 66) | 64) & 2047).leading_zeros()) as usize)
     } else if len < 6210 {
-        21
+        BoundedUsize::<23>::constant::<21>()
     } else if len < 22594 {
-        22
+        BoundedUsize::<23>::constant::<22>()
     } else {
-        23
-    };
-    let nbits = INS_EXTRA[sym as usize];
-    let bits = len - INS_BASE[sym as usize];
-    (sym, nbits, bits)
+        BoundedUsize::<23>::MAX
+    }
 }
 
-fn copy_len_to_sym_and_bits(len: u32) -> (u32, u32, u32) {
-    let sym = if len < 10 {
-        len - 2
-    } else if len < 134 {
-        let nbits = (len - 6).ilog2() - 1;
-        (nbits << 1) + ((len - 6) >> nbits) + 4
-    } else if len < 2118 {
-        (len - 70).ilog2() + 12
-    } else {
-        23
-    };
-    let nbits = COPY_EXTRA[sym as usize];
-    let bits = len - COPY_BASE[sym as usize];
-    (sym, nbits, bits)
+#[inline(always)]
+pub(crate) fn ins_code_only(len: u32) -> usize {
+    ins_code_bounded(len).get()
 }
 
-/// Returns (symbol, nbits, bits)
-pub fn insert_copy_len_to_sym_and_bits(insert: u32, copy: u32) -> (u16, u8, u64) {
-    let (insert_code, insert_nbits, insert_bits) = insert_len_to_sym_and_bits(insert);
-    let (copy_code, copy_nbits, copy_bits) = copy_len_to_sym_and_bits(copy);
-    let nbits = insert_nbits + copy_nbits;
-    let bits = (copy_bits as u64) << insert_nbits | insert_bits as u64;
-    let bits64 = (copy_code & 0x7) | ((insert_code & 0x7) << 3);
-    /* Specification: 5 Encoding of ... (last table) */
-    /* offset = 2 * index, where index is in range [0..8] */
-    let mut offset = 2 * ((copy_code >> 3) + 3 * (insert_code >> 3));
-    /* All values in specification are K * 64,
-    where   K = [2, 3, 6, 4, 5, 8, 7, 9, 10],
-        i + 1 = [1, 2, 3, 4, 5, 6, 7, 8,  9],
-    K - i - 1 = [1, 1, 3, 0, 0, 2, 0, 1,  2] = D.
-    All values in D require only 2 bits to encode.
-    Magic constant is shifted 6 bits left, to avoid final multiplication. */
-    offset = (offset << 5) + 0x40 + ((0x520D40 >> offset) & 0xC0);
+#[inline(always)]
+pub(crate) fn copy_code_bounded(len: u32) -> BoundedUsize<23> {
+    if let Some(idx) = BoundedUsize::<133>::new(len as usize) {
+        return (*COPY_CODE_SMALL.bget(idx)).into();
+    }
+    if len < 2118 {
+        BoundedUsize::<23>::new_clamped((43 - (((len - 70) | 64) & 2047).leading_zeros()) as usize)
+    } else {
+        BoundedUsize::<23>::MAX
+    }
+}
+
+#[inline(always)]
+pub(crate) fn copy_code_only(len: u32) -> usize {
+    copy_code_bounded(len).get()
+}
+
+/// Computes `iac_sym` (`0..704`) directly from `(ins_code, copy_code, implicit_d0)`.
+#[inline(always)]
+pub(crate) const fn iac_sym_from_codes(
+    ins_code: usize,
+    copy_code: usize,
+    implicit_d0: bool,
+) -> usize {
+    let bits64 = (copy_code & 0x7) | ((ins_code & 0x7) << 3);
+    // Specification: 5 Encoding of ... (last table).
+    // All values in specification are K * 64, where K = [2, 3, 6, 4, 5, 8, 7, 9, 10],
+    // K - (i + 1) = [1, 1, 3, 0, 0, 2, 0, 1, 2], packed into 2-bit pairs in `0x520D40`.
+    let mut offset = 2 * ((copy_code >> 3) + 3 * (ins_code >> 3));
+    offset = (offset << 5) + 0x40 + ((0x520D40usize >> offset) & 0xC0);
     let sym = offset | bits64;
+    if implicit_d0 {
+        debug_assert!(sym >= 128 && sym < 256);
+        sym - 128
+    } else {
+        sym
+    }
+}
+
+const IAC_BLOCK_OFFSET: [[BoundedU16<640>; 16]; 2] = {
+    let (mut t, mut k) = ([[BoundedU16::<640>::constant::<0>(); 16]; 2], 0usize);
+    while k < 12 {
+        let (ib, cb) = (k >> 2, k & 3);
+        if cb < 3 {
+            let s = iac_sym_from_codes(ib << 3, cb << 3, false) as u16;
+            t[0][k] = BoundedU16::<640>::new_clamped(s);
+            t[1][k] = BoundedU16::<640>::new_clamped(s - if ib == 0 && cb < 2 { 128 } else { 0 });
+        }
+        k += 1;
+    }
+    t
+};
+
+#[inline(always)]
+pub(crate) fn iac_sym_from_codes_bounded(
+    ins_code: BoundedUsize<23>,
+    copy_code: BoundedUsize<23>,
+    implicit_d0: bool,
+) -> BoundedU16<{ MAX_IAC - 1 }> {
+    let (ic, cc) = (ins_code.get(), copy_code.get());
+    let blk_idx = BoundedUsize::<15>::new_masked(((ic >> 3) << 2) | (cc >> 3));
+    let hi = *IAC_BLOCK_OFFSET[usize::from(implicit_d0)].bget(blk_idx);
+    let lo = BoundedU16::<63>::new_masked((((ic & 7) << 3) | (cc & 7)) as u16);
+    hi.add_bounded::<63, { MAX_IAC - 1 }>(lo)
+}
+
+/// Packed `(sym_no_d0 | (eb_n << 10) | (eb_b << 16))` for `insert_len < 32 && copy_len - 2 < 16`.
+const IAC_FAST_NO_D0: [u32; 512] = {
+    let (mut t, mut idx) = ([0u32; 512], 0usize);
+    while idx < 512 {
+        let (ins, copy) = ((idx >> 4) as u32, ((idx & 15) + 2) as u32);
+        let (ic, cc) = (
+            INS_CODE_SMALL[ins as usize].get() as usize,
+            COPY_CODE_SMALL[copy as usize].get() as usize,
+        );
+        let (inb, cnb) = (INS_EXTRA[ic], COPY_EXTRA[cc]);
+        let eb = ((copy - COPY_BASE[cc]) << inb) | (ins - INS_BASE[ic]);
+        t[idx] = (iac_sym_from_codes(ic, cc, false) as u32) | ((inb + cnb) << 10) | (eb << 16);
+        idx += 1;
+    }
+    t
+};
+
+/// Encodes `(insert_len, copy_len, implicit_d0)` into bounded `(iac_sym, extra_nbits, extra_bits)`.
+#[inline(always)]
+pub(crate) fn encode_iac_bounded(
+    insert_len: u32,
+    copy_len: u32,
+    implicit_d0: bool,
+) -> (BoundedU16<{ MAX_IAC - 1 }>, BoundedU8<48>, u64) {
+    let cm2 = copy_len.wrapping_sub(2);
+    if (insert_len < 32) & (cm2 < 16) {
+        debug_assert!(!implicit_d0 || insert_len < 10);
+        let idx = BoundedUsize::<511>::new_masked(((insert_len as usize) << 4) | (cm2 as usize));
+        let p = *IAC_FAST_NO_D0.bget(idx);
+        let sym = (p as u16).wrapping_sub(u16::from(implicit_d0) << 7);
+        return (
+            BoundedU16::<511>::new_masked(sym).widen(),
+            BoundedU8::<7>::new_masked((p >> 10) as u8).widen(),
+            (p >> 16) as u64,
+        );
+    }
+    let ins_code = ins_code_bounded(insert_len);
+    let ins_nbits = *INS_EXTRA.bget(ins_code);
+    let ins_bits = insert_len - *INS_BASE.bget(ins_code);
+    let copy_code = copy_code_bounded(copy_len);
+    let copy_nbits = *COPY_EXTRA.bget(copy_code);
+    let copy_bits = copy_len.saturating_sub(*COPY_BASE.bget(copy_code));
+    let sym = iac_sym_from_codes_bounded(ins_code, copy_code, implicit_d0);
+    (
+        sym,
+        BoundedU8::<48>::new_clamped((ins_nbits + copy_nbits) as u8),
+        ((copy_bits as u64) << ins_nbits) | (ins_bits as u64),
+    )
+}
+
+/// Encodes `(insert_len, copy_len, implicit_d0)` into `(iac_sym, extra_nbits, extra_bits)`.
+#[inline(always)]
+pub(crate) fn encode_iac(insert_len: u32, copy_len: u32, implicit_d0: bool) -> (u16, u8, u64) {
+    let (s, nb, b) = encode_iac_bounded(insert_len, copy_len, implicit_d0);
+    (s.get(), nb.get(), b)
+}
+
+/// Total extra bits (`INS_EXTRA[ic] + COPY_EXTRA[cc]`) for each IAC symbol `0..704`.
+pub(crate) const IAC_EXTRA_BITS: [u8; MAX_IAC] = {
+    let (mut t, mut ic) = ([0u8; MAX_IAC], 0usize);
+    while ic < 24 {
+        let mut cc = 0usize;
+        while cc < 24 {
+            let eb = (INS_EXTRA[ic] + COPY_EXTRA[cc]) as u8;
+            t[iac_sym_from_codes(ic, cc, false)] = eb;
+            if ic < 8 && cc < 16 {
+                t[iac_sym_from_codes(ic, cc, true)] = eb;
+            }
+            cc += 1;
+        }
+        ic += 1;
+    }
+    t
+};
+
+/// Extra-bit count for a distance symbol `sym` under `(npostfix, ndirect)`.
+#[inline(always)]
+pub(crate) const fn dist_sym_extra_bits(sym: usize, npostfix: u8, ndirect: u8) -> u8 {
+    let base = 16 + ndirect as usize;
+    if sym < base {
+        0
+    } else {
+        (1 + ((sym - base) >> (npostfix + 1))) as u8
+    }
+}
+
+/// Computes the RFC 7932 distance alphabet size for `(npostfix, ndirect, large_window)`.
+#[inline(always)]
+pub(crate) const fn dist_alphabet_size(npostfix: u8, ndirect: u8, large_window: bool) -> usize {
+    16 + (ndirect as usize) + ((if large_window { 62usize } else { 24usize }) << (npostfix + 1))
+}
+
+/// Maximum legal distance symbol count (`BrotliCalculateDistanceCodeLimit(0x7FFF_FFFC, npostfix,
+/// ndirect).max_alphabet_size` in Large Window mode, `dist_alphabet_size` in standard mode).
+/// Symbols `>= max_dist_symbol` are rejected by `libbrotlidec` because their complete distance
+/// code group exceeds `BROTLI_MAX_ALLOWED_DISTANCE = 0x7FFF_FFFC`.
+#[inline(always)]
+pub(crate) const fn max_dist_symbol(npostfix: u8, ndirect: u8, large_window: bool) -> usize {
+    if !large_window {
+        return dist_alphabet_size(npostfix, ndirect, false);
+    }
+    const BOUND: [usize; 4] = [0, 4, 12, 24];
+    const DIFF: [usize; 4] = [73, 126, 228, 424];
+    let (np, nd) = (npostfix as usize, ndirect as usize);
+    let postfix = 1usize << np;
+    if nd < BOUND[np] {
+        nd + DIFF[np] + postfix
+    } else if nd > BOUND[np] + postfix {
+        nd + DIFF[np]
+    } else {
+        BOUND[np] + DIFF[np] + postfix
+    }
+}
+
+/// Branchless raw-distance encoder for `(NPOSTFIX, NDIRECT) == (0, 0)` (`sym` in `16..=73`).
+#[inline(always)]
+pub(crate) fn encode_raw_distance_00(distance: u32) -> (u16, u8, u32) {
+    debug_assert!(distance >= 1);
+    let u = distance.wrapping_add(3);
+    let nbits = 30 - ((u | 4) & 0x7FFF_FFFF).leading_zeros();
+    let hcode = (u >> nbits) & 1;
+    let bits = u.wrapping_sub((2 + hcode) << nbits);
+    ((14 + (nbits << 1) + hcode) as u16, nbits as u8, bits)
+}
+
+/// Returns bounded `(symbol, nbits, bits)`. Assumes `NPOSTFIX = 0` and `NDIRECT = 0` without distance cache.
+#[inline(always)]
+pub(crate) fn distance_to_sym_bounded(
+    distance: u32,
+) -> (
+    BoundedU8<{ LARGE_DIST_ALPHABET_SIZE - 1 }>,
+    BoundedU8<30>,
+    u32,
+) {
+    let (sym, nbits, bits) = encode_raw_distance_00(distance);
+    (
+        BoundedU8::<{ LARGE_DIST_ALPHABET_SIZE - 1 }>::new_clamped(sym as u8),
+        BoundedU8::<30>::new_clamped(nbits),
+        bits,
+    )
+}
+
+/// Encodes a raw distance `>= 1` into `(dist_sym >= 16, extra_nbits, extra_bits)` for arbitrary
+/// RFC 7932 `(npostfix, ndirect)` (`npostfix in 0..=3`, `ndirect = k << npostfix` with `k in 0..=15`).
+#[inline(always)]
+pub(crate) fn encode_raw_distance_params(
+    distance: u32,
+    npostfix: u8,
+    ndirect: u8,
+) -> (u16, u8, u32) {
+    debug_assert!(distance >= 1 && npostfix <= 3 && (ndirect >> npostfix) < 16);
+    debug_assert_eq!(ndirect & ((1u8 << npostfix) - 1), 0);
+    let d = distance.wrapping_sub(1);
+    if d < ndirect as u32 {
+        return ((16 + d) as u16, 0, 0);
+    }
+    let d = d.wrapping_sub(ndirect as u32);
+    let postfix = d & ((1u32 << npostfix) - 1);
+    let u = (d >> npostfix).wrapping_add(4);
+    // For all valid Brotli distances `1..=0x7FFF_FFFC`, `u` is in `4..=0x7FFF_FFFF` (bit 31 = 0).
+    // Masking `& 0x7FFF_FFFF` before `leading_zeros` lets LLVM prove `1 <= lz <= 29`, eliminating
+    // `new_clamped` branches completely in `distance_to_sym_bounded`.
+    let nbits = 30 - ((u | 4) & 0x7FFF_FFFF).leading_zeros();
+    let hcode = (u >> nbits) & 1;
+    let bits = u.wrapping_sub((2 + hcode) << nbits);
+    let sym = 16 + ndirect as u32 + ((((nbits - 1) << 1) | hcode) << npostfix) + postfix;
     (sym as u16, nbits as u8, bits)
 }
 
+/// Matches `d` (`1..=2^30`) against `(d0 ± 3, d1 ± 3)`, returning bounded short code `0..=15`.
+#[inline(always)]
+pub(crate) fn match_short_dist_d01(d: u32, d0: u32, d1: u32) -> Option<BoundedU8<15>> {
+    if let Some(idx0) = BoundedUsize::<6>::new(d.wrapping_sub(d0).wrapping_add(3) as usize) {
+        return Some(BoundedU8::<15>::new_masked(*SHORT_D0_SYM.bget(idx0)));
+    }
+    if let Some(idx1) = BoundedUsize::<6>::new(d.wrapping_sub(d1).wrapping_add(3) as usize) {
+        return Some(BoundedU8::<15>::new_masked(*SHORT_D1_SYM.bget(idx1)));
+    }
+    None
+}
+
+/// Encodes `raw_distance` (with optional `STATIC_DICT_DIST_FLAG`) against the full 4-entry RFC 7932
+/// distance ring `ring = [d0, d1, d2, d3]` and `(npostfix, ndirect)`, using all 16 short codes `0..15`.
+#[inline(always)]
+pub(crate) fn distance_to_sym_and_bits_with_ring(
+    raw_distance: u32,
+    ring: [u32; 4],
+    npostfix: u8,
+    ndirect: u8,
+) -> (u16, u32, u32) {
+    let d = (raw_distance & !STATIC_DICT_DIST_FLAG).max(1);
+    if (raw_distance & STATIC_DICT_DIST_FLAG) == 0 {
+        if let Some(sc) = match_short_dist_code(d, ring) {
+            return (sc as u16, 0, 0);
+        }
+    }
+    let (sym, nbits, bits) = encode_raw_distance_params(d, npostfix, ndirect);
+    (sym, nbits as u32, bits)
+}
+
+#[cfg(target_arch = "x86_64")]
 #[inline]
-#[target_feature(enable = "avx,avx2")]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
+fn finish_len_simd(
+    olen: __m256i,
+    nbits: __m256i,
+    nbitsshift: __m256i,
+    sym_add: __m256i,
+    low_mask: __m256i,
+) -> (__m256i, __m256i, __m256i) {
+    let one = _mm256_set1_epi32(1);
+    let bits = _mm256_and_si256(olen, _mm256_sub_epi32(_mm256_sllv_epi32(one, nbits), one));
+    let sym = _mm256_add_epi32(_mm256_sllv_epi32(nbits, nbitsshift), sym_add);
+    (
+        _mm256_add_epi32(
+            sym,
+            _mm256_and_si256(low_mask, _mm256_srlv_epi32(olen, nbits)),
+        ),
+        nbits,
+        bits,
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
 fn copy_len_to_sym_and_bits_simd(len: __m256i) -> (__m256i, __m256i, __m256i) {
     let less_134 = _mm256_cmpgt_epi32(_mm256_set1_epi32(134), len);
     let nbitsoff = _mm256_sub_epi32(_mm256_set1_epi32(127), less_134);
     let offmask = _mm256_slli_epi32::<3>(less_134);
-    let offset = _mm256_andnot_si256(offmask, _mm256_set1_epi32(70));
+    let olen = _mm256_sub_epi32(len, _mm256_andnot_si256(offmask, _mm256_set1_epi32(70)));
     let addoff = _mm256_andnot_si256(offmask, _mm256_set1_epi32(12));
-    let nbitsshift = _mm256_abs_epi32(less_134);
-
-    let olen = _mm256_sub_epi32(len, offset);
     let nbits = _mm256_andnot_si256(
         _mm256_cmpgt_epi32(_mm256_set1_epi32(10), len),
         _mm256_subs_epi16(
@@ -107,60 +462,42 @@ fn copy_len_to_sym_and_bits_simd(len: __m256i) -> (__m256i, __m256i, __m256i) {
             nbitsoff,
         ),
     );
-    let one = _mm256_set1_epi32(1);
-    let bits = _mm256_and_si256(olen, _mm256_sub_epi32(_mm256_sllv_epi32(one, nbits), one));
-    let sym = _mm256_add_epi32(_mm256_sllv_epi32(nbits, nbitsshift), addoff);
-    let sym = _mm256_add_epi32(
-        sym,
-        _mm256_and_si256(less_134, _mm256_srlv_epi32(olen, nbits)),
-    );
-
+    let (sym, nbits, bits) =
+        finish_len_simd(olen, nbits, _mm256_abs_epi32(less_134), addoff, less_134);
     let thresh = _mm256_set1_epi32(2118);
-    let less_thresh = _mm256_cmpgt_epi32(thresh, len);
-    let sym = _mm256_blendv_epi8(_mm256_set1_epi32(23), sym, less_thresh);
-    let nbits = _mm256_blendv_epi8(_mm256_set1_epi32(24), nbits, less_thresh);
-    let bits = _mm256_blendv_epi8(_mm256_sub_epi32(len, thresh), bits, less_thresh);
-    (sym, nbits, bits)
+    let lt = _mm256_cmpgt_epi32(thresh, len);
+    (
+        _mm256_blendv_epi8(_mm256_set1_epi32(23), sym, lt),
+        _mm256_blendv_epi8(_mm256_set1_epi32(24), nbits, lt),
+        _mm256_blendv_epi8(_mm256_sub_epi32(len, thresh), bits, lt),
+    )
 }
 
+#[cfg(target_arch = "x86_64")]
 #[inline]
-#[target_feature(enable = "sse2,avx,avx2")]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
 fn insert_len_to_sym_and_bits_simd(len: __m256i) -> (__m256i, __m256i, __m256i) {
-    let v130 = _mm256_set1_epi32(130);
-    let v2114 = _mm256_set1_epi32(2114);
-    let v6210 = _mm256_set1_epi32(6210);
-    let v22694 = _mm256_set1_epi32(22594);
-
     let gt5 = _mm256_cmpgt_epi32(len, _mm256_set1_epi32(5));
-    let lt130 = _mm256_cmpgt_epi32(v130, len);
-    let lt2114 = _mm256_cmpgt_epi32(v2114, len);
-    let lt6210 = _mm256_cmpgt_epi32(v6210, len);
-    let lt22694 = _mm256_cmpgt_epi32(v22694, len);
-
+    let lt130 = _mm256_cmpgt_epi32(_mm256_set1_epi32(130), len);
+    let lt2114 = _mm256_cmpgt_epi32(_mm256_set1_epi32(2114), len);
     let neg_num_lt = _mm256_add_epi32(
         _mm256_add_epi32(lt130, lt2114),
-        _mm256_add_epi32(lt6210, lt22694),
+        _mm256_add_epi32(
+            _mm256_cmpgt_epi32(_mm256_set1_epi32(6210), len),
+            _mm256_cmpgt_epi32(_mm256_set1_epi32(22594), len),
+        ),
     );
-
-    let lookup_indices = _mm256_add_epi32(
+    let idx = _mm256_add_epi32(
         _mm256_mullo_epi32(_mm256_set1_epi32(-0x202), neg_num_lt),
         _mm256_set1_epi32(0x302),
     );
-
     let offset_tbl = _mm256_broadcastsi128_si256(_mm_setr_epi16(0, 22594, 6210, 2114, 66, 2, 0, 0));
     let nbitsoff_tbl = _mm256_broadcastsi128_si256(_mm_setr_epi16(0, 25, 15, 13, 1, 0, 0, 0));
     let addoff_tbl = _mm256_broadcastsi128_si256(_mm_setr_epi16(0, 0, 9, 10, 11, 3, 0, 0));
 
-    let offset = _mm256_shuffle_epi8(offset_tbl, lookup_indices);
-    let nbitsoff = _mm256_shuffle_epi8(nbitsoff_tbl, lookup_indices);
-    let addoff = _mm256_shuffle_epi8(addoff_tbl, lookup_indices);
-
-    let nbitsadd = _mm256_sub_epi32(addoff, _mm256_set1_epi32(1));
-    let nbitsoff = _mm256_add_epi32(nbitsoff, gt5);
-    let nbitsshift = _mm256_abs_epi32(lt130);
-
-    let olen = _mm256_sub_epi32(len, offset);
-
+    let olen = _mm256_sub_epi32(len, _mm256_shuffle_epi8(offset_tbl, idx));
+    let nbitsoff = _mm256_add_epi32(_mm256_shuffle_epi8(nbitsoff_tbl, idx), gt5);
+    let nbitsadd = _mm256_sub_epi32(_mm256_shuffle_epi8(addoff_tbl, idx), _mm256_set1_epi32(1));
     let nbits = _mm256_add_epi32(
         _mm256_and_si256(
             _mm256_and_si256(gt5, lt2114),
@@ -171,466 +508,594 @@ fn insert_len_to_sym_and_bits_simd(len: __m256i) -> (__m256i, __m256i, __m256i) 
         ),
         nbitsoff,
     );
-
-    let one = _mm256_set1_epi32(1);
-    let bits = _mm256_and_si256(olen, _mm256_sub_epi32(_mm256_sllv_epi32(one, nbits), one));
-    let sym = _mm256_add_epi32(_mm256_sllv_epi32(nbits, nbitsshift), nbitsadd);
-    let sym = _mm256_add_epi32(sym, _mm256_and_si256(lt130, _mm256_srlv_epi32(olen, nbits)));
-    (sym, nbits, bits)
+    finish_len_simd(olen, nbits, _mm256_abs_epi32(lt130), nbitsadd, lt130)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[cfg(target_arch = "x86_64")]
+#[derive(Default)]
+pub(crate) struct IcdBatchBufs {
+    pub iac_bits: [u64; 8],
+    pub iac_sym: [u32; 8],
+    pub dist_ctx: [u32; 8],
+    pub dist_bits: [u32; 8],
+    pub dist_sym: [u32; 8],
+}
+
+#[cfg(target_arch = "x86_64")]
 #[inline]
-#[target_feature(enable = "sse2,avx,avx2")]
-pub(crate) fn insert_copy_len_to_sym_and_bits_simd<
-    const SLICE_BOUND: usize,
-    const INDEX_BOUND: usize,
->(
-    insert: &BoundedSlice<u32, SLICE_BOUND>,
-    copy: &BoundedSlice<u32, SLICE_BOUND>,
-    index: BoundedUsize<INDEX_BOUND>,
-    sym_buf: &mut [u32; 8],
-    bits_buf: &mut [u64; 8],
-    nbits_pat_buf: &mut [u64; 8],
-    nbits_count_buf: &mut [u32; 8],
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
+fn halves(v: __m256i) -> [__m128i; 2] {
+    [_mm256_castsi256_si128(v), _mm256_extracti128_si256::<1>(v)]
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
+pub(crate) fn insert_copy_len_to_sym_and_bits_simd<const TWO_DIST_CTX: bool>(
+    insert: &[u32; 8],
+    copy: &[u32; 8],
+    bufs: &mut IcdBatchBufs,
 ) {
-    const ZERO: BoundedUsize<0> = BoundedUsize::MAX;
-    const FOUR: BoundedUsize<4> = BoundedUsize::MAX;
+    let (insert_code, insert_nbits, insert_bits) =
+        insert_len_to_sym_and_bits_simd(_mm256_loadu_si256(insert));
+    let copy_len = _mm256_loadu_si256(copy);
+    if TWO_DIST_CTX {
+        let ctx = _mm256_srli_epi32::<31>(_mm256_cmpgt_epi32(copy_len, _mm256_set1_epi32(4)));
+        _mm256_storeu_si256(&mut bufs.dist_ctx, ctx);
+    }
 
-    let insert_len = _mm256_loadu_si256(insert.get_array::<8, INDEX_BOUND>(index));
-    let (insert_code, insert_nbits, insert_bits) = insert_len_to_sym_and_bits_simd(insert_len);
-    let copy_len = _mm256_loadu_si256(copy.get_array::<8, INDEX_BOUND>(index));
-
-    let (copy_code, copy_nbits, copy_bits) = copy_len_to_sym_and_bits_simd(copy_len);
-
-    let nbits = _mm256_add_epi32(insert_nbits, copy_nbits);
-    let nbits_count = _mm256_srli_epi32::<4>(_mm256_add_epi32(nbits, _mm256_set1_epi32(15)));
-    _mm256_storeu_si256(nbits_count_buf, nbits_count);
-    let insert_nbits_64_0 = _mm256_cvtepu32_epi64(_mm256_extractf128_si256::<0>(insert_nbits));
-    let insert_nbits_64_1 = _mm256_cvtepu32_epi64(_mm256_extractf128_si256::<1>(insert_nbits));
-    let insert_bits_64_0 = _mm256_cvtepu32_epi64(_mm256_extractf128_si256::<0>(insert_bits));
-    let insert_bits_64_1 = _mm256_cvtepu32_epi64(_mm256_extractf128_si256::<1>(insert_bits));
-    let copy_bits_64_0 = _mm256_cvtepu32_epi64(_mm256_extractf128_si256::<0>(copy_bits));
-    let copy_bits_64_1 = _mm256_cvtepu32_epi64(_mm256_extractf128_si256::<1>(copy_bits));
-
-    let bits_0 = _mm256_or_si256(
-        _mm256_sllv_epi64(copy_bits_64_0, insert_nbits_64_0),
-        insert_bits_64_0,
-    );
-
-    let bits_1 = _mm256_or_si256(
-        _mm256_sllv_epi64(copy_bits_64_1, insert_nbits_64_1),
-        insert_bits_64_1,
-    );
-
-    let bits_buf = BoundedSlice::new_from_equal_array_mut(bits_buf);
-    _mm256_storeu_si256(bits_buf.get_array_mut::<4, 0>(ZERO), bits_0);
-    _mm256_storeu_si256(bits_buf.get_array_mut::<4, 4>(FOUR), bits_1);
-
-    let nbits_pat = _mm256_or_si256(_mm256_slli_epi32::<16>(nbits), nbits);
-    let nbits_pat = _mm256_or_si256(_mm256_slli_epi32::<8>(nbits_pat), nbits_pat);
-    let nbits_pat = _mm256_min_epi8(
-        _mm256_subs_epu8(nbits_pat, _mm256_set1_epi32(0x30201000)),
-        _mm256_set1_epi8(16),
-    );
-    let nbits_pat_0 = _mm256_cvtepu32_epi64(_mm256_extractf128_si256::<0>(nbits_pat));
-    let nbits_pat_1 = _mm256_cvtepu32_epi64(_mm256_extractf128_si256::<1>(nbits_pat));
-    let expand_mask = _mm256_broadcastsi128_si256(_mm_setr_epi8(
-        0, -1, 1, -1, 2, -1, 3, -1, 8, -1, 9, -1, 10, -1, 11, -1,
-    ));
-    let nbits_pat_0 = _mm256_shuffle_epi8(nbits_pat_0, expand_mask);
-    let nbits_pat_1 = _mm256_shuffle_epi8(nbits_pat_1, expand_mask);
-
-    let nbits_pat_buf = BoundedSlice::new_from_equal_array_mut(nbits_pat_buf);
-    _mm256_storeu_si256(nbits_pat_buf.get_array_mut::<4, 0>(ZERO), nbits_pat_0);
-    _mm256_storeu_si256(nbits_pat_buf.get_array_mut::<4, 4>(FOUR), nbits_pat_1);
+    let (copy_code, _, copy_bits) = copy_len_to_sym_and_bits_simd(copy_len);
+    let (cb_h, inb_h, ib_h) = (halves(copy_bits), halves(insert_nbits), halves(insert_bits));
+    for (h, dst) in bufs.iac_bits.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        let packed = _mm256_or_si256(
+            _mm256_sllv_epi64(
+                _mm256_cvtepu32_epi64(cb_h[h]),
+                _mm256_cvtepu32_epi64(inb_h[h]),
+            ),
+            _mm256_cvtepu32_epi64(ib_h[h]),
+        );
+        _mm256_storeu_si256(dst, packed);
+    }
 
     let mask = _mm256_set1_epi32(0x7);
     let bits64 = _mm256_or_si256(
         _mm256_and_si256(copy_code, mask),
         _mm256_slli_epi32::<3>(_mm256_and_si256(insert_code, mask)),
     );
-
-    /*
-    (i, c)
-    (0, 0) -> 2
-    (0, 1) -> 3
-    (0, 2) -> 6
-    (1, 0) -> 4
-    (1, 1) -> 5
-    (1, 2) -> 8
-    (2, 0) -> 7
-    (2, 1) -> 9
-    (2, 2) -> 10
-    */
-
     let table = _mm256_broadcastsi128_si256(_mm_setr_epi8(
         0, 2, 3, 6, 0, 4, 5, 8, 0, 7, 9, 10, 0, 0, 0, 0,
     ));
-
     let idx = _mm256_or_si256(
         _mm256_add_epi32(_mm256_set1_epi32(1), _mm256_srli_epi32::<3>(copy_code)),
         _mm256_slli_epi32::<2>(_mm256_srli_epi32::<3>(insert_code)),
     );
-
     let offset = _mm256_slli_epi32::<6>(_mm256_shuffle_epi8(table, idx));
-    let offset = _mm256_or_si256(_mm256_set1_epi32(SYMBOL_MASK as i32), offset);
-
-    let sym = _mm256_or_si256(bits64, offset);
-    _mm256_storeu_si256(sym_buf, sym);
+    _mm256_storeu_si256(&mut bufs.iac_sym, _mm256_or_si256(bits64, offset));
 }
 
-/// Returns (symbol, nbits, bits). Assumes NPREFIX = 0 and NDIRECT = 0. Does not support the
-/// distance cache.
-#[cfg(test)]
-fn distance_to_sym_and_bits(distance: u32) -> (u8, u8, u32) {
-    debug_assert_ne!(distance, 0);
-    let dist = distance + 3;
-    let nbits = dist.ilog2() - 1;
-    let prefix = (dist >> nbits) & 1;
-    let offset = (2 + prefix) << nbits;
-    let code = 16 + 2 * (nbits - 1) + prefix;
-    let bits = dist - offset;
-    (code as u8, nbits as u8, bits)
-}
-
-/// Returns (symbol, nbits, bits). Assumes NPREFIX = 0 and NDIRECT = 0.
-#[cfg(test)]
-fn distance_to_sym_and_bits_with_cache(
-    distance: u32,
-    last_distance: u32,
-    second_last_distance: u32,
-) -> (u8, u32, u32) {
-    let (sym, nbits, bits) = if distance == last_distance {
-        (0, 0, 0)
-    } else if distance == last_distance + 1 {
-        (5, 0, 0)
-    } else if distance + 1 == last_distance {
-        (4, 0, 0)
-    } else if distance == last_distance + 2 {
-        (7, 0, 0)
-    } else if distance + 2 == last_distance {
-        (6, 0, 0)
-    } else if distance == second_last_distance {
-        (1, 0, 0)
-    } else if distance == second_last_distance + 1 {
-        (11, 0, 0)
-    } else if distance + 1 == second_last_distance {
-        (10, 0, 0)
-    } else if distance == second_last_distance + 2 {
-        (13, 0, 0)
-    } else if distance + 2 == second_last_distance {
-        (12, 0, 0)
-    } else {
-        distance_to_sym_and_bits(distance)
-    };
-    (sym, nbits as u32, bits)
-}
-
+#[cfg(target_arch = "x86_64")]
 #[inline]
-#[target_feature(enable = "sse2,avx,avx2")]
-pub(crate) fn distance_to_sym_and_bits_simd<
-    const SLICE_BOUND: usize,
-    const INDEX_BOUND: usize,
-    const INDEX_BOUND_PLUS_AT_LEAST_2: usize,
->(
-    distance: &BoundedSlice<u32, SLICE_BOUND>,
-    pos: BoundedUsize<INDEX_BOUND>,
-    sym_buf: &mut [u32; 8],
-    bits_buf: &mut [u32; 8],
-    nbits_pat_buf: &mut [u32; 8],
-    nbits_count_buf: &mut [u32; 8],
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
+pub(crate) fn distance_to_sym_and_bits_simd(
+    [d0, d1, d2, d3]: [__m256i; 4],
+    raw: __m256i,
+    npostfix: u8,
+    ndirect: u8,
+    bufs: &mut IcdBatchBufs,
 ) {
-    let second_last_distance = _mm256_loadu_si256(distance.get_array::<8, INDEX_BOUND>(pos));
-    let last_distance =
-        _mm256_loadu_si256(distance.get_array::<8, INDEX_BOUND_PLUS_AT_LEAST_2>(
-            pos.add::<INDEX_BOUND_PLUS_AT_LEAST_2, 1>(),
-        ));
-    let distance =
-        _mm256_loadu_si256(distance.get_array::<8, INDEX_BOUND_PLUS_AT_LEAST_2>(
-            pos.add::<INDEX_BOUND_PLUS_AT_LEAST_2, 2>(),
-        ));
-    let dist = _mm256_add_epi32(distance, _mm256_set1_epi32(3));
-    let float_dist = _mm256_castps_si256(_mm256_cvtepi32_ps(dist));
-    let nbits = _mm256_sub_epi32(_mm256_srli_epi32::<23>(float_dist), _mm256_set1_epi32(128));
-    let prefix = _mm256_and_si256(_mm256_set1_epi32(1), _mm256_srlv_epi32(dist, nbits));
-    let offset = _mm256_sllv_epi32(_mm256_add_epi32(_mm256_set1_epi32(2), prefix), nbits);
-    let code = _mm256_add_epi32(
-        _mm256_add_epi32(_mm256_set1_epi32(14), prefix),
-        _mm256_slli_epi32::<1>(nbits),
+    let is_dict = _mm256_srai_epi32::<31>(raw);
+    let (zero, one, two) = (
+        _mm256_setzero_si256(),
+        _mm256_set1_epi32(1),
+        _mm256_set1_epi32(2),
     );
-    let bits = _mm256_sub_epi32(dist, offset);
-    // lookup table from distance + 3 - [second_]last_distance to corresponding symbol. The upper 4
-    // bits contain the symbol for last_distance, the lower 4 for second_last_distance.
-    let lut = _mm256_broadcastsi128_si256(_mm_setr_epi8(
-        0x00, 0x6c, 0x4a, 0x01, 0x5b, 0x7d, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    ));
-    let last_diff = _mm256_sub_epi32(dist, last_distance);
-    let second_last_diff = _mm256_sub_epi32(dist, second_last_distance);
-    let six = _mm256_set1_epi32(6);
-    let last_matches = _mm256_and_si256(
-        _mm256_cmpgt_epi32(last_diff, _mm256_setzero_si256()),
-        _mm256_cmpgt_epi32(six, last_diff),
+    let distance = _mm256_max_epi32(_mm256_and_si256(raw, _mm256_set1_epi32(0x7FFF_FFFF)), one);
+
+    let ndirect_p1 = _mm256_set1_epi32(ndirect as i32 + 1);
+    let is_direct = _mm256_cmpgt_epi32(ndirect_p1, distance);
+    let direct_code = _mm256_add_epi32(distance, _mm256_set1_epi32(15));
+
+    let d_minus = _mm256_max_epi32(_mm256_sub_epi32(distance, ndirect_p1), zero);
+    let v_npostfix = _mm256_set1_epi32(npostfix as i32);
+    let postfix = _mm256_and_si256(d_minus, _mm256_set1_epi32((1i32 << npostfix) - 1));
+    let u = _mm256_add_epi32(_mm256_srlv_epi32(d_minus, v_npostfix), _mm256_set1_epi32(4));
+    // Masking low 7 bits for `u >= 128` keeps `<= 24` significant bits so `_mm256_cvtepi32_ps`
+    // never rounds across a power of two for any `4 <= u < 2^31`.
+    let mask_low = _mm256_and_si256(
+        _mm256_cmpgt_epi32(u, _mm256_set1_epi32(127)),
+        _mm256_set1_epi32(0x7F),
     );
-    let second_last_matches = _mm256_and_si256(
-        _mm256_cmpgt_epi32(second_last_diff, _mm256_setzero_si256()),
-        _mm256_cmpgt_epi32(six, second_last_diff),
+    let float_u = _mm256_castps_si256(_mm256_cvtepi32_ps(_mm256_andnot_si256(mask_low, u)));
+    let nbits = _mm256_sub_epi32(_mm256_srli_epi32::<23>(float_u), _mm256_set1_epi32(128));
+    let hcode = _mm256_and_si256(one, _mm256_srlv_epi32(u, nbits));
+    let raw_bits = _mm256_sub_epi32(u, _mm256_sllv_epi32(_mm256_add_epi32(two, hcode), nbits));
+    let prefix_idx = _mm256_add_epi32(_mm256_slli_epi32::<1>(nbits), _mm256_sub_epi32(hcode, two));
+    let raw_code = _mm256_add_epi32(
+        _mm256_add_epi32(_mm256_set1_epi32(16 + ndirect as i32), postfix),
+        _mm256_sllv_epi32(prefix_idx, v_npostfix),
     );
 
-    let code = _mm256_castps_si256(_mm256_blendv_ps(
-        _mm256_castsi256_ps(code),
-        _mm256_castsi256_ps(_mm256_and_si256(
-            _mm256_set1_epi32(0xf),
-            _mm256_shuffle_epi8(lut, second_last_diff),
-        )),
-        _mm256_castsi256_ps(second_last_matches),
-    ));
+    let non_cache_code = _mm256_blendv_epi8(raw_code, direct_code, is_direct);
+    let non_cache_bits = _mm256_andnot_si256(is_direct, raw_bits);
 
-    let code = _mm256_castps_si256(_mm256_blendv_ps(
-        _mm256_castsi256_ps(code),
-        _mm256_castsi256_ps(_mm256_srai_epi32::<4>(_mm256_shuffle_epi8(lut, last_diff))),
-        _mm256_castsi256_ps(last_matches),
-    ));
-
-    let code = _mm256_add_epi32(_mm256_set1_epi32((SYMBOL_MASK + DIST_BASE) as i32), code);
-
-    let last_mask = _mm256_or_si256(last_matches, second_last_matches);
-    let bits = _mm256_andnot_si256(last_mask, bits);
-    let nbits = _mm256_andnot_si256(last_mask, nbits);
-    let nbits_count = _mm256_srli_epi32::<4>(_mm256_add_epi32(nbits, _mm256_set1_epi32(15)));
-    let nbits_pat = _mm256_or_si256(nbits, _mm256_slli_epi32::<16>(nbits));
-    let nbits_pat = _mm256_min_epi16(
-        _mm256_subs_epu16(nbits_pat, _mm256_set1_epi32(16 << 16)),
-        _mm256_set1_epi16(16),
+    // Lookup table from `(distance - d_k) + 4` in `1..=7` (`-3..=+3`) to short code:
+    // upper nibble = `d0` `[8, 6, 4, 0, 5, 7, 9]`, lower nibble = `d1` `[14, 12, 10, 1, 11, 13, 15]`.
+    let lut = _mm256_broadcastsi128_si256(_mm_loadu_si128(&[
+        0x00u8, 0x8e, 0x6c, 0x4a, 0x01, 0x5b, 0x7d, 0x9f, 0, 0, 0, 0, 0, 0, 0, 0,
+    ]));
+    let (four, eight) = (_mm256_set1_epi32(4), _mm256_set1_epi32(8));
+    let diff0 = _mm256_add_epi32(_mm256_sub_epi32(distance, d0), four);
+    let diff1 = _mm256_add_epi32(_mm256_sub_epi32(distance, d1), four);
+    let near0 = _mm256_and_si256(
+        _mm256_cmpgt_epi32(diff0, zero),
+        _mm256_cmpgt_epi32(eight, diff0),
     );
-    _mm256_storeu_si256(sym_buf, code);
-    _mm256_storeu_si256(bits_buf, bits);
-    _mm256_storeu_si256(nbits_pat_buf, nbits_pat);
-    _mm256_storeu_si256(nbits_count_buf, nbits_count);
+    let near1 = _mm256_and_si256(
+        _mm256_cmpgt_epi32(diff1, zero),
+        _mm256_cmpgt_epi32(eight, diff1),
+    );
+    let eq0 = _mm256_cmpeq_epi32(distance, d0);
+    let eq1 = _mm256_cmpeq_epi32(distance, d1);
+    let eq2 = _mm256_cmpeq_epi32(distance, d2);
+    let eq3 = _mm256_cmpeq_epi32(distance, d3);
+
+    // Ascending priority (`near1 < near0 < eq3 < eq2 < eq1 < eq0`) matches scalar tie-breaking.
+    let s1 = _mm256_and_si256(_mm256_set1_epi32(0x0F), _mm256_shuffle_epi8(lut, diff1));
+    let s0 = _mm256_srli_epi32::<4>(_mm256_shuffle_epi8(lut, diff0));
+    let mut code = _mm256_blendv_epi8(non_cache_code, s1, near1);
+    code = _mm256_blendv_epi8(code, s0, near0);
+    code = _mm256_blendv_epi8(code, _mm256_set1_epi32(3), eq3);
+    code = _mm256_blendv_epi8(code, two, eq2);
+    code = _mm256_blendv_epi8(code, one, eq1);
+    code = _mm256_blendv_epi8(code, zero, eq0);
+    code = _mm256_blendv_epi8(code, non_cache_code, is_dict);
+
+    let any_short = _mm256_andnot_si256(
+        is_dict,
+        _mm256_or_si256(_mm256_or_si256(near0, near1), _mm256_or_si256(eq2, eq3)),
+    );
+    let bits = _mm256_andnot_si256(any_short, non_cache_bits);
+
+    _mm256_storeu_si256(&mut bufs.dist_sym, code);
+    _mm256_storeu_si256(&mut bufs.dist_bits, bits);
+}
+
+/// Matches `d` (`1..=2^30`) against `ring` slots enabled in `valid_mask` (`bit k` = `ring[k]` valid).
+#[inline(always)]
+pub(crate) fn match_short_dist_code_masked(d: u32, ring: [u32; 4], valid_mask: u8) -> Option<u8> {
+    for (sc, &rk) in ring.iter().enumerate() {
+        if (valid_mask & (1u8 << sc)) != 0 && d == rk {
+            return Some(sc as u8);
+        }
+    }
+    let r0 = if (valid_mask & 1) != 0 {
+        ring[0]
+    } else {
+        0xFFFF_FFF0
+    };
+    let r1 = if (valid_mask & 2) != 0 {
+        ring[1]
+    } else {
+        0xFFFF_FFF0
+    };
+    Some(match_short_dist_d01(d, r0, r1)?.get())
+}
+
+/// Matches `d` (`1..=2^30`) against `ring = [d0, d1, d2, d3]`, returning an RFC 7932 short code `0..15`.
+#[inline(always)]
+pub(crate) fn match_short_dist_code(d: u32, ring: [u32; 4]) -> Option<u8> {
+    match_short_dist_code_masked(d, ring, 0x0F)
+}
+
+/// Unpacks 16 interleaved `(even, odd)` `HuffmanCodeEntry::to_u32()` lanes and packs them into
+/// 4 bounded `(nbits, bits)` quadwords (`16 -> 32 -> 64` AVX2 variable shifts).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
+pub(crate) fn pack_even_odd_16_avx2(
+    even: [u32; 8],
+    odd: [u32; 8],
+) -> ([BoundedUsize<64>; 4], [u64; 4]) {
+    let (h_even, h_odd) = (_mm256_loadu_si256(&even), _mm256_loadu_si256(&odd));
+    let mask16 = _mm256_set1_epi32(0x0000_FFFF);
+    let mask32 = _mm256_set1_epi64x(0x0000_0000_FFFF_FFFF);
+    let nbits = _mm256_or_si256(
+        _mm256_slli_epi32::<16>(h_odd),
+        _mm256_and_si256(mask16, h_even),
+    );
+    let bits = _mm256_or_si256(
+        _mm256_srli_epi32::<16>(h_even),
+        _mm256_andnot_si256(mask16, h_odd),
+    );
+
+    let nbits_lo = _mm256_and_si256(mask16, nbits);
+    let nbits32 = _mm256_add_epi32(_mm256_srli_epi32::<16>(nbits), nbits_lo);
+    let bits32 = _mm256_or_si256(
+        _mm256_and_si256(mask16, bits),
+        _mm256_sllv_epi32(_mm256_srli_epi32::<16>(bits), nbits_lo),
+    );
+
+    let nbits32_lo = _mm256_and_si256(mask32, nbits32);
+    let nbits64 = _mm256_add_epi64(_mm256_srli_epi64::<32>(nbits32), nbits32_lo);
+    let bits64 = _mm256_or_si256(
+        _mm256_and_si256(mask32, bits32),
+        _mm256_sllv_epi64(_mm256_srli_epi64::<32>(bits32), nbits32_lo),
+    );
+
+    let (mut n, mut ba) = ([0u64; 4], [0u64; 4]);
+    _mm256_storeu_si256(&mut n, nbits64);
+    _mm256_storeu_si256(&mut ba, bits64);
+    let [n0, n1, n2, n3] = n;
+    (
+        [
+            bound64_from_u63(n0 as usize),
+            bound64_from_u63(n1 as usize),
+            bound64_from_u63(n2 as usize),
+            bound64_from_u63(n3 as usize),
+        ],
+        ba,
+    )
+}
+
+#[inline(always)]
+pub(crate) fn bound64_from_u63(nb: usize) -> BoundedUsize<64> {
+    debug_assert!(nb <= 63);
+    BoundedUsize::<63>::new_masked(nb).widen::<64>()
+}
+
+#[inline(always)]
+pub(crate) fn pack_huff_extra(h: HuffmanCodeEntry, eb_len: u8, eb: u64) -> (usize, u64) {
+    (
+        usize::from(h.len + u16::from(eb_len)),
+        u64::from(h.bits) | (eb << h.len),
+    )
+}
+
+#[inline(always)]
+pub(crate) fn pack_huff_extra_bounded(
+    h: HuffmanCodeEntry,
+    eb_len: u8,
+    eb: u64,
+) -> (BoundedUsize<64>, u64) {
+    let (nb, b) = pack_huff_extra(h, eb_len, eb);
+    (bound64_from_u63(nb), b)
+}
+
+#[inline(always)]
+pub(crate) fn pack_entries_quad_bounded(
+    [e0, e1, e2, e3]: [HuffmanCodeEntry; 4],
+) -> (BoundedUsize<64>, u64) {
+    let (l0, l1, l2, l3) = (
+        e0.len as usize,
+        e1.len as usize,
+        e2.len as usize,
+        e3.len as usize,
+    );
+    let l01 = l0 + l1;
+    let l012 = l01 + l2;
+    let bits = (e0.bits as u64)
+        | ((e1.bits as u64) << l0)
+        | ((e2.bits as u64) << l01)
+        | ((e3.bits as u64) << l012);
+    (bound64_from_u63(l012 + l3), bits)
+}
+
+#[inline(always)]
+fn pack_quad_bounded(
+    &[b0, b1, b2, b3]: &[u8; 4],
+    lut: &[HuffmanCodeEntry; 256],
+) -> (BoundedUsize<64>, u64) {
+    pack_entries_quad_bounded([
+        lut[b0 as usize],
+        lut[b1 as usize],
+        lut[b2 as usize],
+        lut[b3 as usize],
+    ])
+}
+
+#[inline(always)]
+pub(crate) fn mask_huff_entry(e: HuffmanCodeEntry, keep: bool) -> HuffmanCodeEntry {
+    let m = u16::MAX.wrapping_mul(u16::from(keep));
+    HuffmanCodeEntry {
+        len: e.len & m,
+        bits: e.bits & m,
+    }
+}
+
+#[inline(always)]
+fn pack_quad_prefix_bounded(
+    &[b0, b1, b2, b3]: &[u8; 4],
+    len: usize,
+    lut: &[HuffmanCodeEntry; 256],
+) -> (BoundedUsize<64>, u64) {
+    debug_assert!((1..=4).contains(&len));
+    pack_entries_quad_bounded([
+        lut[b0 as usize],
+        mask_huff_entry(lut[b1 as usize], len >= 2),
+        mask_huff_entry(lut[b2 as usize], len >= 3),
+        mask_huff_entry(lut[b3 as usize], len >= 4),
+    ])
+}
+
+#[inline(always)]
+fn pack_lits_1_to_4_bounded(s: &[u8], lut: &[HuffmanCodeEntry; 256]) -> (BoundedUsize<64>, u64) {
+    let Some((&b0, rest)) = s.split_first() else {
+        return (BoundedUsize::constant::<0>(), 0);
+    };
+    let e0 = lut[b0 as usize];
+    let (mut nb, mut b) = (e0.len as usize, e0.bits as u64);
+    for &byte in rest {
+        let e = lut[byte as usize];
+        b |= (e.bits as u64) << nb;
+        nb += e.len as usize;
+    }
+    (bound64_from_u63(nb), b)
+}
+
+#[inline(always)]
+pub(crate) fn emit_batch1_slice<'c, T>(
+    cur: &mut BitStreamCursor<'_, '_>,
+    items: &'c [T],
+    mut f: impl FnMut(&'c T) -> (BoundedUsize<64>, u64),
+) {
+    match cur.try_batch_iter::<1, _>(items.iter()) {
+        Ok(mut batch) => {
+            while let Some((item, slot)) = batch.next_slot() {
+                let (nb, b) = f(item);
+                slot.put([nb], [b]);
+            }
+        }
+        Err(iter) => {
+            for item in iter {
+                let (nb, b) = f(item);
+                cur.put_bounded(nb, b);
+            }
+        }
+    }
+}
+
+macro_rules! with_detached {
+    ($cur:expr, |$d:ident| $body:expr) => {{
+        let mut $d = ($cur).detach();
+        $body;
+    }};
+}
+#[cfg(target_arch = "x86_64")]
+pub(crate) use with_detached;
+
+#[inline(always)]
+fn emit_literals_scalar(
+    slice: &[u8],
+    lut: &[HuffmanCodeEntry; 256],
+    cur: &mut BitStreamCursor<'_, '_>,
+) {
+    let (quads, rem) = slice.as_chunks::<4>();
+    emit_batch1_slice(cur, quads, |q| pack_quad_bounded(q, lut));
+    if !rem.is_empty() {
+        let (nb, b) = pack_lits_1_to_4_bounded(rem, lut);
+        cur.put_bounded(nb, b);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[cold]
+#[inline(never)]
+fn emit_literals_slow(
+    slice: &[u8],
+    lut: &[HuffmanCodeEntry; 256],
+    cur: &mut BitStreamCursor<'_, '_>,
+) {
+    emit_literals_scalar(slice, lut, cur);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[simd_entry]
+#[inline]
+#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
+pub(crate) fn emit_literals_avx2(
+    slice: &[u8],
+    lut: &[HuffmanCodeEntry; 256],
+    cur: &mut BitStreamCursor<'_, '_>,
+    _tok: impl SimdToken,
+) {
+    let mut local = cur.detach();
+    let rem = if slice.len() >= 16 {
+        let (chunks, rem) = slice.as_chunks::<16>();
+        let Ok(mut batch) = local.try_batch_iter::<4, _>(chunks.iter()) else {
+            drop(local);
+            emit_literals_slow(slice, lut, cur);
+            return;
+        };
+        while let Some((c16, slot)) = batch.next_slot() {
+            macro_rules! lut8 {
+                ($($i:literal),+) => { [$(lut[c16[$i] as usize].to_u32()),+] };
+            }
+            let (na, ba) = pack_even_odd_16_avx2(
+                lut8!(0, 2, 4, 6, 8, 10, 12, 14),
+                lut8!(1, 3, 5, 7, 9, 11, 13, 15),
+            );
+            slot.put::<4>(na, ba);
+        }
+        rem
+    } else {
+        slice
+    };
+    if !rem.is_empty() {
+        let Some(slot) = local.try_slot::<4>() else {
+            drop(local);
+            emit_literals_slow(rem, lut, cur);
+            return;
+        };
+        let (quads, tail) = rem.as_chunks::<4>();
+        let (nt, bt) = pack_lits_1_to_4_bounded(tail, lut);
+        match quads {
+            [] => slot.put([nt], [bt]),
+            [q0] => {
+                let (n0, b0) = pack_quad_bounded(q0, lut);
+                slot.put([n0, nt], [b0, bt]);
+            }
+            [q0, q1] => {
+                let ((n0, b0), (n1, b1)) = (pack_quad_bounded(q0, lut), pack_quad_bounded(q1, lut));
+                slot.put([n0, n1, nt], [b0, b1, bt]);
+            }
+            [q0, q1, q2, ..] => {
+                let ((n0, b0), (n1, b1), (n2, b2)) = (
+                    pack_quad_bounded(q0, lut),
+                    pack_quad_bounded(q1, lut),
+                    pack_quad_bounded(q2, lut),
+                );
+                slot.put([n0, n1, n2, nt], [b0, b1, b2, bt]);
+            }
+        }
+    }
+}
+
+#[inline(always)]
+pub(crate) fn emit_literals_mode<S: SimdBackend, const DETACH: bool>(
+    simd: S,
+    slice: &[u8],
+    lut: &[HuffmanCodeEntry; 256],
+    cur: &mut BitStreamCursor<'_, '_>,
+) {
+    dispatch_simd!(
+        simd,
+        S => |tok| if DETACH {
+            with_detached!(cur, |d| emit_literals_avx2(slice, lut, &mut d, tok))
+        } else {
+            emit_literals_avx2(slice, lut, cur, tok)
+        },
+        if DETACH {
+            with_detached!(cur, |d| emit_literals_scalar(slice, lut, &mut d))
+        } else {
+            emit_literals_scalar(slice, lut, cur)
+        }
+    );
+}
+
+#[inline(always)]
+pub(crate) fn emit_literals<S: SimdBackend>(
+    simd: S,
+    slice: &[u8],
+    lut: &[HuffmanCodeEntry; 256],
+    cur: &mut BitStreamCursor<'_, '_>,
+) {
+    emit_literals_mode::<S, false>(simd, slice, lut, cur);
+}
+
+#[inline(always)]
+pub(crate) fn emit_cmd_no_lits(
+    cur: &mut BitStreamCursor<'_, '_>,
+    (iac_nb, iac_b): (BoundedUsize<64>, u64),
+    opt_dist: Option<(BoundedUsize<64>, u64)>,
+) {
+    match opt_dist {
+        Some((d_nb, d_b)) => cur.put_batch([iac_nb, d_nb], [iac_b, d_b]),
+        None => cur.put_bounded(iac_nb, iac_b),
+    }
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_cmd_and_lits<const DETACH: bool, const N: usize, S: SimdBackend>(
+    simd: S,
+    cur: &mut BitStreamCursor<'_, '_>,
+    prefix: &[u8],
+    pfx: Option<BoundedPrefix<'_, u8, N>>,
+    (lit_start, lit_len): (usize, usize),
+    lit_lut: &[HuffmanCodeEntry; 256],
+    (iac_nb, iac_b): (BoundedUsize<64>, u64),
+    opt_dist: Option<(BoundedUsize<64>, u64)>,
+) {
+    const { assert!(N >= 8) };
+    macro_rules! emit_q {
+        ([$(($ln:expr, $lb:expr)),+]) => {
+            match opt_dist {
+                Some((dn, db)) => cur.put_batch([iac_nb, $($ln),+, dn], [iac_b, $($lb),+, db]),
+                None => cur.put_batch([iac_nb, $($ln),+], [iac_b, $($lb),+]),
+            }
+        };
+    }
+    if lit_len == 0 {
+        return emit_cmd_no_lits(cur, (iac_nb, iac_b), opt_dist);
+    }
+    if lit_len <= 8 {
+        if let Some(p) = pfx {
+            if let Some(at_s) = p.cursor_at(lit_start) {
+                if lit_len <= 4 {
+                    let q0 = pack_quad_prefix_bounded(at_s.sub_array::<4, 0>(), lit_len, lit_lut);
+                    emit_q!([(q0.0, q0.1)]);
+                } else {
+                    let q0 = pack_quad_bounded(at_s.sub_array::<4, 0>(), lit_lut);
+                    let q1 =
+                        pack_quad_prefix_bounded(at_s.sub_array::<4, 4>(), lit_len - 4, lit_lut);
+                    emit_q!([(q0.0, q0.1), (q1.0, q1.1)]);
+                }
+                return;
+            }
+        }
+        if lit_len <= 4 {
+            if let Some(ls) = prefix.get(lit_start..lit_start + lit_len) {
+                let q0 = pack_lits_1_to_4_bounded(ls, lit_lut);
+                emit_q!([(q0.0, q0.1)]);
+            }
+            return;
+        }
+    }
+    if let Some(ls) = prefix.get(lit_start..lit_start + lit_len) {
+        cur.put_bounded(iac_nb, iac_b);
+        emit_literals_mode::<S, DETACH>(simd, ls, lit_lut, cur);
+        if let Some((d_nb, d_b)) = opt_dist {
+            cur.put_bounded(d_nb, d_b);
+        }
+    }
 }
 
 #[cfg(test)]
-#[allow(clippy::needless_range_loop)]
-mod test {
-    use super::{
-        copy_len_to_sym_and_bits, copy_len_to_sym_and_bits_simd, distance_to_sym_and_bits_simd,
-        distance_to_sym_and_bits_with_cache, insert_copy_len_to_sym_and_bits,
-        insert_copy_len_to_sym_and_bits_simd, insert_len_to_sym_and_bits,
-        insert_len_to_sym_and_bits_simd,
-    };
-    use crate::constants::*;
-    use bounded_utils::{BoundedSlice, BoundedUsize};
-    use safe_unaligned_simd::x86_64::{_mm256_loadu_si256, _mm256_storeu_si256};
-    use simd_tokens::{simd_entry, Avx2Token, SimdToken};
+mod tests {
+    use super::*;
 
-    fn get_nbits(mut nbits_pat: u64, mut nbits_count: u32) -> u64 {
-        let mut nbits = 0;
-        while nbits_pat > 0 {
-            let lo = nbits_pat & 0xFFFF;
-            assert_ne!(nbits_count, 0);
-            assert_ne!(lo, 0);
-            nbits += lo;
-            nbits_count -= 1;
-            nbits_pat >>= 16;
-            if nbits_count > 0 {
-                assert_eq!(lo, 16);
-            }
+    /// Exact port of `BrotliCalculateDistanceCodeLimit` from C `libbrotli` (`common/constants.h`).
+    fn c_brotli_distance_code_limit(max_distance: u32, npostfix: u32, ndirect: u32) -> (u32, u32) {
+        let forbidden_distance = max_distance + 1;
+        let offset = ((forbidden_distance - ndirect - 1) >> npostfix) + 4;
+        let mut ndistbits = 0u32;
+        let mut tmp = offset / 2;
+        while tmp != 0 {
+            ndistbits += 1;
+            tmp >>= 1;
         }
-        assert_eq!(nbits_count, 0);
-        nbits
+        ndistbits -= 1;
+        let half = (offset >> ndistbits) & 1;
+        let group = (((ndistbits - 1) << 1) | half) - 1;
+        let ndistbits = (group >> 1) + 1;
+        let extra = (1u32 << ndistbits) - 1;
+        let start = ((1u32 << (ndistbits + 1)) - 4) + ((group & 1) << ndistbits);
+        let postfix = (1u32 << npostfix) - 1;
+        let max_alphabet_size = ((group << npostfix) | postfix) + ndirect + 16 + 1;
+        let limit_max_distance = ((start + extra) << npostfix) + postfix + ndirect + 1;
+        (max_alphabet_size, limit_max_distance)
     }
 
-    #[simd_entry]
-    #[target_feature(enable = "avx2")]
-    fn run_test_distance_simd(_token: impl SimdToken) {
-        let mut distances = [0u32; 1024];
-        let mut distance_bits_buf = [0; 8];
-        let mut distance_nbits_pat_buf = [0; 8];
-        let mut distance_nbits_count_buf = [0; 8];
-        let mut distance_sym_buf = [0; 8];
-
-        let step = if cfg!(miri) { 1_000_000 } else { 1 };
-
-        for d in (1..WSIZE).step_by(step) {
-            if d % 5 == 0 {
-                for i in 0..10 {
-                    distances[i] = d as u32;
-                }
-            } else if d % 5 == 1 {
-                for i in 0..10 {
-                    distances[i] = (d + (i % 2)) as u32;
-                }
-            } else if d % 5 == 2 {
-                for i in 0..10 {
-                    distances[i] = (d + (i / 2 % 2)) as u32;
-                }
-            } else if d % 5 == 3 {
-                for i in 0..10 {
-                    distances[i] = (d + i * 4) as u32;
-                }
-            } else if d % 5 == 4 {
-                for i in 0..10 {
-                    distances[i] = if i % 2 == 0 { d } else { d + 2 } as u32;
-                }
-            }
-            distance_to_sym_and_bits_simd::<1024, 0, 2>(
-                BoundedSlice::new_from_array(&distances),
-                BoundedUsize::MAX,
-                &mut distance_sym_buf,
-                &mut distance_bits_buf,
-                &mut distance_nbits_pat_buf,
-                &mut distance_nbits_count_buf,
-            );
-            for i in 0..8 {
-                let distance = distances[i + 2];
-                // if last_distance == second_last_distance, second_last_distance is incorrect.
-                // However, in that case, we always select last_distance anyway.
-                let last_distance = distances[i + 1];
-                let second_last_distance = distances[i];
-                let (sym, nbits, bits) = distance_to_sym_and_bits_with_cache(
-                    distance,
-                    last_distance,
-                    second_last_distance,
-                );
-                let adj_sym = sym as u16 + (SYMBOL_MASK + DIST_BASE);
-                assert_eq!(adj_sym as u32, distance_sym_buf[i]);
-                assert_eq!(bits, distance_bits_buf[i]);
+    #[test]
+    fn test_max_dist_symbol_matches_c_libbrotlidec_across_all_64_pairs() {
+        assert_eq!(max_dist_symbol(3, 32, true), 456);
+        for np in 0..=3u8 {
+            for k in 0..=15u8 {
+                let nd = k << np;
+                let (c_alpha, c_max_d) =
+                    c_brotli_distance_code_limit(MAX_ALLOWED_DISTANCE as u32, np as u32, nd as u32);
                 assert_eq!(
-                    nbits as u64,
-                    get_nbits(
-                        distance_nbits_pat_buf[i] as u64,
-                        distance_nbits_count_buf[i]
-                    )
+                    max_dist_symbol(np, nd, true),
+                    c_alpha as usize,
+                    "mismatch at (np={np}, nd={nd})"
                 );
-            }
-        }
-    }
-
-    #[test]
-    fn test_distance_simd() {
-        if let Some(token) = Avx2Token::try_new() {
-            run_test_distance_simd(token);
-        }
-    }
-
-    #[simd_entry]
-    #[target_feature(enable = "avx2")]
-    fn run_test_insert_and_copy_simd(_token: impl SimdToken) {
-        let mut insert = [0; 8];
-        let mut copy = [0; 8];
-        let mut sym_buf = [0; 8];
-        let mut bits_buf = [0; 8];
-        let mut nbits_pat_buf = [0; 8];
-        let mut nbits_count_buf = [0; 8];
-
-        let step = if cfg!(miri) { 8 * 1000 } else { 8 };
-
-        for i in (0..METABLOCK_SIZE).step_by(step) {
-            if i > 22594 && i % 1024 != 0 {
-                continue;
-            }
-            for j in (4..MAX_COPY_LEN).step_by(step) {
-                if j > 2118 && j % 1024 != 0 {
-                    continue;
-                }
-                for x in 0..8 {
-                    insert[x] = (i + x) as u32;
-                    copy[x] = (j + x) as u32;
-                }
-                insert_copy_len_to_sym_and_bits_simd(
-                    BoundedSlice::new_from_equal_array(&insert),
-                    BoundedSlice::new_from_equal_array(&copy),
-                    BoundedUsize::<0>::MAX,
-                    &mut sym_buf,
-                    &mut bits_buf,
-                    &mut nbits_pat_buf,
-                    &mut nbits_count_buf,
-                );
-                for x in 0..8 {
-                    let (sym, nbits, bits) = insert_copy_len_to_sym_and_bits(insert[x], copy[x]);
-                    assert_eq!((sym | SYMBOL_MASK) as u32, sym_buf[x]);
-                    assert_eq!(
-                        nbits as u64,
-                        get_nbits(nbits_pat_buf[x], nbits_count_buf[x])
-                    );
-                    assert_eq!(bits, bits_buf[x]);
+                let sym_ok = encode_raw_distance_params(c_max_d, np, nd).0 as u32;
+                assert!(sym_ok < c_alpha, "(np={np}, nd={nd}) d={c_max_d:#x}");
+                if c_max_d < MAX_ALLOWED_DISTANCE as u32 {
+                    let sym_hi = encode_raw_distance_params(c_max_d + 1, np, nd).0 as u32;
+                    assert!(sym_hi >= c_alpha, "(np={np}, nd={nd}) d={:#x}", c_max_d + 1);
                 }
             }
-        }
-    }
-
-    #[test]
-    fn test_insert_and_copy_simd() {
-        if let Some(token) = Avx2Token::try_new() {
-            run_test_insert_and_copy_simd(token);
-        }
-    }
-
-    #[simd_entry]
-    #[target_feature(enable = "avx2")]
-    fn run_test_insert_simd(_token: impl SimdToken) {
-        let mut insert = [0; 8];
-        let mut sym_buf = [0; 8];
-        let mut bits_buf = [0; 8];
-        let mut nbits_buf = [0; 8];
-
-        let step = if cfg!(miri) { 8 * 1000 } else { 8 };
-
-        for i in (0..METABLOCK_SIZE).step_by(step) {
-            for x in 0..8 {
-                insert[x] = (i + x) as u32;
-            }
-            let (sym, nbits, bits) = insert_len_to_sym_and_bits_simd(_mm256_loadu_si256(&insert));
-            _mm256_storeu_si256(&mut sym_buf, sym);
-            _mm256_storeu_si256(&mut bits_buf, bits);
-            _mm256_storeu_si256(&mut nbits_buf, nbits);
-            for x in 0..8 {
-                let (sym, nbits, bits) = insert_len_to_sym_and_bits(i as u32 + x);
-                assert_eq!(sym, sym_buf[x as usize]);
-                assert_eq!(nbits, nbits_buf[x as usize]);
-                assert_eq!(bits, bits_buf[x as usize]);
-            }
-        }
-    }
-
-    #[test]
-    fn test_insert_simd() {
-        if let Some(token) = Avx2Token::try_new() {
-            run_test_insert_simd(token);
-        }
-    }
-
-    #[simd_entry]
-    #[target_feature(enable = "avx2")]
-    fn run_test_copy_simd(_token: impl SimdToken) {
-        let mut copy = [0; 8];
-        let mut sym_buf = [0; 8];
-        let mut bits_buf = [0; 8];
-        let mut nbits_buf = [0; 8];
-
-        let step = if cfg!(miri) { 8 * 1000 } else { 8 };
-
-        for i in (2..METABLOCK_SIZE).step_by(step) {
-            for x in 0..8 {
-                copy[x] = (i + x) as u32;
-            }
-            let (sym, nbits, bits) = copy_len_to_sym_and_bits_simd(_mm256_loadu_si256(&copy));
-            _mm256_storeu_si256(&mut sym_buf, sym);
-            _mm256_storeu_si256(&mut bits_buf, bits);
-            _mm256_storeu_si256(&mut nbits_buf, nbits);
-            for x in 0..8 {
-                let (sym, nbits, bits) = copy_len_to_sym_and_bits(i as u32 + x);
-                assert_eq!(sym, sym_buf[x as usize]);
-                assert_eq!(nbits, nbits_buf[x as usize]);
-                assert_eq!(bits, bits_buf[x as usize]);
-            }
-        }
-    }
-
-    #[test]
-    fn test_copy_simd() {
-        if let Some(token) = Avx2Token::try_new() {
-            run_test_copy_simd(token);
         }
     }
 }
