@@ -100,6 +100,15 @@ impl<'a> ChunkEnv<'a> {
 
 #[cfg(test)]
 pub(crate) mod test_helpers {
+    #[inline]
+    pub(crate) fn miri_or<T>(miri: T, normal: T) -> T {
+        if cfg!(miri) {
+            miri
+        } else {
+            normal
+        }
+    }
+
     pub(crate) fn append_lcg_bytes(out: &mut Vec<u8>, count: usize, mut st: u64, add: u64) {
         out.reserve(count);
         for _ in 0..count {
