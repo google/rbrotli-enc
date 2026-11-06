@@ -22,6 +22,8 @@ mod constants;
 #[allow(dead_code)]
 mod context;
 #[allow(dead_code)]
+mod fast_onepass;
+#[allow(dead_code)]
 mod hashtable;
 #[allow(dead_code)]
 mod huffman;
