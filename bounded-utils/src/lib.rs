@@ -24,6 +24,8 @@
 mod bounded_iterator;
 mod bounded_slice;
 mod bounded_usize;
+#[cfg(target_arch = "aarch64")]
+pub mod safe_aarch64;
 
 #[cfg(target_arch = "x86_64")]
 pub mod safe_x86_64;
@@ -181,6 +183,13 @@ mod tests {
         #[cfg(target_arch = "x86_64")]
         if let Some(tok) = <safe_x86_64::X64V3 as simd_tokens::SimdToken>::try_new() {
             use safe_x86_64::X64V3Ext;
+            let x = 0x100u64;
+            tok.prefetch_et0(&x);
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        if let Some(tok) = <safe_aarch64::A64Neon as simd_tokens::SimdToken>::try_new() {
+            use safe_aarch64::A64NeonExt;
             let x = 0x100u64;
             tok.prefetch_et0(&x);
         }

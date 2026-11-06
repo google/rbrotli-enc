@@ -10,7 +10,7 @@ license = "Apache-2.0"
 paste = "1.0.14"
 zerocopy = { version = "0.7.32", features = ["derive"] }
 
-[target.'cfg(target_arch = "x86_64")'.dependencies]
+[target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]
 simd_tokens = "0.2.0"
 
 [lints]
