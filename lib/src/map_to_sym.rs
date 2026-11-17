@@ -16,17 +16,8 @@ use crate::constants::*;
 use crate::huffman::HuffmanCodeEntry;
 use crate::metablock::{DIST_MODE_IMPLICIT_D0, DIST_MODE_STATIC_DICT};
 use bounded_utils::{BoundedArrayExt, BoundedPrefix, BoundedU16, BoundedU8, BoundedUsize};
-#[cfg(target_arch = "aarch64")]
-use core::arch::aarch64::*;
+use jxl_simd::{I32Vec, SimdDescriptor, U32Vec, U64Vec, U8Vec};
 use lsb_bitwriter::BitStreamCursor;
-#[cfg(target_arch = "aarch64")]
-use safe_unaligned_simd::aarch64::{vld1q_u16, vld1q_u32, vld1q_u8, vst1q_u32, vst1q_u64};
-#[cfg(target_arch = "x86_64")]
-use safe_unaligned_simd::x86_64::{_mm256_loadu_si256, _mm256_storeu_si256, _mm_loadu_si128};
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-use simd_tokens::{simd_entry, SimdToken};
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
 
 pub(crate) const INS_BASE: [u32; 24] = [
     0, 1, 2, 3, 4, 5, 6, 8, 10, 14, 18, 26, 34, 50, 66, 98, 130, 194, 322, 578, 1090, 2114, 6210,
@@ -426,95 +417,131 @@ pub(crate) fn distance_to_sym_and_bits_with_ring(
     (sym, nbits as u32, bits)
 }
 
-#[cfg(target_arch = "x86_64")]
-#[inline]
-#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
-fn finish_len_simd(
-    olen: __m256i,
-    nbits: __m256i,
-    nbitsshift: __m256i,
-    sym_add: __m256i,
-    low_mask: __m256i,
-) -> (__m256i, __m256i, __m256i) {
-    let one = _mm256_set1_epi32(1);
-    let bits = _mm256_and_si256(olen, _mm256_sub_epi32(_mm256_sllv_epi32(one, nbits), one));
-    let sym = _mm256_add_epi32(_mm256_sllv_epi32(nbits, nbitsshift), sym_add);
-    (
-        _mm256_add_epi32(
-            sym,
-            _mm256_and_si256(low_mask, _mm256_srlv_epi32(olen, nbits)),
-        ),
+#[inline(always)]
+pub(crate) fn splat_128_u8<D: SimdDescriptor>(d: D, bytes: &[u8; 16]) -> U8Vec<D> {
+    let mut rep = [0u8; 64];
+    for chunk in rep.as_chunks_mut::<16>().0 {
+        chunk.copy_from_slice(bytes);
+    }
+    U8Vec::load(d, &rep)
+}
+
+const fn u16x8_to_le_bytes(vals: [u16; 8]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    let mut i = 0;
+    while i < 8 {
+        let b = vals[i].to_le_bytes();
+        out[2 * i] = b[0];
+        out[2 * i + 1] = b[1];
+        i += 1;
+    }
+    out
+}
+
+#[inline(always)]
+fn finish_len_simd<D: SimdDescriptor>(
+    d: D,
+    olen: I32Vec<D>,
+    nbits: I32Vec<D>,
+    nbitsshift: I32Vec<D>,
+    sym_add: I32Vec<D>,
+    low_mask: jxl_simd::SimdMask<jxl_simd::W32, D>,
+) -> (I32Vec<D>, I32Vec<D>, I32Vec<D>) {
+    let one = I32Vec::splat(d, 1);
+    let bits = olen & (one.shl_vec(nbits) - one);
+    let sym = nbits.shl_vec(nbitsshift) + sym_add;
+    let shifted = olen
+        .bitcast::<u32>()
+        .shr_vec(nbits.bitcast::<u32>())
+        .bitcast::<i32>();
+    (sym + low_mask.if_then_else_zero(shifted), nbits, bits)
+}
+
+#[inline(always)]
+fn copy_len_to_sym_and_bits_simd<D: SimdDescriptor>(
+    d: D,
+    len: I32Vec<D>,
+) -> (I32Vec<D>, I32Vec<D>, I32Vec<D>) {
+    let one = I32Vec::splat(d, 1);
+    let less_134 = len.lt(I32Vec::splat(d, 134));
+    let nbitsoff = less_134.if_then_else(I32Vec::splat(d, 128), I32Vec::splat(d, 127));
+    let olen = len - less_134.if_then_else(I32Vec::splat(d, 6), I32Vec::splat(d, 70));
+    let addoff = less_134.if_then_else(I32Vec::splat(d, 4), I32Vec::splat(d, 12));
+    let exp = olen
+        .max(one)
+        .as_f32()
+        .bitcast::<u32>()
+        .shr::<23>()
+        .bitcast::<i32>();
+    let nbits = (!len.lt(I32Vec::splat(d, 10))).if_then_else_zero(exp - nbitsoff);
+    let (sym, nbits, bits) = finish_len_simd(
+        d,
+        olen,
         nbits,
-        bits,
-    )
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
-fn copy_len_to_sym_and_bits_simd(len: __m256i) -> (__m256i, __m256i, __m256i) {
-    let less_134 = _mm256_cmpgt_epi32(_mm256_set1_epi32(134), len);
-    let nbitsoff = _mm256_sub_epi32(_mm256_set1_epi32(127), less_134);
-    let offmask = _mm256_slli_epi32::<3>(less_134);
-    let olen = _mm256_sub_epi32(len, _mm256_andnot_si256(offmask, _mm256_set1_epi32(70)));
-    let addoff = _mm256_andnot_si256(offmask, _mm256_set1_epi32(12));
-    let nbits = _mm256_andnot_si256(
-        _mm256_cmpgt_epi32(_mm256_set1_epi32(10), len),
-        _mm256_subs_epi16(
-            _mm256_srli_epi32::<23>(_mm256_castps_si256(_mm256_cvtepi32_ps(olen))),
-            nbitsoff,
-        ),
+        less_134.if_then_else_zero(one),
+        addoff,
+        less_134,
     );
-    let (sym, nbits, bits) =
-        finish_len_simd(olen, nbits, _mm256_abs_epi32(less_134), addoff, less_134);
-    let thresh = _mm256_set1_epi32(2118);
-    let lt = _mm256_cmpgt_epi32(thresh, len);
+    let thresh = I32Vec::splat(d, 2118);
+    let lt = len.lt(thresh);
     (
-        _mm256_blendv_epi8(_mm256_set1_epi32(23), sym, lt),
-        _mm256_blendv_epi8(_mm256_set1_epi32(24), nbits, lt),
-        _mm256_blendv_epi8(_mm256_sub_epi32(len, thresh), bits, lt),
+        lt.if_then_else(sym, I32Vec::splat(d, 23)),
+        lt.if_then_else(nbits, I32Vec::splat(d, 24)),
+        lt.if_then_else(bits, len - thresh),
     )
 }
 
-#[cfg(target_arch = "x86_64")]
-#[inline]
-#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
-fn insert_len_to_sym_and_bits_simd(len: __m256i) -> (__m256i, __m256i, __m256i) {
-    let gt5 = _mm256_cmpgt_epi32(len, _mm256_set1_epi32(5));
-    let lt130 = _mm256_cmpgt_epi32(_mm256_set1_epi32(130), len);
-    let lt2114 = _mm256_cmpgt_epi32(_mm256_set1_epi32(2114), len);
-    let neg_num_lt = _mm256_add_epi32(
-        _mm256_add_epi32(lt130, lt2114),
-        _mm256_add_epi32(
-            _mm256_cmpgt_epi32(_mm256_set1_epi32(6210), len),
-            _mm256_cmpgt_epi32(_mm256_set1_epi32(22594), len),
-        ),
+#[inline(always)]
+fn insert_len_to_sym_and_bits_simd<D: SimdDescriptor>(
+    d: D,
+    len: I32Vec<D>,
+) -> (I32Vec<D>, I32Vec<D>, I32Vec<D>) {
+    let one = I32Vec::splat(d, 1);
+    let gt5 = len.gt(I32Vec::splat(d, 5));
+    let lt130 = len.lt(I32Vec::splat(d, 130));
+    let lt2114 = len.lt(I32Vec::splat(d, 2114));
+    let lt6210 = len.lt(I32Vec::splat(d, 6210));
+    let lt22594 = len.lt(I32Vec::splat(d, 22594));
+    let num_lt = (lt130.if_then_else_zero(one) + lt2114.if_then_else_zero(one))
+        + (lt6210.if_then_else_zero(one) + lt22594.if_then_else_zero(one));
+    let idx = num_lt * I32Vec::splat(d, 0x202) + I32Vec::splat(d, 0x302);
+    let offset_tbl = splat_128_u8(
+        d,
+        &const { u16x8_to_le_bytes([0, 22594, 6210, 2114, 66, 2, 0, 0]) },
     );
-    let idx = _mm256_add_epi32(
-        _mm256_mullo_epi32(_mm256_set1_epi32(-0x202), neg_num_lt),
-        _mm256_set1_epi32(0x302),
-    );
-    let offset_tbl = _mm256_broadcastsi128_si256(_mm_setr_epi16(0, 22594, 6210, 2114, 66, 2, 0, 0));
-    let nbitsoff_tbl = _mm256_broadcastsi128_si256(_mm_setr_epi16(0, 25, 15, 13, 1, 0, 0, 0));
-    let addoff_tbl = _mm256_broadcastsi128_si256(_mm_setr_epi16(0, 0, 9, 10, 11, 3, 0, 0));
+    let nbitsoff_tbl = splat_128_u8(d, &const { u16x8_to_le_bytes([0, 25, 15, 13, 1, 0, 0, 0]) });
+    let addoff_tbl = splat_128_u8(d, &const { u16x8_to_le_bytes([0, 0, 9, 10, 11, 3, 0, 0]) });
 
-    let olen = _mm256_sub_epi32(len, _mm256_shuffle_epi8(offset_tbl, idx));
-    let nbitsoff = _mm256_add_epi32(_mm256_shuffle_epi8(nbitsoff_tbl, idx), gt5);
-    let nbitsadd = _mm256_sub_epi32(_mm256_shuffle_epi8(addoff_tbl, idx), _mm256_set1_epi32(1));
-    let nbits = _mm256_add_epi32(
-        _mm256_and_si256(
-            _mm256_and_si256(gt5, lt2114),
-            _mm256_subs_epi16(
-                _mm256_srli_epi32::<23>(_mm256_castps_si256(_mm256_cvtepi32_ps(olen))),
-                _mm256_set1_epi32(127),
-            ),
-        ),
-        nbitsoff,
-    );
-    finish_len_simd(olen, nbits, _mm256_abs_epi32(lt130), nbitsadd, lt130)
+    let idx_u8 = idx.bitcast::<u8>();
+    let olen = len
+        - offset_tbl
+            .table_lookup_bytes_or_zero(idx_u8)
+            .bitcast::<i32>();
+    let nbitsoff = nbitsoff_tbl
+        .table_lookup_bytes_or_zero(idx_u8)
+        .bitcast::<i32>()
+        + gt5.if_then_else_zero(I32Vec::splat(d, -1));
+    let nbitsadd = addoff_tbl
+        .table_lookup_bytes_or_zero(idx_u8)
+        .bitcast::<i32>()
+        - one;
+    let exp = olen
+        .max(one)
+        .as_f32()
+        .bitcast::<u32>()
+        .shr::<23>()
+        .bitcast::<i32>();
+    let nbits = (gt5 & lt2114).if_then_else_zero(exp - I32Vec::splat(d, 127)) + nbitsoff;
+    finish_len_simd(
+        d,
+        olen,
+        nbits,
+        lt130.if_then_else_zero(one),
+        nbitsadd,
+        lt130,
+    )
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[derive(Default)]
 pub(crate) struct IcdBatchBufs {
     pub iac_bits: [u64; 8],
@@ -524,396 +551,152 @@ pub(crate) struct IcdBatchBufs {
     pub dist_sym: [u32; 8],
 }
 
-#[cfg(target_arch = "x86_64")]
-#[inline]
-#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
-fn halves(v: __m256i) -> [__m128i; 2] {
-    [_mm256_castsi256_si128(v), _mm256_extracti128_si256::<1>(v)]
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
-pub(crate) fn insert_copy_len_to_sym_and_bits_simd<const TWO_DIST_CTX: bool>(
+#[inline(always)]
+pub(crate) fn insert_copy_len_to_sym_and_bits_simd<D: SimdDescriptor, const TWO_DIST_CTX: bool>(
+    d: D,
     insert: &[u32; 8],
     copy: &[u32; 8],
     bufs: &mut IcdBatchBufs,
 ) {
-    let (insert_code, insert_nbits, insert_bits) =
-        insert_len_to_sym_and_bits_simd(_mm256_loadu_si256(insert));
-    let copy_len = _mm256_loadu_si256(copy);
-    if TWO_DIST_CTX {
-        let ctx = _mm256_srli_epi32::<31>(_mm256_cmpgt_epi32(copy_len, _mm256_set1_epi32(4)));
-        _mm256_storeu_si256(&mut bufs.dist_ctx, ctx);
-    }
+    let d = d.maybe_downgrade_256bit();
+    let step = U32Vec::<D::Descriptor256>::LEN;
+    let table = splat_128_u8(d, &[0, 2, 3, 6, 0, 4, 5, 8, 0, 7, 9, 10, 0, 0, 0, 0]);
+    let mask7 = U32Vec::splat(d, 0x7);
+    let one = U32Vec::splat(d, 1);
 
-    let (copy_code, _, copy_bits) = copy_len_to_sym_and_bits_simd(copy_len);
-    let (cb_h, inb_h, ib_h) = (halves(copy_bits), halves(insert_nbits), halves(insert_bits));
-    for (h, dst) in bufs.iac_bits.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-        let packed = _mm256_or_si256(
-            _mm256_sllv_epi64(
-                _mm256_cvtepu32_epi64(cb_h[h]),
-                _mm256_cvtepu32_epi64(inb_h[h]),
-            ),
-            _mm256_cvtepu32_epi64(ib_h[h]),
+    for (h, (ins_c, copy_c)) in insert
+        .chunks_exact(step)
+        .zip(copy.chunks_exact(step))
+        .enumerate()
+    {
+        let base = h * step;
+        let ins_v = U32Vec::load(d, ins_c).bitcast::<i32>();
+        let copy_v = U32Vec::load(d, copy_c).bitcast::<i32>();
+        if TWO_DIST_CTX {
+            let ctx = copy_v
+                .gt(I32Vec::splat(d, 4))
+                .if_then_else_zero(I32Vec::splat(d, 1))
+                .bitcast::<u32>();
+            ctx.store(&mut bufs.dist_ctx[base..]);
+        }
+        let (ic, inb, ib) = insert_len_to_sym_and_bits_simd(d, ins_v);
+        let (cc, _, cb) = copy_len_to_sym_and_bits_simd(d, copy_v);
+        let (cb_u, inb_u, ib_u) = (
+            cb.bitcast::<u32>(),
+            inb.bitcast::<u32>(),
+            ib.bitcast::<u32>(),
         );
-        _mm256_storeu_si256(dst, packed);
-    }
+        let lo =
+            cb_u.promote_lo::<u64>().shl_vec(inb_u.promote_lo::<u64>()) | ib_u.promote_lo::<u64>();
+        let hi =
+            cb_u.promote_hi::<u64>().shl_vec(inb_u.promote_hi::<u64>()) | ib_u.promote_hi::<u64>();
+        lo.store(&mut bufs.iac_bits[base..]);
+        hi.store(&mut bufs.iac_bits[base + step / 2..]);
 
-    let mask = _mm256_set1_epi32(0x7);
-    let bits64 = _mm256_or_si256(
-        _mm256_and_si256(copy_code, mask),
-        _mm256_slli_epi32::<3>(_mm256_and_si256(insert_code, mask)),
-    );
-    let table = _mm256_broadcastsi128_si256(_mm_setr_epi8(
-        0, 2, 3, 6, 0, 4, 5, 8, 0, 7, 9, 10, 0, 0, 0, 0,
-    ));
-    let idx = _mm256_or_si256(
-        _mm256_add_epi32(_mm256_set1_epi32(1), _mm256_srli_epi32::<3>(copy_code)),
-        _mm256_slli_epi32::<2>(_mm256_srli_epi32::<3>(insert_code)),
-    );
-    let offset = _mm256_slli_epi32::<6>(_mm256_shuffle_epi8(table, idx));
-    _mm256_storeu_si256(&mut bufs.iac_sym, _mm256_or_si256(bits64, offset));
+        let (ic_u, cc_u) = (ic.bitcast::<u32>(), cc.bitcast::<u32>());
+        let bits64 = (cc_u & mask7) | (ic_u & mask7).shl::<3>();
+        let idx = (one + cc_u.shr::<3>()) | ic_u.shr::<3>().shl::<2>();
+        let offset = table
+            .table_lookup_bytes_or_zero(idx.bitcast::<u8>())
+            .bitcast::<u32>()
+            .shl::<6>();
+        (bits64 | offset).store(&mut bufs.iac_sym[base..]);
+    }
 }
 
-#[cfg(target_arch = "x86_64")]
-#[inline]
-#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
-pub(crate) fn distance_to_sym_and_bits_simd(
-    [d0, d1, d2, d3]: [__m256i; 4],
-    raw: __m256i,
+#[inline(always)]
+pub(crate) fn distance_to_sym_and_bits_chunk<D: SimdDescriptor>(
+    d: D,
+    [d0, d1, d2, d3]: [U32Vec<D>; 4],
+    raw: U32Vec<D>,
     npostfix: u8,
     ndirect: u8,
-    bufs: &mut IcdBatchBufs,
+    sym_out: &mut [u32],
+    bits_out: &mut [u32],
 ) {
-    let is_dict = _mm256_srai_epi32::<31>(raw);
-    let (zero, one, two) = (
-        _mm256_setzero_si256(),
-        _mm256_set1_epi32(1),
-        _mm256_set1_epi32(2),
+    let raw_i = raw.bitcast::<i32>();
+    let is_dict = raw_i.lt_zero();
+    let (zero, one, two) = (I32Vec::zero(d), I32Vec::splat(d, 1), I32Vec::splat(d, 2));
+    let (d0, d1, d2, d3) = (
+        d0.bitcast::<i32>(),
+        d1.bitcast::<i32>(),
+        d2.bitcast::<i32>(),
+        d3.bitcast::<i32>(),
     );
-    let distance = _mm256_max_epi32(_mm256_and_si256(raw, _mm256_set1_epi32(0x7FFF_FFFF)), one);
+    let distance = (raw_i & I32Vec::splat(d, 0x7FFF_FFFF)).max(one);
 
-    let ndirect_p1 = _mm256_set1_epi32(ndirect as i32 + 1);
-    let is_direct = _mm256_cmpgt_epi32(ndirect_p1, distance);
-    let direct_code = _mm256_add_epi32(distance, _mm256_set1_epi32(15));
+    let ndirect_p1 = I32Vec::splat(d, ndirect as i32 + 1);
+    let is_direct = distance.lt(ndirect_p1);
+    let direct_code = distance + I32Vec::splat(d, 15);
 
-    let d_minus = _mm256_max_epi32(_mm256_sub_epi32(distance, ndirect_p1), zero);
-    let v_npostfix = _mm256_set1_epi32(npostfix as i32);
-    let postfix = _mm256_and_si256(d_minus, _mm256_set1_epi32((1i32 << npostfix) - 1));
-    let u = _mm256_add_epi32(_mm256_srlv_epi32(d_minus, v_npostfix), _mm256_set1_epi32(4));
-    // Masking low 7 bits for `u >= 128` keeps `<= 24` significant bits so `_mm256_cvtepi32_ps`
+    let d_minus = (distance - ndirect_p1).max(zero);
+    let v_npostfix = U32Vec::splat(d, npostfix as u32);
+    let postfix = d_minus & I32Vec::splat(d, (1i32 << npostfix) - 1);
+    let u = d_minus
+        .bitcast::<u32>()
+        .shr_vec(v_npostfix)
+        .bitcast::<i32>()
+        + I32Vec::splat(d, 4);
+    // Masking low 7 bits for `u >= 128` keeps `<= 24` significant bits so `as_f32`
     // never rounds across a power of two for any `4 <= u < 2^31`.
-    let mask_low = _mm256_and_si256(
-        _mm256_cmpgt_epi32(u, _mm256_set1_epi32(127)),
-        _mm256_set1_epi32(0x7F),
-    );
-    let float_u = _mm256_castps_si256(_mm256_cvtepi32_ps(_mm256_andnot_si256(mask_low, u)));
-    let nbits = _mm256_sub_epi32(_mm256_srli_epi32::<23>(float_u), _mm256_set1_epi32(128));
-    let hcode = _mm256_and_si256(one, _mm256_srlv_epi32(u, nbits));
-    let raw_bits = _mm256_sub_epi32(u, _mm256_sllv_epi32(_mm256_add_epi32(two, hcode), nbits));
-    let prefix_idx = _mm256_add_epi32(_mm256_slli_epi32::<1>(nbits), _mm256_sub_epi32(hcode, two));
-    let raw_code = _mm256_add_epi32(
-        _mm256_add_epi32(_mm256_set1_epi32(16 + ndirect as i32), postfix),
-        _mm256_sllv_epi32(prefix_idx, v_npostfix),
-    );
+    let mask_low = u
+        .gt(I32Vec::splat(d, 127))
+        .if_then_else_zero(I32Vec::splat(d, 0x7F));
+    let float_u = mask_low.andnot(u).as_f32().bitcast::<u32>();
+    let nbits = float_u.shr::<23>().bitcast::<i32>() - I32Vec::splat(d, 128);
+    let hcode = one
+        & u.bitcast::<u32>()
+            .shr_vec(nbits.bitcast::<u32>())
+            .bitcast::<i32>();
+    let raw_bits = u - (two + hcode).shl_vec(nbits);
+    let prefix_idx = nbits.shl::<1>() + (hcode - two);
+    let raw_code = (I32Vec::splat(d, 16 + ndirect as i32) + postfix)
+        + prefix_idx.shl_vec(v_npostfix.bitcast::<i32>());
 
-    let non_cache_code = _mm256_blendv_epi8(raw_code, direct_code, is_direct);
-    let non_cache_bits = _mm256_andnot_si256(is_direct, raw_bits);
+    let non_cache_code = is_direct.if_then_else(direct_code, raw_code);
+    let non_cache_bits = is_direct.if_then_zero_else(raw_bits);
 
     // Lookup table from `(distance - d_k) + 4` in `1..=7` (`-3..=+3`) to short code:
     // upper nibble = `d0` `[8, 6, 4, 0, 5, 7, 9]`, lower nibble = `d1` `[14, 12, 10, 1, 11, 13, 15]`.
-    let lut = _mm256_broadcastsi128_si256(_mm_loadu_si128(&[
-        0x00u8, 0x8e, 0x6c, 0x4a, 0x01, 0x5b, 0x7d, 0x9f, 0, 0, 0, 0, 0, 0, 0, 0,
-    ]));
-    let (four, eight) = (_mm256_set1_epi32(4), _mm256_set1_epi32(8));
-    let diff0 = _mm256_add_epi32(_mm256_sub_epi32(distance, d0), four);
-    let diff1 = _mm256_add_epi32(_mm256_sub_epi32(distance, d1), four);
-    let near0 = _mm256_and_si256(
-        _mm256_cmpgt_epi32(diff0, zero),
-        _mm256_cmpgt_epi32(eight, diff0),
+    let lut = splat_128_u8(
+        d,
+        &[
+            0x00u8, 0x8e, 0x6c, 0x4a, 0x01, 0x5b, 0x7d, 0x9f, 0, 0, 0, 0, 0, 0, 0, 0,
+        ],
     );
-    let near1 = _mm256_and_si256(
-        _mm256_cmpgt_epi32(diff1, zero),
-        _mm256_cmpgt_epi32(eight, diff1),
-    );
-    let eq0 = _mm256_cmpeq_epi32(distance, d0);
-    let eq1 = _mm256_cmpeq_epi32(distance, d1);
-    let eq2 = _mm256_cmpeq_epi32(distance, d2);
-    let eq3 = _mm256_cmpeq_epi32(distance, d3);
+    let (four, eight) = (I32Vec::splat(d, 4), I32Vec::splat(d, 8));
+    let diff0 = (distance - d0) + four;
+    let diff1 = (distance - d1) + four;
+    let near0 = diff0.gt(zero) & diff0.lt(eight);
+    let near1 = diff1.gt(zero) & diff1.lt(eight);
+    let eq0 = distance.eq(d0);
+    let eq1 = distance.eq(d1);
+    let eq2 = distance.eq(d2);
+    let eq3 = distance.eq(d3);
 
     // Ascending priority (`near1 < near0 < eq3 < eq2 < eq1 < eq0`) matches scalar tie-breaking.
-    let s1 = _mm256_and_si256(_mm256_set1_epi32(0x0F), _mm256_shuffle_epi8(lut, diff1));
-    let s0 = _mm256_srli_epi32::<4>(_mm256_shuffle_epi8(lut, diff0));
-    let mut code = _mm256_blendv_epi8(non_cache_code, s1, near1);
-    code = _mm256_blendv_epi8(code, s0, near0);
-    code = _mm256_blendv_epi8(code, _mm256_set1_epi32(3), eq3);
-    code = _mm256_blendv_epi8(code, two, eq2);
-    code = _mm256_blendv_epi8(code, one, eq1);
-    code = _mm256_blendv_epi8(code, zero, eq0);
-    code = _mm256_blendv_epi8(code, non_cache_code, is_dict);
+    let s1 = I32Vec::splat(d, 0x0F)
+        & lut
+            .table_lookup_bytes_or_zero(diff1.bitcast::<u8>())
+            .bitcast::<i32>();
+    let s0 = lut
+        .table_lookup_bytes_or_zero(diff0.bitcast::<u8>())
+        .bitcast::<u32>()
+        .shr::<4>()
+        .bitcast::<i32>();
+    let mut code = near1.if_then_else(s1, non_cache_code);
+    code = near0.if_then_else(s0, code);
+    code = eq3.if_then_else(I32Vec::splat(d, 3), code);
+    code = eq2.if_then_else(two, code);
+    code = eq1.if_then_else(one, code);
+    code = eq0.if_then_else(zero, code);
+    code = is_dict.if_then_else(non_cache_code, code);
 
-    let any_short = _mm256_andnot_si256(
-        is_dict,
-        _mm256_or_si256(_mm256_or_si256(near0, near1), _mm256_or_si256(eq2, eq3)),
-    );
-    let bits = _mm256_andnot_si256(any_short, non_cache_bits);
+    let any_short = is_dict.andnot((near0 | near1) | (eq2 | eq3));
+    let bits = any_short.if_then_zero_else(non_cache_bits);
 
-    _mm256_storeu_si256(&mut bufs.dist_sym, code);
-    _mm256_storeu_si256(&mut bufs.dist_bits, bits);
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline]
-#[target_feature(enable = "neon")]
-fn finish_len_neon(
-    olen: int32x4_t,
-    nbits: int32x4_t,
-    nbitsshift: int32x4_t,
-    sym_add: int32x4_t,
-    low_mask: uint32x4_t,
-) -> (int32x4_t, int32x4_t, int32x4_t) {
-    let one = vdupq_n_s32(1);
-    let bits = vandq_s32(olen, vsubq_s32(vshlq_s32(one, nbits), one));
-    let sym = vaddq_s32(vshlq_s32(nbits, nbitsshift), sym_add);
-    let shifted = vreinterpretq_s32_u32(vshlq_u32(vreinterpretq_u32_s32(olen), vnegq_s32(nbits)));
-    (
-        vaddq_s32(sym, vandq_s32(vreinterpretq_s32_u32(low_mask), shifted)),
-        nbits,
-        bits,
-    )
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline]
-#[target_feature(enable = "neon")]
-fn copy_len_to_sym_and_bits_neon(len: int32x4_t) -> (int32x4_t, int32x4_t, int32x4_t) {
-    let less_134_u = vcltq_s32(len, vdupq_n_s32(134));
-    let less_134 = vreinterpretq_s32_u32(less_134_u);
-    let offmask = vshlq_n_s32::<3>(less_134);
-    let olen = vsubq_s32(len, vbicq_s32(vdupq_n_s32(70), offmask));
-    let addoff = vbicq_s32(vdupq_n_s32(12), offmask);
-    let pos_olen = vreinterpretq_u32_s32(vmaxq_s32(olen, vdupq_n_s32(1)));
-    let clz_nb = vsubq_s32(
-        vaddq_s32(vdupq_n_s32(31), less_134),
-        vreinterpretq_s32_u32(vclzq_u32(pos_olen)),
-    );
-    let nbits = vbicq_s32(
-        clz_nb,
-        vreinterpretq_s32_u32(vcltq_s32(len, vdupq_n_s32(10))),
-    );
-    let (sym, nbits, bits) = finish_len_neon(olen, nbits, vabsq_s32(less_134), addoff, less_134_u);
-    let thresh = vdupq_n_s32(2118);
-    let lt = vcltq_s32(len, thresh);
-    (
-        vbslq_s32(lt, sym, vdupq_n_s32(23)),
-        vbslq_s32(lt, nbits, vdupq_n_s32(24)),
-        vbslq_s32(lt, bits, vsubq_s32(len, thresh)),
-    )
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline]
-#[target_feature(enable = "neon")]
-fn insert_len_to_sym_and_bits_neon(len: int32x4_t) -> (int32x4_t, int32x4_t, int32x4_t) {
-    let gt5_u = vcgtq_s32(len, vdupq_n_s32(5));
-    let lt130_u = vcltq_s32(len, vdupq_n_s32(130));
-    let lt2114_u = vcltq_s32(len, vdupq_n_s32(2114));
-    let lt6210 = vreinterpretq_s32_u32(vcltq_s32(len, vdupq_n_s32(6210)));
-    let lt22594 = vreinterpretq_s32_u32(vcltq_s32(len, vdupq_n_s32(22594)));
-    let (gt5, lt130, lt2114) = (
-        vreinterpretq_s32_u32(gt5_u),
-        vreinterpretq_s32_u32(lt130_u),
-        vreinterpretq_s32_u32(lt2114_u),
-    );
-    let neg_num_lt = vaddq_s32(vaddq_s32(lt130, lt2114), vaddq_s32(lt6210, lt22594));
-    let idx = vreinterpretq_u8_s32(vaddq_s32(
-        vmulq_n_s32(neg_num_lt, -0x202),
-        vdupq_n_s32(0x302),
-    ));
-    let tbl_u16 = |arr: &[u16; 8]| vreinterpretq_u8_u16(vld1q_u16(arr));
-    let offset_tbl = tbl_u16(&[0, 22594, 6210, 2114, 66, 2, 0, 0]);
-    let nbitsoff_tbl = tbl_u16(&[0, 25, 15, 13, 1, 0, 0, 0]);
-    let addoff_tbl = tbl_u16(&[0, 0, 9, 10, 11, 3, 0, 0]);
-    let shuf_s32 = |tbl| vreinterpretq_s32_u8(vqtbl1q_u8(tbl, idx));
-
-    let olen = vsubq_s32(len, shuf_s32(offset_tbl));
-    let nbitsoff = vaddq_s32(shuf_s32(nbitsoff_tbl), gt5);
-    let nbitsadd = vsubq_s32(shuf_s32(addoff_tbl), vdupq_n_s32(1));
-    let pos_olen = vreinterpretq_u32_s32(vmaxq_s32(olen, vdupq_n_s32(1)));
-    let clz_nb = vsubq_s32(vdupq_n_s32(31), vreinterpretq_s32_u32(vclzq_u32(pos_olen)));
-    let nbits = vaddq_s32(vandq_s32(vandq_s32(gt5, lt2114), clz_nb), nbitsoff);
-    finish_len_neon(olen, nbits, vabsq_s32(lt130), nbitsadd, lt130_u)
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline]
-#[target_feature(enable = "neon")]
-pub(crate) fn insert_copy_len_to_sym_and_bits_simd<const TWO_DIST_CTX: bool>(
-    insert: &[u32; 8],
-    copy: &[u32; 8],
-    bufs: &mut IcdBatchBufs,
-) {
-    let table = vld1q_u8(&[0, 2, 3, 6, 0, 4, 5, 8, 0, 7, 9, 10, 0, 0, 0, 0]);
-    let mask7 = vdupq_n_u32(0x7);
-    let one = vdupq_n_u32(1);
-    let (ins_chunks, copy_chunks) = (insert.as_chunks::<4>().0, copy.as_chunks::<4>().0);
-    let ctx_chunks = bufs.dist_ctx.as_chunks_mut::<4>().0;
-    let sym_chunks = bufs.iac_sym.as_chunks_mut::<4>().0;
-    let bits_chunks = bufs.iac_bits.as_chunks_mut::<2>().0;
-
-    for h in 0..2 {
-        let (ins_v, copy_v) = (
-            vreinterpretq_s32_u32(vld1q_u32(&ins_chunks[h])),
-            vreinterpretq_s32_u32(vld1q_u32(&copy_chunks[h])),
-        );
-        if TWO_DIST_CTX {
-            let ctx = vshrq_n_u32::<31>(vcgtq_s32(copy_v, vdupq_n_s32(4)));
-            vst1q_u32(&mut ctx_chunks[h], ctx);
-        }
-        let (ic, inb, ib) = insert_len_to_sym_and_bits_neon(ins_v);
-        let (cc, _, cb) = copy_len_to_sym_and_bits_neon(copy_v);
-        let (cb_u, inb_u, ib_u) = (
-            vreinterpretq_u32_s32(cb),
-            vreinterpretq_u32_s32(inb),
-            vreinterpretq_u32_s32(ib),
-        );
-        let lo = vorrq_u64(
-            vshlq_u64(
-                vmovl_u32(vget_low_u32(cb_u)),
-                vreinterpretq_s64_u64(vmovl_u32(vget_low_u32(inb_u))),
-            ),
-            vmovl_u32(vget_low_u32(ib_u)),
-        );
-        let hi = vorrq_u64(
-            vshlq_u64(
-                vmovl_high_u32(cb_u),
-                vreinterpretq_s64_u64(vmovl_high_u32(inb_u)),
-            ),
-            vmovl_high_u32(ib_u),
-        );
-        vst1q_u64(&mut bits_chunks[h * 2], lo);
-        vst1q_u64(&mut bits_chunks[h * 2 + 1], hi);
-
-        let (ic_u, cc_u) = (vreinterpretq_u32_s32(ic), vreinterpretq_u32_s32(cc));
-        let bits64 = vorrq_u32(
-            vandq_u32(cc_u, mask7),
-            vshlq_n_u32::<3>(vandq_u32(ic_u, mask7)),
-        );
-        let idx = vorrq_u32(
-            vaddq_u32(one, vshrq_n_u32::<3>(cc_u)),
-            vshlq_n_u32::<2>(vshrq_n_u32::<3>(ic_u)),
-        );
-        let offset = vshlq_n_u32::<6>(vreinterpretq_u32_u8(vqtbl1q_u8(
-            table,
-            vreinterpretq_u8_u32(idx),
-        )));
-        vst1q_u32(&mut sym_chunks[h], vorrq_u32(bits64, offset));
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline]
-#[target_feature(enable = "neon")]
-fn distance_to_sym_and_bits_neon_quad(
-    [d0, d1, d2, d3]: [int32x4_t; 4],
-    raw: int32x4_t,
-    npostfix: u8,
-    ndirect: u8,
-    lut: uint8x16_t,
-) -> (int32x4_t, int32x4_t) {
-    let is_dict = vcltq_s32(raw, vdupq_n_s32(0));
-    let (zero, one, two) = (vdupq_n_s32(0), vdupq_n_s32(1), vdupq_n_s32(2));
-    let distance = vmaxq_s32(vandq_s32(raw, vdupq_n_s32(0x7FFF_FFFF)), one);
-
-    let ndirect_p1 = vdupq_n_s32(ndirect as i32 + 1);
-    let is_direct = vcgtq_s32(ndirect_p1, distance);
-    let direct_code = vaddq_s32(distance, vdupq_n_s32(15));
-
-    let d_minus = vmaxq_s32(vsubq_s32(distance, ndirect_p1), zero);
-    let v_npostfix = vdupq_n_s32(npostfix as i32);
-    let postfix = vandq_s32(d_minus, vdupq_n_s32((1i32 << npostfix) - 1));
-    let u = vaddq_s32(
-        vreinterpretq_s32_u32(vshlq_u32(
-            vreinterpretq_u32_s32(d_minus),
-            vnegq_s32(v_npostfix),
-        )),
-        vdupq_n_s32(4),
-    );
-    let nbits = vsubq_s32(
-        vdupq_n_s32(30),
-        vreinterpretq_s32_u32(vclzq_u32(vreinterpretq_u32_s32(u))),
-    );
-    let hcode = vandq_s32(
-        one,
-        vreinterpretq_s32_u32(vshlq_u32(vreinterpretq_u32_s32(u), vnegq_s32(nbits))),
-    );
-    let raw_bits = vsubq_s32(u, vshlq_s32(vaddq_s32(two, hcode), nbits));
-    let prefix_idx = vaddq_s32(vshlq_n_s32::<1>(nbits), vsubq_s32(hcode, two));
-    let raw_code = vaddq_s32(
-        vaddq_s32(vdupq_n_s32(16 + ndirect as i32), postfix),
-        vshlq_s32(prefix_idx, v_npostfix),
-    );
-
-    let non_cache_code = vbslq_s32(is_direct, direct_code, raw_code);
-    let non_cache_bits =
-        vreinterpretq_s32_u32(vbicq_u32(vreinterpretq_u32_s32(raw_bits), is_direct));
-
-    let (four, eight) = (vdupq_n_s32(4), vdupq_n_s32(8));
-    let diff0 = vaddq_s32(vsubq_s32(distance, d0), four);
-    let diff1 = vaddq_s32(vsubq_s32(distance, d1), four);
-    let near0 = vandq_u32(vcgtq_s32(diff0, zero), vcgtq_s32(eight, diff0));
-    let near1 = vandq_u32(vcgtq_s32(diff1, zero), vcgtq_s32(eight, diff1));
-    let eq0 = vceqq_s32(distance, d0);
-    let eq1 = vceqq_s32(distance, d1);
-    let eq2 = vceqq_s32(distance, d2);
-    let eq3 = vceqq_s32(distance, d3);
-
-    let tbl_s32 = |d: int32x4_t| vreinterpretq_s32_u8(vqtbl1q_u8(lut, vreinterpretq_u8_s32(d)));
-    let s1 = vandq_s32(vdupq_n_s32(0x0F), tbl_s32(diff1));
-    let s0 = vreinterpretq_s32_u32(vshrq_n_u32::<4>(vreinterpretq_u32_s32(tbl_s32(diff0))));
-    let mut code = vbslq_s32(near1, s1, non_cache_code);
-    code = vbslq_s32(near0, s0, code);
-    code = vbslq_s32(eq3, vdupq_n_s32(3), code);
-    code = vbslq_s32(eq2, two, code);
-    code = vbslq_s32(eq1, one, code);
-    code = vbslq_s32(eq0, zero, code);
-    code = vbslq_s32(is_dict, non_cache_code, code);
-
-    let any_short = vbicq_u32(
-        vorrq_u32(vorrq_u32(near0, near1), vorrq_u32(eq2, eq3)),
-        is_dict,
-    );
-    let bits = vreinterpretq_s32_u32(vbicq_u32(vreinterpretq_u32_s32(non_cache_bits), any_short));
-    (code, bits)
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline]
-#[target_feature(enable = "neon")]
-pub(crate) fn distance_to_sym_and_bits_simd(
-    [d0, d1, d2, d3]: [[int32x4_t; 2]; 4],
-    raw: [int32x4_t; 2],
-    npostfix: u8,
-    ndirect: u8,
-    bufs: &mut IcdBatchBufs,
-) {
-    let lut = vld1q_u8(&[
-        0x00u8, 0x8e, 0x6c, 0x4a, 0x01, 0x5b, 0x7d, 0x9f, 0, 0, 0, 0, 0, 0, 0, 0,
-    ]);
-    let sym_out = bufs.dist_sym.as_chunks_mut::<4>().0;
-    let bits_out = bufs.dist_bits.as_chunks_mut::<4>().0;
-    for h in 0..2 {
-        let (code, bits) = distance_to_sym_and_bits_neon_quad(
-            [d0[h], d1[h], d2[h], d3[h]],
-            raw[h],
-            npostfix,
-            ndirect,
-            lut,
-        );
-        vst1q_u32(&mut sym_out[h], vreinterpretq_u32_s32(code));
-        vst1q_u32(&mut bits_out[h], vreinterpretq_u32_s32(bits));
-    }
+    code.bitcast::<u32>().store(sym_out);
+    bits.bitcast::<u32>().store(bits_out);
 }
 
 /// Matches `d` (`1..=2^30`) against `ring` slots enabled in `valid_mask` (`bit k` = `ring[k]` valid).
@@ -944,91 +727,37 @@ pub(crate) fn match_short_dist_code(d: u32, ring: [u32; 4]) -> Option<u8> {
 }
 
 /// Unpacks 16 interleaved `(even, odd)` `HuffmanCodeEntry::to_u32()` lanes and packs them into
-/// 4 bounded `(nbits, bits)` quadwords (`16 -> 32 -> 64` AVX2 variable shifts).
-#[cfg(target_arch = "x86_64")]
-#[inline]
-#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
-pub(crate) fn pack_even_odd_16_avx2(
+/// 4 bounded `(nbits, bits)` quadwords (`16 -> 32 -> 64` variable shifts).
+#[inline(always)]
+pub(crate) fn pack_even_odd_16<D: SimdDescriptor>(
+    d: D,
     even: [u32; 8],
     odd: [u32; 8],
 ) -> ([BoundedUsize<64>; 4], [u64; 4]) {
-    let (h_even, h_odd) = (_mm256_loadu_si256(&even), _mm256_loadu_si256(&odd));
-    let mask16 = _mm256_set1_epi32(0x0000_FFFF);
-    let mask32 = _mm256_set1_epi64x(0x0000_0000_FFFF_FFFF);
-    let nbits = _mm256_or_si256(
-        _mm256_slli_epi32::<16>(h_odd),
-        _mm256_and_si256(mask16, h_even),
-    );
-    let bits = _mm256_or_si256(
-        _mm256_srli_epi32::<16>(h_even),
-        _mm256_andnot_si256(mask16, h_odd),
-    );
-
-    let nbits_lo = _mm256_and_si256(mask16, nbits);
-    let nbits32 = _mm256_add_epi32(_mm256_srli_epi32::<16>(nbits), nbits_lo);
-    let bits32 = _mm256_or_si256(
-        _mm256_and_si256(mask16, bits),
-        _mm256_sllv_epi32(_mm256_srli_epi32::<16>(bits), nbits_lo),
-    );
-
-    let nbits32_lo = _mm256_and_si256(mask32, nbits32);
-    let nbits64 = _mm256_add_epi64(_mm256_srli_epi64::<32>(nbits32), nbits32_lo);
-    let bits64 = _mm256_or_si256(
-        _mm256_and_si256(mask32, bits32),
-        _mm256_sllv_epi64(_mm256_srli_epi64::<32>(bits32), nbits32_lo),
-    );
-
+    let d = d.maybe_downgrade_256bit();
+    let step = U32Vec::<D::Descriptor256>::LEN;
+    let mask16 = U32Vec::splat(d, 0x0000_FFFF);
+    let mask32 = U64Vec::splat(d, 0x0000_0000_FFFF_FFFF);
     let (mut n, mut ba) = ([0u64; 4], [0u64; 4]);
-    _mm256_storeu_si256(&mut n, nbits64);
-    _mm256_storeu_si256(&mut ba, bits64);
-    let [n0, n1, n2, n3] = n;
-    (
-        [
-            bound64_from_u63(n0 as usize),
-            bound64_from_u63(n1 as usize),
-            bound64_from_u63(n2 as usize),
-            bound64_from_u63(n3 as usize),
-        ],
-        ba,
-    )
-}
+    for (h, (e_c, o_c)) in even
+        .chunks_exact(step)
+        .zip(odd.chunks_exact(step))
+        .enumerate()
+    {
+        let (h_even, h_odd) = (U32Vec::load(d, e_c), U32Vec::load(d, o_c));
+        let nbits = h_odd.shl::<16>() | (mask16 & h_even);
+        let bits = h_even.shr::<16>() | mask16.andnot(h_odd);
 
-#[cfg(target_arch = "aarch64")]
-#[inline]
-#[target_feature(enable = "neon")]
-pub(crate) fn pack_even_odd_16_neon(
-    even: [u32; 8],
-    odd: [u32; 8],
-) -> ([BoundedUsize<64>; 4], [u64; 4]) {
-    let mask16 = vdupq_n_u32(0x0000_FFFF);
-    let mask32 = vdupq_n_u64(0x0000_0000_FFFF_FFFF);
-    let (e_chunks, o_chunks) = (even.as_chunks::<4>().0, odd.as_chunks::<4>().0);
-    let (mut n, mut ba) = ([0u64; 4], [0u64; 4]);
-    let (n_chunks, b_chunks) = (n.as_chunks_mut::<2>().0, ba.as_chunks_mut::<2>().0);
-    for h in 0..2 {
-        let (h_even, h_odd) = (vld1q_u32(&e_chunks[h]), vld1q_u32(&o_chunks[h]));
-        let nbits = vorrq_u32(vshlq_n_u32::<16>(h_odd), vandq_u32(mask16, h_even));
-        let bits = vorrq_u32(vshrq_n_u32::<16>(h_even), vbicq_u32(h_odd, mask16));
+        let nbits_lo = mask16 & nbits;
+        let nbits32 = nbits.shr::<16>() + nbits_lo;
+        let bits32 = (mask16 & bits) | bits.shr::<16>().shl_vec(nbits_lo);
 
-        let nbits_lo = vandq_u32(mask16, nbits);
-        let nbits32 = vaddq_u32(vshrq_n_u32::<16>(nbits), nbits_lo);
-        let bits32 = vorrq_u32(
-            vandq_u32(mask16, bits),
-            vshlq_u32(vshrq_n_u32::<16>(bits), vreinterpretq_s32_u32(nbits_lo)),
-        );
-
-        let (nb32_64, b32_64) = (
-            vreinterpretq_u64_u32(nbits32),
-            vreinterpretq_u64_u32(bits32),
-        );
-        let nbits32_lo = vandq_u64(mask32, nb32_64);
-        let nbits64 = vaddq_u64(vshrq_n_u64::<32>(nb32_64), nbits32_lo);
-        let bits64 = vorrq_u64(
-            vandq_u64(mask32, b32_64),
-            vshlq_u64(vshrq_n_u64::<32>(b32_64), vreinterpretq_s64_u64(nbits32_lo)),
-        );
-        vst1q_u64(&mut n_chunks[h], nbits64);
-        vst1q_u64(&mut b_chunks[h], bits64);
+        let (nb32_64, b32_64) = (nbits32.bitcast::<u64>(), bits32.bitcast::<u64>());
+        let nbits32_lo = mask32 & nb32_64;
+        let nbits64 = nb32_64.shr::<32>() + nbits32_lo;
+        let bits64 = (mask32 & b32_64) | b32_64.shr::<32>().shl_vec(nbits32_lo);
+        nbits64.store(&mut n[h * (step / 2)..]);
+        bits64.store(&mut ba[h * (step / 2)..]);
     }
     let [n0, n1, n2, n3] = n;
     (
@@ -1165,7 +894,6 @@ macro_rules! with_detached {
         $body;
     }};
 }
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub(crate) use with_detached;
 
 #[inline(always)]
@@ -1182,7 +910,6 @@ fn emit_literals_scalar(
     }
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[cold]
 #[inline(never)]
 fn emit_literals_slow(
@@ -1193,139 +920,109 @@ fn emit_literals_slow(
     emit_literals_scalar(slice, lut, cur);
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-macro_rules! emit_literals_body {
-    ($slice:ident, $lut:ident, $cur:ident, $pack16:path) => {{
-        let mut local = $cur.detach();
-        let rem = if $slice.len() >= 16 {
-            let (chunks, rem) = $slice.as_chunks::<16>();
-            let Ok(mut batch) = local.try_batch_iter::<4, _>(chunks.iter()) else {
-                drop(local);
-                emit_literals_slow($slice, $lut, $cur);
-                return;
-            };
-            while let Some((c16, slot)) = batch.next_slot() {
-                let (na, ba) = $pack16(
-                    [
-                        $lut[c16[0] as usize].to_u32(),
-                        $lut[c16[2] as usize].to_u32(),
-                        $lut[c16[4] as usize].to_u32(),
-                        $lut[c16[6] as usize].to_u32(),
-                        $lut[c16[8] as usize].to_u32(),
-                        $lut[c16[10] as usize].to_u32(),
-                        $lut[c16[12] as usize].to_u32(),
-                        $lut[c16[14] as usize].to_u32(),
-                    ],
-                    [
-                        $lut[c16[1] as usize].to_u32(),
-                        $lut[c16[3] as usize].to_u32(),
-                        $lut[c16[5] as usize].to_u32(),
-                        $lut[c16[7] as usize].to_u32(),
-                        $lut[c16[9] as usize].to_u32(),
-                        $lut[c16[11] as usize].to_u32(),
-                        $lut[c16[13] as usize].to_u32(),
-                        $lut[c16[15] as usize].to_u32(),
-                    ],
-                );
-                slot.put::<4>(na, ba);
-            }
-            rem
-        } else {
-            $slice
+#[inline(always)]
+fn emit_literals_simd_core<D: SimdDescriptor>(
+    d: D,
+    slice: &[u8],
+    lut: &[HuffmanCodeEntry; 256],
+    cur: &mut BitStreamCursor<'_, '_>,
+) {
+    let mut local = cur.detach();
+    let rem = if slice.len() >= 16 {
+        let (chunks, rem) = slice.as_chunks::<16>();
+        let Ok(mut batch) = local.try_batch_iter::<4, _>(chunks.iter()) else {
+            drop(local);
+            emit_literals_slow(slice, lut, cur);
+            return;
         };
-        if !rem.is_empty() {
-            let Some(slot) = local.try_slot::<4>() else {
-                drop(local);
-                emit_literals_slow(rem, $lut, $cur);
-                return;
-            };
-            let (quads, tail) = rem.as_chunks::<4>();
-            let (nt, bt) = pack_lits_1_to_4_bounded(tail, $lut);
-            match quads {
-                [] => slot.put([nt], [bt]),
-                [q0] => {
-                    let (n0, b0) = pack_quad_bounded(q0, $lut);
-                    slot.put([n0, nt], [b0, bt]);
-                }
-                [q0, q1] => {
-                    let ((n0, b0), (n1, b1)) =
-                        (pack_quad_bounded(q0, $lut), pack_quad_bounded(q1, $lut));
-                    slot.put([n0, n1, nt], [b0, b1, bt]);
-                }
-                [q0, q1, q2, ..] => {
-                    let ((n0, b0), (n1, b1), (n2, b2)) = (
-                        pack_quad_bounded(q0, $lut),
-                        pack_quad_bounded(q1, $lut),
-                        pack_quad_bounded(q2, $lut),
-                    );
-                    slot.put([n0, n1, n2, nt], [b0, b1, b2, bt]);
-                }
+        while let Some((c16, slot)) = batch.next_slot() {
+            let (na, ba) = pack_even_odd_16(
+                d,
+                [
+                    lut[c16[0] as usize].to_u32(),
+                    lut[c16[2] as usize].to_u32(),
+                    lut[c16[4] as usize].to_u32(),
+                    lut[c16[6] as usize].to_u32(),
+                    lut[c16[8] as usize].to_u32(),
+                    lut[c16[10] as usize].to_u32(),
+                    lut[c16[12] as usize].to_u32(),
+                    lut[c16[14] as usize].to_u32(),
+                ],
+                [
+                    lut[c16[1] as usize].to_u32(),
+                    lut[c16[3] as usize].to_u32(),
+                    lut[c16[5] as usize].to_u32(),
+                    lut[c16[7] as usize].to_u32(),
+                    lut[c16[9] as usize].to_u32(),
+                    lut[c16[11] as usize].to_u32(),
+                    lut[c16[13] as usize].to_u32(),
+                    lut[c16[15] as usize].to_u32(),
+                ],
+            );
+            slot.put::<4>(na, ba);
+        }
+        rem
+    } else {
+        slice
+    };
+    if !rem.is_empty() {
+        let Some(slot) = local.try_slot::<4>() else {
+            drop(local);
+            emit_literals_slow(rem, lut, cur);
+            return;
+        };
+        let (quads, tail) = rem.as_chunks::<4>();
+        let (nt, bt) = pack_lits_1_to_4_bounded(tail, lut);
+        match quads {
+            [] => slot.put([nt], [bt]),
+            [q0] => {
+                let (n0, b0) = pack_quad_bounded(q0, lut);
+                slot.put([n0, nt], [b0, bt]);
+            }
+            [q0, q1] => {
+                let ((n0, b0), (n1, b1)) = (pack_quad_bounded(q0, lut), pack_quad_bounded(q1, lut));
+                slot.put([n0, n1, nt], [b0, b1, bt]);
+            }
+            [q0, q1, q2, ..] => {
+                let ((n0, b0), (n1, b1), (n2, b2)) = (
+                    pack_quad_bounded(q0, lut),
+                    pack_quad_bounded(q1, lut),
+                    pack_quad_bounded(q2, lut),
+                );
+                slot.put([n0, n1, n2, nt], [b0, b1, b2, bt]);
             }
         }
-    }};
-}
-
-#[cfg(target_arch = "x86_64")]
-#[simd_entry]
-#[inline]
-#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
-pub(crate) fn emit_literals_avx2(
-    slice: &[u8],
-    lut: &[HuffmanCodeEntry; 256],
-    cur: &mut BitStreamCursor<'_, '_>,
-    _tok: impl SimdToken,
-) {
-    emit_literals_body!(slice, lut, cur, pack_even_odd_16_avx2);
-}
-
-#[cfg(target_arch = "aarch64")]
-#[simd_entry]
-#[inline]
-#[target_feature(enable = "neon")]
-pub(crate) fn emit_literals_neon(
-    slice: &[u8],
-    lut: &[HuffmanCodeEntry; 256],
-    cur: &mut BitStreamCursor<'_, '_>,
-    _tok: impl SimdToken,
-) {
-    emit_literals_body!(slice, lut, cur, pack_even_odd_16_neon);
+    }
 }
 
 #[inline(always)]
-pub(crate) fn emit_literals_mode<S: SimdBackend, const DETACH: bool>(
-    simd: S,
+pub(crate) fn emit_literals_mode<D: SimdDescriptor, const DETACH: bool>(
+    d: D,
     slice: &[u8],
     lut: &[HuffmanCodeEntry; 256],
     cur: &mut BitStreamCursor<'_, '_>,
 ) {
-    dispatch_simd!(
-        simd,
-        S => x64: |tok| if DETACH {
-            with_detached!(cur, |d| emit_literals_avx2(slice, lut, &mut d, tok))
+    if D::IS_EMULATED {
+        if DETACH {
+            with_detached!(cur, |dc| emit_literals_scalar(slice, lut, &mut dc));
         } else {
-            emit_literals_avx2(slice, lut, cur, tok)
-        },
-        neon: |tok| if DETACH {
-            with_detached!(cur, |d| emit_literals_neon(slice, lut, &mut d, tok))
-        } else {
-            emit_literals_neon(slice, lut, cur, tok)
-        },
-        scalar: if DETACH {
-            with_detached!(cur, |d| emit_literals_scalar(slice, lut, &mut d))
-        } else {
-            emit_literals_scalar(slice, lut, cur)
-        },
-    );
+            emit_literals_scalar(slice, lut, cur);
+        }
+    } else if DETACH {
+        with_detached!(cur, |dc| emit_literals_simd_core(d, slice, lut, &mut dc));
+    } else {
+        emit_literals_simd_core(d, slice, lut, cur);
+    }
 }
 
 #[inline(always)]
-pub(crate) fn emit_literals<S: SimdBackend>(
-    simd: S,
+pub(crate) fn emit_literals<D: SimdDescriptor>(
+    d: D,
     slice: &[u8],
     lut: &[HuffmanCodeEntry; 256],
     cur: &mut BitStreamCursor<'_, '_>,
 ) {
-    emit_literals_mode::<S, false>(simd, slice, lut, cur);
+    emit_literals_mode::<D, false>(d, slice, lut, cur);
 }
 
 #[inline(always)]
@@ -1342,8 +1039,8 @@ pub(crate) fn emit_cmd_no_lits(
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn emit_cmd_and_lits<const DETACH: bool, const N: usize, S: SimdBackend>(
-    simd: S,
+pub(crate) fn emit_cmd_and_lits<const DETACH: bool, const N: usize, D: SimdDescriptor>(
+    d: D,
     cur: &mut BitStreamCursor<'_, '_>,
     prefix: &[u8],
     pfx: Option<BoundedPrefix<'_, u8, N>>,
@@ -1389,7 +1086,7 @@ pub(crate) fn emit_cmd_and_lits<const DETACH: bool, const N: usize, S: SimdBacke
     }
     if let Some(ls) = prefix.get(lit_start..lit_start + lit_len) {
         cur.put_bounded(iac_nb, iac_b);
-        emit_literals_mode::<S, DETACH>(simd, ls, lit_lut, cur);
+        emit_literals_mode::<D, DETACH>(d, ls, lit_lut, cur);
         if let Some((d_nb, d_b)) = opt_dist {
             cur.put_bounded(d_nb, d_b);
         }

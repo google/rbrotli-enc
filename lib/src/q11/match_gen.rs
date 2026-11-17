@@ -14,11 +14,7 @@
 
 //! Subquadratic $O(N \log N)$ Pareto-frontier match generator for `Q10`..=`Q12`.
 
-#[cfg(target_arch = "aarch64")]
-use crate::constants::A64Neon;
-#[cfg(target_arch = "x86_64")]
-use crate::constants::X64V3;
-use crate::constants::{try_simd, Scalar, SimdBackend, HASH_MUL32};
+use crate::constants::{with_simd_256, HASH_MUL32};
 use crate::hashtable::{
     common_prefix_at, common_prefix_len, common_suffix_len, find_closest_2b, hash5_p64,
     load_word64_padded, FastLdmSpan,
@@ -26,8 +22,7 @@ use crate::hashtable::{
 use crate::map_to_sym::copy_code_only;
 use crate::static_dict;
 use hugepage_buffer::HugePageBuf;
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-use simd_tokens::{simd_entry, SimdToken};
+use jxl_simd::SimdDescriptor;
 
 use super::ChunkEnv;
 
@@ -255,9 +250,9 @@ impl SparseLdm {
     }
 
     #[inline(always)]
-    fn scan_loop<S: SimdBackend>(
+    fn scan_loop<D: SimdDescriptor>(
         &mut self,
-        simd: S,
+        simd: D,
         env: ChunkEnv<'_>,
         (scan_start, capped_end, local_window_cap, do_probe): (usize, usize, usize, bool),
         out: &mut ChunkLdmMatches,
@@ -282,122 +277,114 @@ impl SparseLdm {
             if (h & sync_mask) != 0 {
                 continue;
             }
-            let mut step = |bkt: usize, is_12: bool| {
-                let skip = if is_12 { skip12 } else { skip6 };
-                if do_probe && p >= chunk_start && p >= skip {
-                    let (min_cand, local_p) = (p.saturating_sub(wsize), (p - chunk_start) as u32);
-                    let mut best_end = local_p;
-                    for cand_p1 in self.buckets[bkt] {
-                        if cand_p1 == 0 || (cand_p1 as usize - 1) < min_cand {
-                            break;
-                        }
-                        let cand = cand_p1 as usize - 1;
-                        if cand >= p || (cand >= buf_start && p - cand <= local_window_cap) {
-                            continue;
-                        }
-                        let dist = (p - cand) as u32;
-                        let eq = if is_12 {
-                            cand >= 11 && data[cand - 11..=cand] == data[p - 11..=p]
-                        } else {
-                            cand >= 5 && read_u48(data, cand - 5) == w6
-                        };
-                        if !eq
-                            || recent
-                                .iter()
-                                .any(|r| r.dist == dist && local_p >= r.start && local_p < r.end)
-                        {
-                            continue;
-                        }
-                        if !is_12 && best_end > local_p {
-                            let req_p = chunk_start + (best_end as usize);
-                            if req_p >= chunk_end {
+            macro_rules! step {
+                ($bkt:expr, $is_12:expr) => {{
+                    let (bkt, is_12): (usize, bool) = ($bkt, $is_12);
+                    let skip = if is_12 { skip12 } else { skip6 };
+                    if do_probe && p >= chunk_start && p >= skip {
+                        let (min_cand, local_p) =
+                            (p.saturating_sub(wsize), (p - chunk_start) as u32);
+                        let mut best_end = local_p;
+                        for cand_p1 in self.buckets[bkt] {
+                            if cand_p1 == 0 || (cand_p1 as usize - 1) < min_cand {
                                 break;
                             }
-                            let cc = cand + (req_p - p);
-                            if cc >= data.len() || data[cc] != data[req_p] {
+                            let cand = cand_p1 as usize - 1;
+                            if cand >= p || (cand >= buf_start && p - cand <= local_window_cap) {
                                 continue;
                             }
-                        }
-                        let (max_back, cap) =
-                            ((p - chunk_start).min(cand), 5 + 6 * usize::from(is_12));
-                        let kb = cap.min(max_back);
-                        let back = kb
-                            + common_suffix_len(
-                                &data[cand - max_back..cand - kb],
-                                &data[p - max_back..p - kb],
+                            let dist = (p - cand) as u32;
+                            let eq = if is_12 {
+                                cand >= 11 && data[cand - 11..=cand] == data[p - 11..=p]
+                            } else {
+                                cand >= 5 && read_u48(data, cand - 5) == w6
+                            };
+                            if !eq
+                                || recent.iter().any(|r| {
+                                    r.dist == dist && local_p >= r.start && local_p < r.end
+                                })
+                            {
+                                continue;
+                            }
+                            if !is_12 && best_end > local_p {
+                                let req_p = chunk_start + (best_end as usize);
+                                if req_p >= chunk_end {
+                                    break;
+                                }
+                                let cc = cand + (req_p - p);
+                                if cc >= data.len() || data[cc] != data[req_p] {
+                                    continue;
+                                }
+                            }
+                            let (max_back, cap) =
+                                ((p - chunk_start).min(cand), 5 + 6 * usize::from(is_12));
+                            let kb = cap.min(max_back);
+                            let back = kb
+                                + common_suffix_len(
+                                    &data[cand - max_back..cand - kb],
+                                    &data[p - max_back..p - kb],
+                                );
+                            let fwd =
+                                common_prefix_at(simd, data, cand + 1, p + 1, chunk_end - (p + 1));
+                            let (start, end) = (
+                                (p - back - chunk_start) as u32,
+                                (p + 1 + fwd - chunk_start) as u32,
                             );
-                        let fwd =
-                            common_prefix_at(simd, data, cand + 1, p + 1, chunk_end - (p + 1));
-                        let (start, end) = (
-                            (p - back - chunk_start) as u32,
-                            (p + 1 + fwd - chunk_start) as u32,
-                        );
-                        let min_req = if is_12 {
-                            5
-                        } else {
-                            6 + u32::from(dist > (64 << 20))
-                        };
-                        if end - start >= min_req {
-                            let sp = FastLdmSpan { start, end, dist };
-                            out.push(sp);
-                            recent[r_idx & 7] = sp;
-                            r_idx = r_idx.wrapping_add(1);
-                            best_end = best_end.max(end);
-                            let end_sp = chunk_start + end as usize;
-                            if end >= local_p + 24 {
-                                skip6 = skip6.max(end_sp.saturating_sub(4));
-                            }
-                            if end >= local_p + 32 {
-                                skip12 = skip12.max(end_sp.saturating_sub(8));
+                            let min_req = if is_12 {
+                                5
+                            } else {
+                                6 + u32::from(dist > (64 << 20))
+                            };
+                            if end - start >= min_req {
+                                let sp = FastLdmSpan { start, end, dist };
+                                out.push(sp);
+                                recent[r_idx & 7] = sp;
+                                r_idx = r_idx.wrapping_add(1);
+                                best_end = best_end.max(end);
+                                let end_sp = chunk_start + end as usize;
+                                if end >= local_p + 24 {
+                                    skip6 = skip6.max(end_sp.saturating_sub(4));
+                                }
+                                if end >= local_p + 32 {
+                                    skip12 = skip12.max(end_sp.saturating_sub(8));
+                                }
                             }
                         }
                     }
-                }
-                if p >= self.indexed_end {
-                    let (p1, b) = ((p + 1) as u32, &mut self.buckets[bkt]);
-                    if !is_12 && b[0] != 0 && p1 >= b[0] && p1 - b[0] <= 16 {
-                        b[0] = p1;
-                    } else {
-                        *b = [p1, b[0], b[1], b[2], b[3], b[4], b[5], b[6]];
+                    if p >= self.indexed_end {
+                        let (p1, b) = ((p + 1) as u32, &mut self.buckets[bkt]);
+                        if !is_12 && b[0] != 0 && p1 >= b[0] && p1 - b[0] <= 16 {
+                            b[0] = p1;
+                        } else {
+                            *b = [p1, b[0], b[1], b[2], b[3], b[4], b[5], b[6]];
+                        }
                     }
-                }
-            };
-            step((((h >> 32) as usize) & bmask) & !1, false);
+                }};
+            }
+            step!((((h >> 32) as usize) & bmask) & !1, false);
             if p >= 11 && (h & sync12_mask) == 0 {
                 let lo8 = u64::from_le_bytes(data[p - 11..p - 3].try_into().unwrap());
-                step((((mix_ldm6(lo8 ^ h) >> 32) as usize) & bmask) | 1, true);
+                step!((((mix_ldm6(lo8 ^ h) >> 32) as usize) & bmask) | 1, true);
             }
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
-    #[simd_entry]
-    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
-    #[inline(never)]
-    fn scan_avx2(
+    #[inline]
+    fn scan_dispatch<D: SimdDescriptor>(
         &mut self,
+        d: D,
         env: ChunkEnv<'_>,
         bounds: (usize, usize, usize, bool),
         out: &mut ChunkLdmMatches,
-        simd: X64V3,
-        _tok: impl SimdToken,
     ) {
-        self.scan_loop(simd, env, bounds, out);
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[simd_entry]
-    #[target_feature(enable = "neon")]
-    #[inline(never)]
-    fn scan_neon(
-        &mut self,
-        env: ChunkEnv<'_>,
-        bounds: (usize, usize, usize, bool),
-        out: &mut ChunkLdmMatches,
-        simd: A64Neon,
-        _tok: impl SimdToken,
-    ) {
-        self.scan_loop(simd, env, bounds, out);
+        if D::IS_EMULATED {
+            self.scan_loop(d, env, bounds, out);
+        } else {
+            d.call(
+                #[inline(always)]
+                |d| self.scan_loop(d, env, bounds, out),
+            );
+        }
     }
 
     pub(super) fn extract(
@@ -470,13 +457,7 @@ impl SparseLdm {
         }
         self.dirty_to = self.dirty_to.max(n_bkt);
         let bounds = (scan_start, capped_end, local_window_cap, do_probe);
-        match try_simd(true) {
-            #[cfg(target_arch = "x86_64")]
-            Some(tok) => self.scan_avx2(env, bounds, out, tok, tok),
-            #[cfg(target_arch = "aarch64")]
-            Some(tok) => self.scan_neon(env, bounds, out, tok, tok),
-            _ => self.scan_loop(Scalar, env, bounds, out),
-        }
+        with_simd_256!(true, |d| self.scan_dispatch(d, env, bounds, out));
         self.indexed_end = self.indexed_end.max(capped_end);
         if out.len() > 1 {
             out.sort_unstable_by_key(|s| (s.start, s.dist));
@@ -608,8 +589,14 @@ impl DictChain {
     }
 
     #[inline(always)]
-    fn prefetch_ahead<S: SimdBackend>(&self, simd: S, data: &[u8], sp_head: usize, sp_item: usize) {
-        if const { S::IS_SIMD } && !self.heads5.is_empty() {
+    fn prefetch_ahead<D: SimdDescriptor>(
+        &self,
+        simd: D,
+        data: &[u8],
+        sp_head: usize,
+        sp_item: usize,
+    ) {
+        if const { !D::IS_EMULATED } && !self.heads5.is_empty() {
             if sp_head + 8 <= data.len() {
                 let (h_hd, _, _) = hash5_p64(u64::from_le_bytes(
                     *data[sp_head..sp_head + 8].first_chunk::<8>().unwrap(),
@@ -808,9 +795,9 @@ impl MatchGenScratch {
     }
 
     #[inline(always)]
-    fn store_and_find_bst<S: SimdBackend>(
+    fn store_and_find_bst<D: SimdDescriptor>(
         &mut self,
-        simd: S,
+        simd: D,
         data: &[u8],
         pos: usize,
         (emit_limit, max_dist, comp_cap, max_depth): (usize, usize, usize, usize),
@@ -951,9 +938,9 @@ impl MatchGenScratch {
     }
 
     #[inline(always)]
-    fn index_only_at<S: SimdBackend>(
+    fn index_only_at<D: SimdDescriptor>(
         &mut self,
-        simd: S,
+        simd: D,
         data: &[u8],
         pos: usize,
         p4: (usize, usize, usize, usize),
@@ -977,8 +964,8 @@ pub(super) struct MatchGenCfg<'a> {
 }
 
 #[inline(always)]
-fn build_chunk_matches_impl<S: SimdBackend>(
-    simd: S,
+fn build_chunk_matches_impl<D: SimdDescriptor>(
+    simd: D,
     cfg: MatchGenCfg<'_>,
     scratch: &mut MatchGenScratch,
     out: &mut ChunkMatches,
@@ -1297,42 +1284,32 @@ fn build_chunk_matches_impl<S: SimdBackend>(
     out.begin_pos(cfg.large_window);
 }
 
-#[cfg(target_arch = "x86_64")]
-#[simd_entry]
-#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
+#[cold]
 #[inline(never)]
-fn build_chunk_matches_avx2(
+fn build_chunk_matches_emu(
     cfg: MatchGenCfg<'_>,
     scratch: &mut MatchGenScratch,
     out: &mut ChunkMatches,
-    simd: X64V3,
-    _tok: impl SimdToken,
 ) {
-    build_chunk_matches_impl(simd, cfg, scratch, out);
+    let emu = <jxl_simd::Emu128Descriptor as SimdDescriptor>::new().unwrap();
+    build_chunk_matches_impl(emu, cfg, scratch, out);
 }
 
-#[cfg(target_arch = "aarch64")]
-#[simd_entry]
-#[target_feature(enable = "neon")]
-#[inline(never)]
-fn build_chunk_matches_neon(
-    cfg: MatchGenCfg<'_>,
-    scratch: &mut MatchGenScratch,
-    out: &mut ChunkMatches,
-    simd: A64Neon,
-    _tok: impl SimdToken,
-) {
-    build_chunk_matches_impl(simd, cfg, scratch, out);
-}
-
-#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), cold)]
-#[inline(never)]
-fn build_chunk_matches_scalar(
+#[inline]
+pub(super) fn build_chunk_matches_with_desc<D: SimdDescriptor>(
+    d: D,
     cfg: MatchGenCfg<'_>,
     scratch: &mut MatchGenScratch,
     out: &mut ChunkMatches,
 ) {
-    build_chunk_matches_impl(Scalar, cfg, scratch, out);
+    if D::IS_EMULATED {
+        build_chunk_matches_emu(cfg, scratch, out);
+    } else {
+        d.call(
+            #[inline(always)]
+            |d| build_chunk_matches_impl(d, cfg, scratch, out),
+        );
+    }
 }
 
 pub(super) fn build_chunk_matches(
@@ -1340,13 +1317,9 @@ pub(super) fn build_chunk_matches(
     scratch: &mut MatchGenScratch,
     out: &mut ChunkMatches,
 ) {
-    match try_simd(true) {
-        #[cfg(target_arch = "x86_64")]
-        Some(tok) => build_chunk_matches_avx2(cfg, scratch, out, tok, tok),
-        #[cfg(target_arch = "aarch64")]
-        Some(tok) => build_chunk_matches_neon(cfg, scratch, out, tok, tok),
-        _ => build_chunk_matches_scalar(cfg, scratch, out),
-    }
+    with_simd_256!(true, |d| build_chunk_matches_with_desc(
+        d, cfg, scratch, out
+    ));
 }
 
 #[cfg(test)]
@@ -1401,31 +1374,52 @@ pub(super) mod tests {
         }
         let chunk_start = miri_or(32usize, 300);
 
-        for pos in 0..(data.len() - 1) {
-            for max_d2 in [0usize, 1, 31, 32, 33, 64] {
-                let exp = (1..=max_d2.min(pos))
-                    .find(|&d| data[pos - d..pos - d + 2] == data[pos..pos + 2])
-                    .map_or(u32::MAX, |d| d as u32);
-                assert_eq!(find_closest_2b(Scalar, &data, pos, max_d2), exp);
-                #[cfg(target_arch = "x86_64")]
-                if let Some(tok) = X64V3::try_new() {
-                    assert_eq!(find_closest_2b(tok, &data, pos, max_d2), exp);
-                }
-                #[cfg(target_arch = "aarch64")]
-                if let Some(tok) = A64Neon::try_new() {
-                    assert_eq!(find_closest_2b(tok, &data, pos, max_d2), exp);
-                }
+        fn check_2b_parity<D: SimdDescriptor>(d: D, data: &[u8]) {
+            d.call(
+                #[inline(always)]
+                |d| {
+                    for pos in 0..(data.len() - 1) {
+                        for max_d2 in [0usize, 1, 31, 32, 33, 64] {
+                            let exp = (1..=max_d2.min(pos))
+                                .find(|&dist| {
+                                    data[pos - dist..pos - dist + 2] == data[pos..pos + 2]
+                                })
+                                .map_or(u32::MAX, |dist| dist as u32);
+                            assert_eq!(find_closest_2b(d, data, pos, max_d2), exp);
+                        }
+                    }
+                },
+            );
+        }
+        let emu = <jxl_simd::Emu128Descriptor as SimdDescriptor>::new().unwrap();
+        check_2b_parity(emu, &data);
+        #[cfg(target_arch = "x86_64")]
+        {
+            if let Some(d) = <jxl_simd::AvxDescriptor as SimdDescriptor>::new() {
+                check_2b_parity(d, &data);
+            }
+            if let Some(d) = <jxl_simd::Sse42Descriptor as SimdDescriptor>::new() {
+                check_2b_parity(d, &data);
             }
         }
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-        if let Some(tok) = try_simd(true) {
+        #[cfg(target_arch = "aarch64")]
+        if let Some(d) = <jxl_simd::NeonDescriptor as SimdDescriptor>::new() {
+            check_2b_parity(d, &data);
+        }
+
+        fn check_cm_parity<D: SimdDescriptor>(
+            d: D,
+            data: &[u8],
+            chunk_start: usize,
+            efforts: &[u8],
+        ) {
             let (mut s_a, mut s_p) = (MatchGenScratch::default(), MatchGenScratch::default());
-            for &eff in miri_or(&[10u8, 12][..], &[10u8, 11, 12][..]) {
-                let env = ChunkEnv::new(&data, chunk_start, data.len(), 1024, &[]);
+            for &eff in efforts {
+                let env = ChunkEnv::new(data, chunk_start, data.len(), 1024, &[]);
                 let ldm = ChunkLdmMatches::default();
                 let (mut cm_a, mut cm_p) = (ChunkMatches::default(), ChunkMatches::default());
-                #[cfg(target_arch = "x86_64")]
-                build_chunk_matches_avx2(
+                build_chunk_matches_with_desc(
+                    d,
                     MatchGenCfg {
                         env,
                         local_window_cap: 1024,
@@ -1437,26 +1431,8 @@ pub(super) mod tests {
                     },
                     &mut s_a,
                     &mut cm_a,
-                    tok,
-                    tok,
                 );
-                #[cfg(target_arch = "aarch64")]
-                build_chunk_matches_neon(
-                    MatchGenCfg {
-                        env,
-                        local_window_cap: 1024,
-                        large_window: false,
-                        effort: eff,
-                        full_dict_len: 0,
-                        dict_chain: None,
-                        ldm: &ldm,
-                    },
-                    &mut s_a,
-                    &mut cm_a,
-                    tok,
-                    tok,
-                );
-                build_chunk_matches_scalar(
+                build_chunk_matches_emu(
                     MatchGenCfg {
                         env,
                         local_window_cap: 1024,
@@ -1474,6 +1450,20 @@ pub(super) mod tests {
                 assert_eq!(cm_a.static_cands, cm_p.static_cands);
                 assert_eq!(cm_a.static_offsets, cm_p.static_offsets);
             }
+        }
+        let efforts = miri_or(&[10u8, 12][..], &[10u8, 11, 12][..]);
+        #[cfg(target_arch = "x86_64")]
+        {
+            if let Some(d) = <jxl_simd::AvxDescriptor as SimdDescriptor>::new() {
+                check_cm_parity(d, &data, chunk_start, efforts);
+            }
+            if let Some(d) = <jxl_simd::Sse42Descriptor as SimdDescriptor>::new() {
+                check_cm_parity(d, &data, chunk_start, efforts);
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        if let Some(d) = <jxl_simd::NeonDescriptor as SimdDescriptor>::new() {
+            check_cm_parity(d, &data, chunk_start, efforts);
         }
 
         let (wsize, oracle_end) = (1024usize, data.len());

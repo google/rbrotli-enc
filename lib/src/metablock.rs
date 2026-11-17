@@ -13,10 +13,11 @@
 // limitations under the License.
 
 use bounded_utils::BoundedUsize;
+use jxl_simd::SimdDescriptor;
 use lsb_bitwriter::{BitStreamCursor, BitWriter};
 
 use crate::block_split::{BlockSplit, MetablockPlan};
-use crate::constants::{try_simd, Scalar, MAX_IAC, MAX_LIT};
+use crate::constants::{with_simd_256, MAX_IAC, MAX_LIT};
 use crate::context;
 use crate::huffman::{ContextMap, HuffmanCode, HuffmanCodeEntry};
 use crate::map_to_sym::{
@@ -517,98 +518,97 @@ pub(crate) fn write_compressed_metablock(
 
     let (mut lut0, mut lut1, mut single_lit_tree, mut ctx_trees) =
         resolve_lit_bt(lit_cur.cur_type() as usize);
-    let simd = try_simd(true);
     let mut stream_pos = mb_start;
-    let mut cur = bw.cursor();
+    with_simd_256!(true, |d| d.call(
+        #[inline(always)]
+        |d| {
+            let mut cur = bw.cursor();
 
-    let mut emit_iac_and_literals =
-        |insert_len: u32,
-         copy_len: u32,
-         implicit_d0: bool,
-         sp_out: &mut usize,
-         cur: &mut BitStreamCursor<'_, '_>| {
-            let iac_bt = iac_cur.step(&header.insert_and_copy, cur);
-            let (iac_sym, iac_eb_len, iac_eb_b) =
-                encode_iac_bounded(insert_len, copy_len, implicit_d0);
-            let h_iac = iac_luts[iac_bt][iac_sym.get() as usize];
-            let (iac_nb, iac_b) = pack_huff_extra_bounded(h_iac, iac_eb_len.get(), iac_eb_b);
-            cur.put_bounded(iac_nb, iac_b);
+            macro_rules! emit_iac_and_literals {
+                ($ins_len:expr, $copy_len:expr, $implicit_d0:expr) => {{
+                    let (insert_len, copy_len, implicit_d0): (u32, u32, bool) =
+                        ($ins_len, $copy_len, $implicit_d0);
+                    let iac_bt = iac_cur.step(&header.insert_and_copy, &mut cur);
+                    let (iac_sym, iac_eb_len, iac_eb_b) =
+                        encode_iac_bounded(insert_len, copy_len, implicit_d0);
+                    let h_iac = iac_luts[iac_bt][iac_sym.get() as usize];
+                    let (iac_nb, iac_b) =
+                        pack_huff_extra_bounded(h_iac, iac_eb_len.get(), iac_eb_b);
+                    cur.put_bounded(iac_nb, iac_b);
 
-            let mut sp = *sp_out;
-            let ins_end = sp + (insert_len as usize);
-            while sp < ins_end {
-                if lit_cur.advance_if_needed(&header.literals, cur) {
-                    (lut0, lut1, single_lit_tree, ctx_trees) =
-                        resolve_lit_bt(lit_cur.cur_type() as usize);
-                }
-                let avail = (ins_end - sp).min(lit_cur.rem);
-                if let Some(lut) = single_lit_tree {
-                    match simd {
-                        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-                        Some(tok) => emit_literals(tok, &data[sp..sp + avail], lut, cur),
-                        _ => emit_literals(Scalar, &data[sp..sp + avail], lut, cur),
+                    let mut sp = stream_pos;
+                    let ins_end = sp + (insert_len as usize);
+                    while sp < ins_end {
+                        if lit_cur.advance_if_needed(&header.literals, &mut cur) {
+                            (lut0, lut1, single_lit_tree, ctx_trees) =
+                                resolve_lit_bt(lit_cur.cur_type() as usize);
+                        }
+                        let avail = (ins_end - sp).min(lit_cur.rem);
+                        if let Some(lut) = single_lit_tree {
+                            emit_literals(d, &data[sp..sp + avail], lut, &mut cur);
+                            (sp, lit_cur.rem) = (sp + avail, lit_cur.rem - avail);
+                            continue;
+                        }
+                        if sp >= 2 && avail >= 4 {
+                            let fast_n = avail / 4;
+                            let (mut p2, mut p1) = (data[sp - 2], data[sp - 1]);
+                            let (quads, _) = data[sp..sp + fast_n * 4].as_chunks::<4>();
+                            emit_batch1_slice(&mut cur, quads, |&[b0, b1, b2, b3]| {
+                                let e0 = ctx_trees
+                                    [((lut0[p1 as usize] | lut1[p2 as usize]) & 63) as usize]
+                                    [b0 as usize];
+                                let e1 = ctx_trees
+                                    [((lut0[b0 as usize] | lut1[p1 as usize]) & 63) as usize]
+                                    [b1 as usize];
+                                let e2 = ctx_trees
+                                    [((lut0[b1 as usize] | lut1[b0 as usize]) & 63) as usize]
+                                    [b2 as usize];
+                                let e3 = ctx_trees
+                                    [((lut0[b2 as usize] | lut1[b1 as usize]) & 63) as usize]
+                                    [b3 as usize];
+                                (p2, p1) = (b2, b3);
+                                pack_entries_quad_bounded([e0, e1, e2, e3])
+                            });
+                            sp += fast_n * 4;
+                            lit_cur.rem -= fast_n * 4;
+                            continue;
+                        }
+                        lit_cur.rem -= 1;
+                        let ctx = context::stream_byte_ctx(lut0, lut1, data, sp) & 63;
+                        let e = ctx_trees[ctx][data[sp] as usize];
+                        cur.put_bounded(bound64_from_u63(e.len as usize), e.bits as u64);
+                        sp += 1;
                     }
-                    (sp, lit_cur.rem) = (sp + avail, lit_cur.rem - avail);
-                    continue;
-                }
-                if sp >= 2 && avail >= 4 {
-                    let fast_n = avail / 4;
-                    let (mut p2, mut p1) = (data[sp - 2], data[sp - 1]);
-                    let (quads, _) = data[sp..sp + fast_n * 4].as_chunks::<4>();
-                    emit_batch1_slice(cur, quads, |&[b0, b1, b2, b3]| {
-                        let e0 = ctx_trees[((lut0[p1 as usize] | lut1[p2 as usize]) & 63) as usize]
-                            [b0 as usize];
-                        let e1 = ctx_trees[((lut0[b0 as usize] | lut1[p1 as usize]) & 63) as usize]
-                            [b1 as usize];
-                        let e2 = ctx_trees[((lut0[b1 as usize] | lut1[b0 as usize]) & 63) as usize]
-                            [b2 as usize];
-                        let e3 = ctx_trees[((lut0[b2 as usize] | lut1[b1 as usize]) & 63) as usize]
-                            [b3 as usize];
-                        (p2, p1) = (b2, b3);
-                        pack_entries_quad_bounded([e0, e1, e2, e3])
-                    });
-                    sp += fast_n * 4;
-                    lit_cur.rem -= fast_n * 4;
-                    continue;
-                }
-                lit_cur.rem -= 1;
-                let ctx = context::stream_byte_ctx(lut0, lut1, data, sp) & 63;
-                let e = ctx_trees[ctx][data[sp] as usize];
-                cur.put_bounded(bound64_from_u63(e.len as usize), e.bits as u64);
-                sp += 1;
+                    stream_pos = ins_end;
+                }};
             }
-            *sp_out = ins_end;
-        };
 
-    for &cmd in commands {
-        emit_iac_and_literals(
-            cmd.insert_len,
-            cmd.copy_len,
-            cmd.is_implicit_d0(),
-            &mut stream_pos,
-            &mut cur,
-        );
+            for &cmd in commands {
+                emit_iac_and_literals!(cmd.insert_len, cmd.copy_len, cmd.is_implicit_d0());
 
-        if cmd.emits_dist_sym() {
-            let dist_bt = dist_cur.step(&header.distance, &mut cur);
-            let d_ctx = copy_code_only(cmd.copy_len).min(3);
-            let (d_sym, d_eb_n, d_eb_b) = if cmd.dist_mode < 16 {
-                (cmd.dist_mode as u16, 0u8, 0u64)
-            } else {
-                let (s, n, b) = encode_raw_distance_params(cmd.dist, plan.npostfix, plan.ndirect);
-                (s, n, b as u64)
-            };
-            let tree_id = plan.dist_cmap[dist_bt * 4 + d_ctx] as usize;
-            let (dn, db) = header.distance_codes[tree_id].symbol_info(d_sym as usize);
-            cur.put_bounded(bound64_from_u63(dn + d_eb_n as usize), db | (d_eb_b << dn));
+                if cmd.emits_dist_sym() {
+                    let dist_bt = dist_cur.step(&header.distance, &mut cur);
+                    let d_ctx = copy_code_only(cmd.copy_len).min(3);
+                    let (d_sym, d_eb_n, d_eb_b) = if cmd.dist_mode < 16 {
+                        (cmd.dist_mode as u16, 0u8, 0u64)
+                    } else {
+                        let (s, n, b) =
+                            encode_raw_distance_params(cmd.dist, plan.npostfix, plan.ndirect);
+                        (s, n, b as u64)
+                    };
+                    let tree_id = plan.dist_cmap[dist_bt * 4 + d_ctx] as usize;
+                    let (dn, db) = header.distance_codes[tree_id].symbol_info(d_sym as usize);
+                    cur.put_bounded(bound64_from_u63(dn + d_eb_n as usize), db | (d_eb_b << dn));
+                }
+                stream_pos += cmd.out_len as usize;
+            }
+
+            if trailing_literals > 0 {
+                emit_iac_and_literals!(trailing_literals, 4, false);
+            }
+            drop(cur);
         }
-        stream_pos += cmd.out_len as usize;
-    }
-
-    if trailing_literals > 0 {
-        emit_iac_and_literals(trailing_literals, 4, false, &mut stream_pos, &mut cur);
-    }
-    drop(cur);
+    ));
 
     debug_assert_eq!(stream_pos, mb_end);
     for cur in [&lit_cur, &iac_cur, &dist_cur] {

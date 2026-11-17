@@ -462,6 +462,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "jxl_simd"
+version = "0.8.0"
+source = "git+https://github.com/veluca93/jxl-rs?branch=simd-specialize#85f5dd87889d5be9554966a671f291e274727aa1"
+dependencies = [
+ "jxl_simd_macros",
+]
+
+[[package]]
+name = "jxl_simd_macros"
+version = "0.8.0"
+source = "git+https://github.com/veluca93/jxl-rs?branch=simd-specialize#85f5dd87889d5be9554966a671f291e274727aa1"
+
+[[package]]
 name = "libc"
 version = "0.2.153"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -611,9 +624,8 @@ dependencies = [
  "brotli-decompressor",
  "criterion",
  "hugepage-buffer",
+ "jxl_simd",
  "lsb-bitwriter",
- "safe_unaligned_simd",
- "simd_tokens",
  "zerocopy",
 ]
 
@@ -666,12 +678,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e86697c916019a8588c99b5fac3cead74ec0b4b819707a682fd4d23fa0ce1ba1"
 
 [[package]]
-name = "safe_unaligned_simd"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9c874fb993656d484725d58fbfddb39dfcf98ebcadc1a1d09568aa6b39bafba"
-
-[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -709,26 +715,6 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
-]
-
-[[package]]
-name = "simd_tokens"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f1497db8a62e9fc994fd7c8a19a54106c9485e3d0beb3b1353de26ba8ae4b32"
-dependencies = [
- "simd_tokens_macros",
-]
-
-[[package]]
-name = "simd_tokens_macros"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb0506b507b98fae460060259b4c72b71592d686699c03bc44916afac87cae47"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.60",
 ]
 
 [[package]]

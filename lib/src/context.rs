@@ -14,20 +14,9 @@
 
 //! RFC 7932 literal context lookup tables, context-mode selection, and JSD histogram clustering.
 
-use crate::constants::MAX_LIT;
+use crate::constants::{with_simd, MAX_LIT};
 use crate::metablock::ContextMode;
-#[cfg(target_arch = "aarch64")]
-use core::arch::aarch64::*;
-#[cfg(target_arch = "aarch64")]
-use safe_unaligned_simd::aarch64::vld1q_u32;
-#[cfg(target_arch = "x86_64")]
-use safe_unaligned_simd::x86_64::_mm256_loadu_si256;
-#[cfg(target_arch = "x86_64")]
-use simd_tokens::{simd_entry, Avx2Token, SimdToken};
-#[cfg(target_arch = "aarch64")]
-use simd_tokens::{simd_entry, NeonToken, SimdToken};
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
+use jxl_simd::{I32Vec, SimdDescriptor, U32Vec};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LiteralHistogram {
@@ -208,120 +197,71 @@ fn histogram_distance_slice_portable(a: &[u32], total_a: u32, b: &[u32], total_b
     ((dist_q8 >> 8).clamp(0, i32::MAX as i64)) as i32
 }
 
-#[cfg(target_arch = "x86_64")]
-#[simd_entry]
-#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
-fn histogram_distance_slice_avx2(
+#[inline]
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn histogram_distance_slice_simd<D: SimdDescriptor>(
+    d: D,
     a: &[u32],
     total_a: u32,
     b: &[u32],
     total_b: u32,
-    _token: impl SimdToken,
 ) -> i32 {
-    debug_assert_eq!(a.len(), b.len());
-    if total_a == 0 || total_b == 0 {
-        return 0;
+    if D::IS_EMULATED {
+        return histogram_distance_slice_portable(a, total_a, b, total_b);
     }
-    let (inv_a_s, inv_b_s, inv_tot_s) = (
-        1.0f32 / (total_a as f32),
-        1.0f32 / (total_b as f32),
-        1.0f32 / ((total_a + total_b) as f32),
-    );
-    let (inv_a, inv_b, inv_total, bias) = (
-        _mm256_set1_ps(inv_a_s),
-        _mm256_set1_ps(inv_b_s),
-        _mm256_set1_ps(inv_tot_s),
-        _mm256_set1_epi32(127 << 8),
-    );
-    let [mut td0, mut td1, mut td2] = [_mm256_setzero_si256(); 3];
-    let ((a_chunks, a_rem), (b_chunks, b_rem)) = (a.as_chunks::<8>(), b.as_chunks::<8>());
-    macro_rules! accum {
-        ($acc:ident, $v:expr, $inv:expr) => {{
-            let p = _mm256_mul_ps(_mm256_cvtepi32_ps($v), $inv);
-            let nl = _mm256_sub_epi32(bias, _mm256_srli_epi32::<15>(_mm256_castps_si256(p)));
-            $acc = _mm256_add_epi32(_mm256_mullo_epi32(nl, $v), $acc);
-        }};
-    }
-    for (ac, bc) in a_chunks.iter().zip(b_chunks.iter()) {
-        let (av, bv) = (_mm256_loadu_si256(ac), _mm256_loadu_si256(bc));
-        let totv = _mm256_add_epi32(av, bv);
-        accum!(td0, totv, inv_total);
-        accum!(td1, av, inv_a);
-        accum!(td2, bv, inv_b);
-    }
-    let mut v = _mm256_sub_epi32(td0, _mm256_add_epi32(td1, td2));
-    v = _mm256_add_epi32(v, _mm256_shuffle_epi32::<0b10110001>(v));
-    v = _mm256_add_epi32(v, _mm256_shuffle_epi32::<0b01001110>(v));
-    v = _mm256_add_epi32(v, _mm256_permute4x64_epi64::<0b01001110>(v));
-    let dist_q8 = _mm256_extract_epi32::<0>(v)
-        .wrapping_add(jsd_accum_scalar_q8(a_rem, b_rem, inv_a_s, inv_b_s, inv_tot_s) as i32);
-    (dist_q8 >> 8).max(0)
-}
-
-#[cfg(target_arch = "aarch64")]
-#[simd_entry]
-#[target_feature(enable = "neon")]
-fn histogram_distance_slice_neon(
-    a: &[u32],
-    total_a: u32,
-    b: &[u32],
-    total_b: u32,
-    _token: impl SimdToken,
-) -> i32 {
-    debug_assert_eq!(a.len(), b.len());
-    if total_a == 0 || total_b == 0 {
-        return 0;
-    }
-    let (inv_a_s, inv_b_s, inv_tot_s) = (
-        1.0f32 / (total_a as f32),
-        1.0f32 / (total_b as f32),
-        1.0f32 / ((total_a + total_b) as f32),
-    );
-    let (inv_a, inv_b, inv_total, bias) = (
-        vdupq_n_f32(inv_a_s),
-        vdupq_n_f32(inv_b_s),
-        vdupq_n_f32(inv_tot_s),
-        vdupq_n_s32(127 << 8),
-    );
-    let [mut td0, mut td1, mut td2] = [vdupq_n_s32(0); 3];
-    let ((a_chunks, a_rem), (b_chunks, b_rem)) = (a.as_chunks::<4>(), b.as_chunks::<4>());
-    macro_rules! accum {
-        ($acc:ident, $v:expr, $inv:expr) => {{
-            let p = vmulq_f32(vcvtq_f32_u32($v), $inv);
-            let nl = vsubq_s32(
-                bias,
-                vreinterpretq_s32_u32(vshrq_n_u32::<15>(vreinterpretq_u32_f32(p))),
+    d.call(
+        #[inline(always)]
+        |d| {
+            debug_assert_eq!(a.len(), b.len());
+            if total_a == 0 || total_b == 0 {
+                return 0;
+            }
+            let (inv_a_s, inv_b_s, inv_tot_s) = (
+                1.0f32 / (total_a as f32),
+                1.0f32 / (total_b as f32),
+                1.0f32 / ((total_a + total_b) as f32),
             );
-            $acc = vmlaq_s32($acc, nl, vreinterpretq_s32_u32($v));
-        }};
-    }
-    for (ac, bc) in a_chunks.iter().zip(b_chunks.iter()) {
-        let (av, bv) = (vld1q_u32(ac), vld1q_u32(bc));
-        let totv = vaddq_u32(av, bv);
-        accum!(td0, totv, inv_total);
-        accum!(td1, av, inv_a);
-        accum!(td2, bv, inv_b);
-    }
-    let v = vsubq_s32(td0, vaddq_s32(td1, td2));
-    let dist_q8 = vaddvq_s32(v)
-        .wrapping_add(jsd_accum_scalar_q8(a_rem, b_rem, inv_a_s, inv_b_s, inv_tot_s) as i32);
-    (dist_q8 >> 8).max(0)
+            let (inv_a, inv_b, inv_total, bias) = (
+                jxl_simd::F32Vec::splat(d, inv_a_s),
+                jxl_simd::F32Vec::splat(d, inv_b_s),
+                jxl_simd::F32Vec::splat(d, inv_tot_s),
+                I32Vec::splat(d, 127 << 8),
+            );
+            let [mut td0, mut td1, mut td2] = [I32Vec::zero(d); 3];
+            let step = U32Vec::<D>::LEN;
+            let (a_chunks, b_chunks) = (a.chunks_exact(step), b.chunks_exact(step));
+            let (a_rem, b_rem) = (a_chunks.remainder(), b_chunks.remainder());
+            for (ac, bc) in a_chunks.zip(b_chunks) {
+                let (av, bv) = (U32Vec::load(d, ac), U32Vec::load(d, bc));
+                let totv = av + bv;
+                for (acc, v, inv) in [
+                    (&mut td0, totv, inv_total),
+                    (&mut td1, av, inv_a),
+                    (&mut td2, bv, inv_b),
+                ] {
+                    let vi = v.bitcast::<i32>();
+                    let p = vi.as_f32() * inv;
+                    let nl = bias - p.bitcast::<u32>().shr::<15>().bitcast::<i32>();
+                    *acc += nl * vi;
+                }
+            }
+            let dist_q8 = (td0 - (td1 + td2))
+                .reduce_add()
+                .wrapping_add(
+                    jsd_accum_scalar_q8(a_rem, b_rem, inv_a_s, inv_b_s, inv_tot_s) as i32,
+                );
+            (dist_q8 >> 8).max(0)
+        },
+    )
 }
 
 /// Fast JSD bit-cost divergence over arbitrary-length `[u32]` histograms (`Literal`, `IAC`, `Distance`).
 #[inline]
 pub(crate) fn histogram_distance_slice(a: &[u32], total_a: u32, b: &[u32], total_b: u32) -> i32 {
-    #[cfg(target_arch = "x86_64")]
     if (total_a as u64) + (total_b as u64) <= 8_000_000 {
-        if let Some(token) = Avx2Token::try_new() {
-            return histogram_distance_slice_avx2(a, total_a, b, total_b, token);
-        }
-    }
-    #[cfg(target_arch = "aarch64")]
-    if (total_a as u64) + (total_b as u64) <= 8_000_000 {
-        if let Some(token) = NeonToken::try_new() {
-            return histogram_distance_slice_neon(a, total_a, b, total_b, token);
-        }
+        return with_simd!(true, |d| histogram_distance_slice_simd(
+            d, a, total_a, b, total_b
+        ));
     }
     histogram_distance_slice_portable(a, total_a, b, total_b)
 }

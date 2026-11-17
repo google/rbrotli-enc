@@ -12,160 +12,125 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-/// Portable scalar execution backend token.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Scalar;
-
-#[cfg(target_arch = "aarch64")]
-pub(crate) type A64Neon = simd_tokens::NeonToken;
-#[cfg(target_arch = "x86_64")]
-pub(crate) type X64V3 = simd_tokens::Avx2Token;
-
-#[cfg(target_arch = "x86_64")]
-pub(crate) type OptSimd = Option<X64V3>;
-#[cfg(target_arch = "aarch64")]
-pub(crate) type OptSimd = Option<A64Neon>;
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-pub(crate) type OptSimd = Option<core::convert::Infallible>;
-
-#[inline(always)]
-pub(crate) fn try_simd(use_simd: bool) -> OptSimd {
-    #[cfg(target_arch = "x86_64")]
-    {
-        use_simd
-            .then(<X64V3 as simd_tokens::SimdToken>::try_new)
-            .flatten()
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        use_simd
-            .then(<A64Neon as simd_tokens::SimdToken>::try_new)
-            .flatten()
-    }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    {
-        let _ = use_simd;
-        None
-    }
+#[cold]
+#[inline(never)]
+pub(crate) fn call_emu<R>(f: impl FnOnce(jxl_simd::Emu128Descriptor) -> R) -> R {
+    use jxl_simd::SimdDescriptor;
+    f(jxl_simd::Emu128Descriptor::new().unwrap())
 }
 
-/// Zero-cost SIMD/scalar capability backend allowing hot loops to be written once as generic
-/// functions over `S: SimdBackend` and instantiated inside `#[simd_entry]` / scalar entrypoints.
-#[cfg_attr(
-    not(any(target_arch = "x86_64", target_arch = "aarch64")),
-    allow(dead_code)
-)]
-pub(crate) trait SimdBackend: Copy + Send + Sync + 'static {
-    const IS_SIMD: bool;
-
-    fn prefetch_et0<T>(self, r: &T);
-    fn prefetch_t0<T>(self, r: &T);
-
-    #[cfg(target_arch = "x86_64")]
-    fn into_x64v3(self) -> X64V3;
-
-    #[cfg(target_arch = "aarch64")]
-    fn into_neon(self) -> A64Neon;
-}
-
-impl SimdBackend for Scalar {
-    const IS_SIMD: bool = false;
-
-    #[inline(always)]
-    fn prefetch_et0<T>(self, _r: &T) {}
-
-    #[inline(always)]
-    fn prefetch_t0<T>(self, _r: &T) {}
-
-    #[cfg(target_arch = "x86_64")]
-    #[inline(always)]
-    fn into_x64v3(self) -> X64V3 {
-        unreachable!()
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[inline(always)]
-    fn into_neon(self) -> A64Neon {
-        unreachable!()
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-impl SimdBackend for X64V3 {
-    const IS_SIMD: bool = true;
-
-    #[inline(always)]
-    fn prefetch_et0<T>(self, r: &T) {
-        bounded_utils::prefetch_et0(r);
-    }
-
-    #[inline(always)]
-    fn prefetch_t0<T>(self, r: &T) {
-        bounded_utils::prefetch_t0(r);
-    }
-
-    #[inline(always)]
-    fn into_x64v3(self) -> X64V3 {
-        self
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-impl SimdBackend for A64Neon {
-    const IS_SIMD: bool = true;
-
-    #[inline(always)]
-    fn prefetch_et0<T>(self, r: &T) {
-        bounded_utils::prefetch_et0(r);
-    }
-
-    #[inline(always)]
-    fn prefetch_t0<T>(self, r: &T) {
-        bounded_utils::prefetch_t0(r);
-    }
-
-    #[inline(always)]
-    fn into_neon(self) -> A64Neon {
-        self
-    }
-}
-
-macro_rules! dispatch_simd {
-    ($simd:expr, $S:ty => x64: |$tx:ident| $x64:expr, neon: |$tn:ident| $neon:expr, scalar: $scalar:expr $(,)?) => {{
-        #[cfg(target_arch = "x86_64")]
-        if const { <$S as $crate::constants::SimdBackend>::IS_SIMD } {
-            let $tx: $crate::constants::X64V3 =
-                <$S as $crate::constants::SimdBackend>::into_x64v3($simd);
-            $x64
+/// Evaluates `body` with the widest hardware SIMD descriptor of at most 256 bits (`AvxDescriptor`
+/// or `Sse42Descriptor` on `x86_64`, `NeonDescriptor` on `aarch64`, `Simd128Descriptor` on
+/// `wasm32`) when `use_simd` is true, falling back to [`jxl_simd::Emu128Descriptor`].
+#[allow(unused_macros)]
+macro_rules! with_simd_256 {
+    ($use_simd:expr, |$d:ident| $body:expr) => {{
+        if $use_simd {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if let Some($d) = <jxl_simd::AvxDescriptor as jxl_simd::SimdDescriptor>::new() {
+                    jxl_simd::SimdDescriptor::call_inlined(
+                        $d,
+                        #[inline(always)]
+                        |$d| $body,
+                    )
+                } else if let Some($d) =
+                    <jxl_simd::Sse42Descriptor as jxl_simd::SimdDescriptor>::new()
+                {
+                    jxl_simd::SimdDescriptor::call_inlined(
+                        $d,
+                        #[inline(always)]
+                        |$d| $body,
+                    )
+                } else {
+                    $crate::constants::call_emu(
+                        #[inline(always)]
+                        |$d| $body,
+                    )
+                }
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                if let Some($d) = <jxl_simd::NeonDescriptor as jxl_simd::SimdDescriptor>::new() {
+                    jxl_simd::SimdDescriptor::call_inlined(
+                        $d,
+                        #[inline(always)]
+                        |$d| $body,
+                    )
+                } else {
+                    $crate::constants::call_emu(
+                        #[inline(always)]
+                        |$d| $body,
+                    )
+                }
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                if let Some($d) = <jxl_simd::Simd128Descriptor as jxl_simd::SimdDescriptor>::new() {
+                    jxl_simd::SimdDescriptor::call_inlined(
+                        $d,
+                        #[inline(always)]
+                        |$d| $body,
+                    )
+                } else {
+                    $crate::constants::call_emu(
+                        #[inline(always)]
+                        |$d| $body,
+                    )
+                }
+            }
+            #[cfg(not(any(
+                target_arch = "x86_64",
+                target_arch = "aarch64",
+                target_arch = "wasm32"
+            )))]
+            {
+                $crate::constants::call_emu(
+                    #[inline(always)]
+                    |$d| $body,
+                )
+            }
         } else {
-            let _ = $simd;
-            $scalar
-        }
-        #[cfg(target_arch = "aarch64")]
-        if const { <$S as $crate::constants::SimdBackend>::IS_SIMD } {
-            let $tn: $crate::constants::A64Neon =
-                <$S as $crate::constants::SimdBackend>::into_neon($simd);
-            $neon
-        } else {
-            let _ = $simd;
-            $scalar
-        }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        {
-            let _ = $simd;
-            $scalar
+            $crate::constants::call_emu(
+                #[inline(always)]
+                |$d| $body,
+            )
         }
     }};
-    ($simd:expr, $S:ty => |$tok:ident| $simd_arm:expr, $scalar:expr) => {
-        dispatch_simd!(
-            $simd,
-            $S => x64: |$tok| $simd_arm,
-            neon: |$tok| $simd_arm,
-            scalar: $scalar
-        )
-    };
 }
-pub(crate) use dispatch_simd;
+#[allow(unused_imports)]
+pub(crate) use with_simd_256;
+
+/// Evaluates `body` with the widest supported SIMD descriptor (including `Avx512Descriptor` on
+/// `x86_64`) when `use_simd` is true, falling back to [`jxl_simd::Emu128Descriptor`].
+#[allow(unused_macros)]
+macro_rules! with_simd {
+    ($use_simd:expr, |$d:ident| $body:expr) => {{
+        #[cfg(target_arch = "x86_64")]
+        if $use_simd {
+            if let Some($d) = <jxl_simd::Avx512Descriptor as jxl_simd::SimdDescriptor>::new() {
+                jxl_simd::SimdDescriptor::call_inlined(
+                    $d,
+                    #[inline(always)]
+                    |$d| $body,
+                )
+            } else {
+                $crate::constants::with_simd_256!(true, |$d| $body)
+            }
+        } else {
+            $crate::constants::call_emu(
+                #[inline(always)]
+                |$d| $body,
+            )
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            $crate::constants::with_simd_256!($use_simd, |$d| $body)
+        }
+    }};
+}
+#[allow(unused_imports)]
+pub(crate) use with_simd;
 
 // File format choices.
 pub(crate) const METABLOCK_SIZE: usize = 1 << 20;

@@ -1,4 +1,4 @@
 [target.'cfg(all(miri, target_arch = "x86_64"))']
 rustflags = [
-    "-C", "target-feature=+sse2,+ssse3,+sse4.1,+avx,+avx2"
+    "-C", "target-feature=+sse2,+ssse3,+sse4.1,+sse4.2,+avx,+avx2,+fma,+f16c,+bmi1,+bmi2,+lzcnt"
 ]

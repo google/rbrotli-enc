@@ -14,9 +14,7 @@
 
 //! Unified RFC 7932 built-in static dictionary (`kBrotliDictionary` + all 121 transforms).
 
-use crate::constants::{dispatch_simd, SimdBackend};
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-use simd_tokens::{simd_entry, SimdToken};
+use jxl_simd::SimdDescriptor;
 use std::sync::OnceLock;
 
 const RFC7932_DICT: &[u8; 122_784] = include_bytes!("rfc7932_dict.bin");
@@ -520,51 +518,15 @@ fn lookup_impl(
     best
 }
 
-#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), cold)]
+#[cold]
 #[inline(never)]
-fn lookup_with_mode(
-    s: &[u8],
-    bd: u64,
-    mrd_mo: u64,
-    lm_co: u64,
-    mg_fast: u64,
-) -> Option<StaticDictMatch> {
-    lookup_impl(s, bd, mrd_mo, lm_co, mg_fast)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[simd_entry]
-#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
-#[inline(never)]
-fn lookup_avx2(
-    s: &[u8],
-    bd: u64,
-    mrd_mo: u64,
-    lm_co: u64,
-    mg_fast: u64,
-    _tok: impl SimdToken,
-) -> Option<StaticDictMatch> {
-    lookup_impl(s, bd, mrd_mo, lm_co, mg_fast)
-}
-
-#[cfg(target_arch = "aarch64")]
-#[simd_entry]
-#[target_feature(enable = "neon")]
-#[inline(never)]
-fn lookup_neon(
-    s: &[u8],
-    bd: u64,
-    mrd_mo: u64,
-    lm_co: u64,
-    mg_fast: u64,
-    _tok: impl SimdToken,
-) -> Option<StaticDictMatch> {
+fn lookup_emu(s: &[u8], bd: u64, mrd_mo: u64, lm_co: u64, mg_fast: u64) -> Option<StaticDictMatch> {
     lookup_impl(s, bd, mrd_mo, lm_co, mg_fast)
 }
 
 #[inline(always)]
-pub(crate) fn lookup_simd<S: SimdBackend>(
-    simd: S,
+pub(crate) fn lookup_simd<D: SimdDescriptor>(
+    d: D,
     fast: bool,
     s: &[u8],
     (bd, mrd, mo, lm, co, mg): LookupArgs,
@@ -572,12 +534,14 @@ pub(crate) fn lookup_simd<S: SimdBackend>(
     let mrd_mo = (mrd as u64) | ((mo as u64) << 32);
     let lm_co = (lm as u32 as u64) | ((co as u32 as u64) << 32);
     let mg_fast = ((mg as u32 as u64) << 1) | (fast as u64);
-    dispatch_simd!(
-        simd,
-        S => x64: |tok| lookup_avx2(s, bd, mrd_mo, lm_co, mg_fast, tok),
-        neon: |tok| lookup_neon(s, bd, mrd_mo, lm_co, mg_fast, tok),
-        scalar: lookup_with_mode(s, bd, mrd_mo, lm_co, mg_fast),
-    )
+    if D::IS_EMULATED {
+        lookup_emu(s, bd, mrd_mo, lm_co, mg_fast)
+    } else {
+        d.call(
+            #[inline(always)]
+            |_| lookup_impl(s, bd, mrd_mo, lm_co, mg_fast),
+        )
+    }
 }
 
 #[inline]
@@ -1006,20 +970,16 @@ mod test {
             b"worked ", b"Information, ", b" information. ", b" Information, ",
             b" the government of the ",
         ];
+        let emu = jxl_simd::Emu128Descriptor::new().unwrap();
         let lk = |s: &[u8], b: u64| {
-            lookup_simd(
-                crate::constants::Scalar,
-                false,
-                s,
-                (b, STD_MAX_RAW_STATIC_DIST, 4, 168, 352, 48),
-            )
+            lookup_simd(emu, false, s, (b, STD_MAX_RAW_STATIC_DIST, 4, 168, 352, 48))
         };
         for &phrase in phrases {
             let m = lk(phrase, 1).unwrap();
             verify_word(phrase, m.out_len as u32, m.base_len as u32, m.raw_dist - 1);
             if phrase[0] != b' ' {
                 let mf = lookup_simd(
-                    crate::constants::Scalar,
+                    emu,
                     true,
                     phrase,
                     (1, STD_MAX_RAW_STATIC_DIST, 4, 168, 352, 48),
@@ -1027,6 +987,16 @@ mod test {
                 .unwrap();
                 assert_eq!((mf.out_len, mf.raw_dist), (m.out_len, m.raw_dist));
             }
+            crate::constants::with_simd_256!(true, |d| {
+                let ms = lookup_simd(
+                    d,
+                    false,
+                    phrase,
+                    (1, STD_MAX_RAW_STATIC_DIST, 4, 168, 352, 48),
+                )
+                .unwrap();
+                assert_eq!((ms.out_len, ms.raw_dist), (m.out_len, m.raw_dist));
+            });
         }
         assert!(lk(b"time", 100_000).is_none());
         let m = lk(b"information,x", 100_000).unwrap();

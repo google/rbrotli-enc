@@ -22,21 +22,8 @@ use crate::static_dict;
 use bounded_utils::{
     BoundedArrayExt, BoundedPrefix, BoundedPrefixCursor, BoundedUsize, Pow2SliceMut,
 };
-#[cfg(target_arch = "aarch64")]
-use core::arch::aarch64::*;
 use hugepage_buffer::HugePageBuf;
-#[cfg(target_arch = "aarch64")]
-use safe_unaligned_simd::aarch64::{
-    vld1_u16, vld1q_s16, vld1q_u16, vld1q_u16_x4, vld1q_u32, vld1q_u8, vst1q_u16, vst1q_u32,
-};
-#[cfg(target_arch = "x86_64")]
-use safe_unaligned_simd::x86_64::{
-    _mm256_loadu_si256, _mm256_storeu_si256, _mm_loadu_si128, _mm_storeu_si128,
-};
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-use simd_tokens::{simd_entry, SimdToken};
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
+use jxl_simd::{I16Vec, SimdDescriptor, U16Vec, U32Vec, U8Vec};
 use zerocopy::FromZeroes;
 
 pub(crate) const PREFETCH_OFFSET: usize = 8;
@@ -105,12 +92,12 @@ pub(crate) trait MatchConfig: Send + Sync + 'static {
     const MULTI_CONTEXT: bool;
     const USE_3B_TABLE: bool;
 
-    fn run_interior(
+    fn run_interior_with_desc<D: SimdDescriptor>(
+        d: D,
         ht: &mut HashTable,
         env: &SliceEnv<'_>,
         state: &mut SliceParseState,
         md: &mut MetablockSink<'_>,
-        simd: OptSimd,
     );
 }
 
@@ -135,15 +122,10 @@ const fn arch_cfg<C: MatchConfig>() -> ArchCfg {
 
 macro_rules! def_arch {
     (@call $pb:literal, $w:literal, $h4w:literal, $cfg:ty, $lw:literal, $dict:literal,
-           $ht:expr, $env:expr, $state:expr, $md:expr, $tok:expr) => {
+           $ht:expr, $env:expr, $state:expr, $md:expr, $d:expr) => {
         if let Some(it) = $ht.interior_mut::<$pb, $w, $h4w>(<$cfg>::USE_3B_TABLE) {
-            #[cfg(target_arch = "x86_64")]
-            return parse_slice_interior_avx2::<$pb, $w, $h4w, $cfg, $lw, $dict>(
-                it, $env, $state, $md, $tok, $tok,
-            );
-            #[cfg(target_arch = "aarch64")]
-            return parse_slice_interior_neon::<$pb, $w, $h4w, $cfg, $lw, $dict>(
-                it, $env, $state, $md, $tok, $tok,
+            return parse_slice_interior::<$pb, $w, $h4w, $cfg, $lw, $dict, D>(
+                it, $env, $state, $md, $d,
             );
         }
     };
@@ -161,30 +143,29 @@ macro_rules! def_arch {
             const USE_3B_TABLE: bool = $h3;
 
             #[inline(always)]
-            fn run_interior(
+            fn run_interior_with_desc<D: SimdDescriptor>(
+                d: D,
                 ht: &mut HashTable,
                 env: &SliceEnv<'_>,
                 state: &mut SliceParseState,
                 md: &mut MetablockSink<'_>,
-                simd: OptSimd,
             ) {
-                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-                if let Some(tok) = simd {
+                if !D::IS_EMULATED {
                     let eff_lw = env.large_window && env.win.1 > FAST_LDM_MIN_DIST;
                     match (ht.pos_bits, ht.ways, ht.ht4_ways, eff_lw, env.has_dict) {
                         $(($pb, $w, $h4w, false, false) => {
-                            def_arch!(@call $pb, $w, $h4w, Self, false, false, ht, env, state, md, tok);
+                            def_arch!(@call $pb, $w, $h4w, Self, false, false, ht, env, state, md, d);
                         })+
                         $(($pb, $w, $h4w, false, true) => {
-                            def_arch!(@call $pb, $w, $h4w, Self, false, true, ht, env, state, md, tok);
+                            def_arch!(@call $pb, $w, $h4w, Self, false, true, ht, env, state, md, d);
                         })+
                         $(($lpb, $lw_w, $lh4w, true, false) => {
-                            def_arch!(@call $lpb, $lw_w, $lh4w, Self, true, false, ht, env, state, md, tok);
+                            def_arch!(@call $lpb, $lw_w, $lh4w, Self, true, false, ht, env, state, md, d);
                         })+
                         _ => {}
                     }
                 }
-                let _ = simd;
+                let _ = d;
                 parse_slice_interior_portable::<Self>(ht, env, state, md);
             }
         }
@@ -298,25 +279,13 @@ struct PreparedDictTables {
     end_vpos: usize,
 }
 
-#[cfg(target_arch = "x86_64")]
-#[simd_entry]
-#[inline]
-#[target_feature(enable = "avx2")]
-fn raw_dict_search4_avx2(bucket: &[u32; 4], tag8: u32, _tok: impl SimdToken) -> u32 {
-    let v = _mm_loadu_si128(bucket);
-    let eq = _mm_cmpeq_epi32(_mm_srli_epi32::<24>(v), _mm_set1_epi32(tag8 as i32));
-    _mm_movemask_ps(_mm_castsi128_ps(eq)) as u32
-}
-
-#[cfg(target_arch = "aarch64")]
-#[simd_entry]
-#[inline]
-#[target_feature(enable = "neon")]
-fn raw_dict_search4_neon(bucket: &[u32; 4], tag8: u32, _tok: impl SimdToken) -> u32 {
-    let vt = vdupq_n_u32(tag8);
-    let c0 = vceqq_u32(vshrq_n_u32::<24>(vld1q_u32(bucket)), vt);
-    let w0 = vld1q_u32(&[1u32, 2, 4, 8]);
-    vaddvq_u32(vandq_u32(c0, w0))
+#[inline(always)]
+fn raw_dict_search4_simd<D: SimdDescriptor>(d: D, bucket: &[u32; 4], tag8: u32) -> u32 {
+    let d128 = d.maybe_downgrade_128bit();
+    U32Vec::load(d128, bucket)
+        .shr::<24>()
+        .eq(U32Vec::splat(d128, tag8))
+        .to_bitmask() as u32
 }
 
 #[inline(always)]
@@ -468,51 +437,34 @@ impl RawDictIndex {
     }
 
     #[inline(always)]
-    pub(crate) fn search4_mask<S: SimdBackend>(
+    pub(crate) fn search4_mask<D: SimdDescriptor>(
         &self,
-        simd: S,
+        d: D,
         p64: u64,
         sec_hash: u32,
     ) -> Option<(&[u32; 4], u32)> {
         let bucket = self.bucket4(p64)?;
         let tag8 = sec_hash >> 24;
-        let mask = dispatch_simd!(
-            simd,
-            S => x64: |tok| raw_dict_search4_avx2(bucket, tag8, tok),
-            neon: |tok| raw_dict_search4_neon(bucket, tag8, tok),
-            scalar: raw_dict_search4_scalar(bucket, tag8),
-        );
+        let mask = if D::IS_EMULATED {
+            raw_dict_search4_scalar(bucket, tag8)
+        } else {
+            raw_dict_search4_simd(d, bucket, tag8)
+        };
         Some((bucket, mask))
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-#[simd_entry]
-#[inline]
-#[target_feature(enable = "avx2")]
-fn dict5_search8_avx2(bucket: &[u32; 8], tag8: u32, _tok: impl SimdToken) -> u32 {
-    let v = _mm256_loadu_si256(bucket);
-    let eq = _mm256_cmpeq_epi32(_mm256_srli_epi32::<24>(v), _mm256_set1_epi32(tag8 as i32));
-    _mm256_movemask_ps(_mm256_castsi256_ps(eq)) as u32
-}
-
-#[cfg(target_arch = "aarch64")]
-#[simd_entry]
-#[inline]
-#[target_feature(enable = "neon")]
-fn dict5_search8_neon(bucket: &[u32; 8], tag8: u32, _tok: impl SimdToken) -> u32 {
-    let vt = vdupq_n_u32(tag8);
-    let c0 = vceqq_u32(
-        vshrq_n_u32::<24>(vld1q_u32(bucket.first_chunk::<4>().unwrap())),
-        vt,
-    );
-    let c1 = vceqq_u32(
-        vshrq_n_u32::<24>(vld1q_u32(bucket.last_chunk::<4>().unwrap())),
-        vt,
-    );
-    let w0 = vld1q_u32(&[1u32, 2, 4, 8]);
-    let w1 = vld1q_u32(&[16u32, 32, 64, 128]);
-    vaddvq_u32(vorrq_u32(vandq_u32(c0, w0), vandq_u32(c1, w1)))
+#[inline(always)]
+fn dict5_search8_simd<D: SimdDescriptor>(d: D, bucket: &[u32; 8], tag8: u32) -> u32 {
+    let d256 = d.maybe_downgrade_256bit();
+    let vt = U32Vec::splat(d256, tag8);
+    let step = U32Vec::<D::Descriptor256>::LEN;
+    let mut mask = 0u32;
+    for (i, chunk) in bucket.chunks_exact(step).enumerate() {
+        let m = U32Vec::load(d256, chunk).shr::<24>().eq(vt).to_bitmask() as u32;
+        mask |= m << (i * step);
+    }
+    mask
 }
 
 #[inline(always)]
@@ -639,12 +591,12 @@ impl Dict5Index {
     }
 
     #[inline(always)]
-    pub(crate) fn prefetch_ahead<S: SimdBackend>(&self, simd: S, p64_head: u64, p64_chunk: u64) {
-        if const { S::IS_SIMD } && !self.heads.is_empty() {
-            simd.prefetch_t0(&self.heads[((p64_head >> self.shift5) as usize) & self.mask5]);
+    pub(crate) fn prefetch_ahead<D: SimdDescriptor>(&self, d: D, p64_head: u64, p64_chunk: u64) {
+        if const { !D::IS_EMULATED } && !self.heads.is_empty() {
+            d.prefetch_t0(&self.heads[((p64_head >> self.shift5) as usize) & self.mask5]);
             let hdr = self.heads[((p64_chunk >> self.shift5) as usize) & self.mask5];
             if hdr != 0 {
-                simd.prefetch_t0(&self.chunks8[(hdr >> 6) as usize]);
+                d.prefetch_t0(&self.chunks8[(hdr >> 6) as usize]);
             }
         }
     }
@@ -671,13 +623,12 @@ impl Dict5Index {
     }
 
     #[inline(always)]
-    pub(crate) fn search8_chunk_mask<S: SimdBackend>(simd: S, chunk: &[u32; 8], tag8: u32) -> u32 {
-        dispatch_simd!(
-            simd,
-            S => x64: |tok| dict5_search8_avx2(chunk, tag8, tok),
-            neon: |tok| dict5_search8_neon(chunk, tag8, tok),
-            scalar: dict5_search8_scalar(chunk, tag8),
-        )
+    pub(crate) fn search8_chunk_mask<D: SimdDescriptor>(d: D, chunk: &[u32; 8], tag8: u32) -> u32 {
+        if D::IS_EMULATED {
+            dict5_search8_scalar(chunk, tag8)
+        } else {
+            dict5_search8_simd(d, chunk, tag8)
+        }
     }
 }
 
@@ -1199,212 +1150,108 @@ fn tags_shift_match_portable(slot: &mut [u16], tag: u16) -> u32 {
     m
 }
 
-#[cfg(target_arch = "x86_64")]
-#[simd_entry]
-#[inline]
-#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
-fn tags_insert_avx2<const WAYS: usize>(slot: &mut [u16; WAYS], tag: u16, _tok: impl SimdToken) {
-    let vt = _mm_set1_epi16(tag as i16);
-    match WAYS {
-        4 => {
-            let s = slot.first_chunk_mut::<4>().unwrap();
-            let old: u64 = zerocopy::transmute!(*s);
-            *s = zerocopy::transmute!((old << 16) | (tag as u64));
-        }
-        8 => {
-            let s = slot.first_chunk_mut::<8>().unwrap();
-            _mm_storeu_si128(s, _mm_alignr_epi8::<14>(_mm_loadu_si128(s), vt));
-        }
-        16 => {
-            let [c0, c1] = slot.as_chunks_mut::<8>().0.first_chunk_mut::<2>().unwrap();
-            let (p0, p1) = (_mm_loadu_si128(c0), _mm_loadu_si128(c1));
-            _mm_storeu_si128(c0, _mm_alignr_epi8::<14>(p0, vt));
-            _mm_storeu_si128(c1, _mm_alignr_epi8::<14>(p1, p0));
-        }
-        _ => tags_insert_portable(slot, tag),
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[simd_entry]
-#[inline]
-#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
-fn tags_shift_match_avx2<const WAYS: usize>(
-    slot: &mut [u16; WAYS],
-    tag: u16,
-    _tok: impl SimdToken,
-) -> u32 {
-    let vt = _mm_set1_epi16(tag as i16);
-    match WAYS {
-        4 => {
-            let s = slot.first_chunk_mut::<4>().unwrap();
-            let old: u64 = zerocopy::transmute!(*s);
-            *s = zerocopy::transmute!((old << 16) | (tag as u64));
-            let eq = _mm_cmpeq_epi16(_mm_cvtsi64_si128(old as i64), vt);
-            (_mm_movemask_epi8(_mm_packs_epi16(eq, eq)) as u32) & 0xF
-        }
-        8 => {
-            let s = slot.first_chunk_mut::<8>().unwrap();
-            let cur = _mm_loadu_si128(s);
-            _mm_storeu_si128(s, _mm_alignr_epi8::<14>(cur, vt));
-            let eq = _mm_cmpeq_epi16(cur, vt);
-            (_mm_movemask_epi8(_mm_packs_epi16(eq, eq)) as u8) as u32
-        }
-        16 => {
-            let [c0, c1] = slot.as_chunks_mut::<8>().0.first_chunk_mut::<2>().unwrap();
-            let (p0, p1) = (_mm_loadu_si128(c0), _mm_loadu_si128(c1));
-            _mm_storeu_si128(c0, _mm_alignr_epi8::<14>(p0, vt));
-            _mm_storeu_si128(c1, _mm_alignr_epi8::<14>(p1, p0));
-            _mm_movemask_epi8(_mm_packs_epi16(
-                _mm_cmpeq_epi16(p0, vt),
-                _mm_cmpeq_epi16(p1, vt),
-            )) as u32
-        }
-        _ => tags_shift_match_portable(slot, tag),
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[simd_entry]
-#[inline]
-#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
-fn tags_match_ring_avx2<const WAYS: usize>(
-    slot: &[u16; WAYS],
-    tag: u16,
-    _tok: impl SimdToken,
-) -> u32 {
-    match WAYS {
-        32 => {
-            let v = _mm256_set1_epi16(tag as i16);
-            let [c0, c1] = slot.as_chunks::<16>().0.first_chunk::<2>().unwrap();
-            let pk = _mm256_packs_epi16(
-                _mm256_cmpeq_epi16(_mm256_loadu_si256(c0), v),
-                _mm256_cmpeq_epi16(_mm256_loadu_si256(c1), v),
-            );
-            _mm256_movemask_epi8(_mm256_permute4x64_epi64::<0xD8>(pk)) as u32
-        }
-        _ => tags_match_portable(slot, tag),
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[simd_entry]
-#[inline]
-#[target_feature(enable = "neon")]
-fn tags_insert_neon<const WAYS: usize>(slot: &mut [u16; WAYS], tag: u16, _tok: impl SimdToken) {
-    let vt = vdupq_n_u16(tag);
-    match WAYS {
-        4 => {
-            let s = slot.first_chunk_mut::<4>().unwrap();
-            let old: u64 = zerocopy::transmute!(*s);
-            *s = zerocopy::transmute!((old << 16) | (tag as u64));
-        }
-        8 => {
-            let s = slot.first_chunk_mut::<8>().unwrap();
-            vst1q_u16(s, vextq_u16::<7>(vt, vld1q_u16(s)));
-        }
-        16 => {
-            let [c0, c1] = slot.as_chunks_mut::<8>().0.first_chunk_mut::<2>().unwrap();
-            let (p0, p1) = (vld1q_u16(c0), vld1q_u16(c1));
-            vst1q_u16(c0, vextq_u16::<7>(vt, p0));
-            vst1q_u16(c1, vextq_u16::<7>(p0, p1));
-        }
-        _ => tags_insert_portable(slot, tag),
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[simd_entry]
-#[inline]
-#[target_feature(enable = "neon")]
-fn tags_shift_match_neon<const WAYS: usize>(
-    slot: &mut [u16; WAYS],
-    tag: u16,
-    _tok: impl SimdToken,
-) -> u32 {
-    let vt = vdupq_n_u16(tag);
-    match WAYS {
-        4 => {
-            let s = slot.first_chunk_mut::<4>().unwrap();
-            let old: u64 = zerocopy::transmute!(*s);
-            *s = zerocopy::transmute!((old << 16) | (tag as u64));
-            let eq = vceq_u16(vreinterpret_u16_u64(vcreate_u64(old)), vget_low_u16(vt));
-            let w = vld1_u16(&[1u16, 2, 4, 8]);
-            vaddv_u16(vand_u16(eq, w)) as u32
-        }
-        8 => {
-            let s = slot.first_chunk_mut::<8>().unwrap();
-            let cur = vld1q_u16(s);
-            vst1q_u16(s, vextq_u16::<7>(vt, cur));
-            let w = vld1q_u16(&[1u16, 2, 4, 8, 16, 32, 64, 128]);
-            vaddvq_u16(vandq_u16(vceqq_u16(cur, vt), w)) as u32
-        }
-        16 => {
-            let [c0, c1] = slot.as_chunks_mut::<8>().0.first_chunk_mut::<2>().unwrap();
-            let (p0, p1) = (vld1q_u16(c0), vld1q_u16(c1));
-            vst1q_u16(c0, vextq_u16::<7>(vt, p0));
-            vst1q_u16(c1, vextq_u16::<7>(p0, p1));
-            let w0 = vld1q_u16(&[1u16, 2, 4, 8, 16, 32, 64, 128]);
-            let w1 = vld1q_u16(&[256u16, 512, 1024, 2048, 4096, 8192, 16384, 32768]);
-            let lo = vandq_u16(vceqq_u16(p0, vt), w0);
-            let hi = vandq_u16(vceqq_u16(p1, vt), w1);
-            vaddvq_u16(vorrq_u16(lo, hi)) as u32
-        }
-        _ => tags_shift_match_portable(slot, tag),
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[simd_entry]
-#[inline]
-#[target_feature(enable = "neon")]
-fn tags_match_ring_neon<const WAYS: usize>(
-    slot: &[u16; WAYS],
-    tag: u16,
-    _tok: impl SimdToken,
-) -> u32 {
-    match WAYS {
-        32 => {
-            let vt = vdupq_n_u16(tag);
-            let chunks = slot.as_chunks::<8>().0.first_chunk::<4>().unwrap();
-            let x = vld1q_u16_x4(chunks);
-            let w0 = vld1q_u16(&[1u16, 2, 4, 8, 16, 32, 64, 128]);
-            let w1 = vld1q_u16(&[256u16, 512, 1024, 2048, 4096, 8192, 16384, 32768]);
-            let lo = vorrq_u16(
-                vandq_u16(vceqq_u16(x.0, vt), w0),
-                vandq_u16(vceqq_u16(x.1, vt), w1),
-            );
-            let hi = vorrq_u16(
-                vandq_u16(vceqq_u16(x.2, vt), w0),
-                vandq_u16(vceqq_u16(x.3, vt), w1),
-            );
-            (vaddvq_u16(lo) as u32) | ((vaddvq_u16(hi) as u32) << 16)
-        }
-        _ => tags_match_portable(slot, tag),
-    }
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
 #[inline(always)]
-fn shift_tagged_search<const WAYS: usize, S: SimdBackend>(
-    simd: S,
+fn tags_insert<const WAYS: usize, D: SimdDescriptor>(d: D, slot: &mut [u16; WAYS], tag: u16) {
+    if D::IS_EMULATED {
+        tags_insert_portable(slot, tag);
+        return;
+    }
+    let d128 = d.maybe_downgrade_128bit();
+    let vt = U16Vec::splat(d128, tag);
+    match WAYS {
+        4 => {
+            let s = slot.first_chunk_mut::<4>().unwrap();
+            let [t0, t1, t2, _] = *s;
+            *s = [tag, t0, t1, t2];
+        }
+        8 | 16 => {
+            let mut prev = vt;
+            for chunk in slot.as_chunks_mut::<8>().0 {
+                let p = U16Vec::load(d128, chunk);
+                p.slide_right::<1>(prev).store(chunk);
+                prev = p;
+            }
+        }
+        _ => tags_insert_portable(slot, tag),
+    }
+}
+
+#[inline(always)]
+fn tags_shift_match<const WAYS: usize, D: SimdDescriptor>(
+    d: D,
+    slot: &mut [u16; WAYS],
+    tag: u16,
+) -> u32 {
+    if D::IS_EMULATED {
+        return tags_shift_match_portable(slot, tag);
+    }
+    let d128 = d.maybe_downgrade_128bit();
+    let vt = U16Vec::splat(d128, tag);
+    match WAYS {
+        4 => {
+            let s = slot.first_chunk_mut::<4>().unwrap();
+            let [t0, t1, t2, t3] = *s;
+            *s = [tag, t0, t1, t2];
+            U16Vec::load(d128, &[t0, t1, t2, t3, 0, 0, 0, 0])
+                .eq(vt)
+                .to_bitmask() as u32
+                & 0xF
+        }
+        8 => {
+            let s = slot.first_chunk_mut::<8>().unwrap();
+            let cur = U16Vec::load(d128, s);
+            cur.slide_right::<1>(vt).store(s);
+            cur.eq(vt).to_bitmask() as u32
+        }
+        16 => {
+            let [c0, c1] = slot.as_chunks_mut::<8>().0.first_chunk_mut::<2>().unwrap();
+            let (p0, p1) = (U16Vec::load(d128, c0), U16Vec::load(d128, c1));
+            p0.slide_right::<1>(vt).store(c0);
+            p1.slide_right::<1>(p0).store(c1);
+            (p0.eq(vt).to_bitmask() as u32) | ((p1.eq(vt).to_bitmask() as u32) << 8)
+        }
+        _ => tags_shift_match_portable(slot, tag),
+    }
+}
+
+#[inline(always)]
+fn tags_match_ring<const WAYS: usize, D: SimdDescriptor>(
+    d: D,
+    slot: &[u16; WAYS],
+    tag: u16,
+) -> u32 {
+    if D::IS_EMULATED {
+        return tags_match_portable(slot, tag);
+    }
+    if WAYS == 32 {
+        let d256 = d.maybe_downgrade_256bit();
+        let vt = U16Vec::splat(d256, tag);
+        let step = U16Vec::<D::Descriptor256>::LEN;
+        let mut mask = 0u32;
+        for (i, chunk) in slot.chunks_exact(step).enumerate() {
+            mask |= (U16Vec::load(d256, chunk).eq(vt).to_bitmask() as u32) << (i * step);
+        }
+        mask
+    } else {
+        tags_match_portable(slot, tag)
+    }
+}
+
+#[inline(always)]
+fn shift_tagged_search<const WAYS: usize, D: SimdDescriptor>(
+    d: D,
     tags: &mut [u16; WAYS],
     buckets: &mut [u32; WAYS],
     (sec_hash, vpos, wsize): (u32, u32, u32),
     dists: &mut [u32; 32],
 ) -> u32 {
     let tag = shift_tag16(sec_hash);
-    let tm = dispatch_simd!(
-        simd,
-        S => x64: |tok| tags_shift_match_avx2(tags, tag, tok),
-        neon: |tok| tags_shift_match_neon(tags, tag, tok),
-        scalar: tags_shift_match_portable(tags, tag),
-    );
+    let tm = tags_shift_match(d, tags, tag);
     if tm == 0 {
-        buckets_insert(buckets, simd, vpos);
+        buckets_insert(buckets, d, vpos);
         return 0;
     }
-    buckets_search_and_insert_masked(buckets, simd, vpos, wsize, tm, dists)
+    buckets_search_and_insert_masked(buckets, d, vpos, wsize, tm, dists)
 }
 
 #[inline(always)]
@@ -1446,10 +1293,9 @@ fn ring_finish_search(
     out
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
 #[inline(always)]
-fn ring_search<const WAYS: usize, S: SimdBackend>(
-    simd: S,
+fn ring_search<const WAYS: usize, D: SimdDescriptor>(
+    d: D,
     head: &mut u8,
     tags: &mut [u16; WAYS],
     buckets: &mut [u32; WAYS],
@@ -1463,12 +1309,7 @@ fn ring_search<const WAYS: usize, S: SimdBackend>(
         return 0;
     };
     let tag = ring_tag16(sec_hash);
-    let raw = dispatch_simd!(
-        simd,
-        S => x64: |tok| tags_match_ring_avx2(ts, tag, tok),
-        neon: |tok| tags_match_ring_neon(ts, tag, tok),
-        scalar: tags_match_portable(ts, tag),
-    );
+    let raw = tags_match_ring(d, ts, tag);
     ring_finish_search(head, ts, bs, raw, (tag, vpos, wsize), dists)
 }
 
@@ -1515,231 +1356,119 @@ pub(crate) fn buckets_search_and_insert_portable(
     mask
 }
 
-#[cfg(target_arch = "x86_64")]
-#[simd_entry]
-#[inline]
-#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
-pub(crate) fn buckets_insert_avx2<const WAYS: usize>(
+#[inline(always)]
+fn buckets_insert_width<const WAYS: usize, D: SimdDescriptor>(
+    dw: D,
     slot: &mut [u32; WAYS],
     target: u32,
-    _tok: impl SimdToken,
 ) {
-    let vt = target as i32;
-    match WAYS {
-        4 => {
-            let arr = slot.first_chunk_mut::<4>().unwrap();
-            let p0 = _mm_loadu_si128(arr);
-            _mm_storeu_si128(arr, _mm_alignr_epi8::<12>(p0, _mm_set1_epi32(vt)));
-        }
-        8 | 16 | 32 => {
-            let shuf = _mm256_setr_epi32(7, 0, 1, 2, 3, 4, 5, 6);
-            let mut prev = _mm256_set1_epi32(vt);
-            for chunk in slot.as_chunks_mut::<8>().0 {
-                let rot = _mm256_permutevar8x32_epi32(_mm256_loadu_si256(chunk), shuf);
-                _mm256_storeu_si256(chunk, _mm256_blend_epi32::<1>(rot, prev));
-                prev = rot;
-            }
-        }
-        _ => buckets_insert_portable(slot, target),
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[simd_entry]
-#[inline]
-#[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
-pub(crate) fn buckets_search_and_insert_avx2<const WAYS: usize>(
-    slot: &mut [u32; WAYS],
-    target: u32,
-    wsize: u32,
-    tag_mask: u32,
-    dists: &mut [u32; 32],
-    _tok: impl SimdToken,
-) -> u32 {
-    const {
-        assert!(WAYS == 1 || WAYS == 4 || WAYS == 8 || WAYS == 16 || WAYS == 32);
-    }
-    match WAYS {
-        1 => {
-            let d = bucket_search_one(&mut slot[0], target, wsize);
-            dists[0] = d;
-            u32::from(d != 0) & tag_mask
-        }
-        4 => {
-            let vt4 = _mm_set1_epi32(target as i32);
-            let vw4 = _mm_set1_epi32(wsize as i32);
-            let arr = slot.first_chunk_mut::<4>().unwrap();
-            let p0 = _mm_loadu_si128(arr);
-            _mm_storeu_si128(arr, _mm_alignr_epi8::<12>(p0, vt4));
-            let diff = _mm_sub_epi32(vt4, p0);
-            let mask = (_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(
-                _mm_max_epu32(diff, vw4),
-                vw4,
-            ))) as u32)
-                & tag_mask;
-            if mask != 0 {
-                _mm_storeu_si128(dists.const_sub_mut::<4, 0>(), diff);
-            }
-            mask
-        }
-        _ => {
-            let vt = _mm256_set1_epi32(target as i32);
-            let vwsize = _mm256_set1_epi32(wsize as i32);
-            let shuf = _mm256_setr_epi32(7, 0, 1, 2, 3, 4, 5, 6);
-            let mut prev = vt;
-            let mut ds = [_mm256_setzero_si256(); 4];
-            let mut vs = [_mm256_setzero_si256(); 4];
-            for (i, chunk) in slot.as_chunks_mut::<8>().0.iter_mut().enumerate() {
-                let p = _mm256_loadu_si256(chunk);
-                let rot = _mm256_permutevar8x32_epi32(p, shuf);
-                _mm256_storeu_si256(chunk, _mm256_blend_epi32::<1>(rot, prev));
-                prev = rot;
-                let d = _mm256_sub_epi32(vt, p);
-                ds[i] = d;
-                vs[i] = _mm256_cmpeq_epi32(_mm256_max_epu32(d, vwsize), vwsize);
-            }
-            let raw_mask = if WAYS == 8 {
-                _mm256_movemask_ps(_mm256_castsi256_ps(vs[0])) as u32
-            } else if WAYS == 16 {
-                (_mm256_movemask_ps(_mm256_castsi256_ps(vs[0])) as u32)
-                    | ((_mm256_movemask_ps(_mm256_castsi256_ps(vs[1])) as u32) << 8)
-            } else {
-                let p = _mm256_packs_epi16(
-                    _mm256_packs_epi32(vs[0], vs[1]),
-                    _mm256_packs_epi32(vs[2], vs[3]),
-                );
-                _mm256_movemask_epi8(_mm256_permutevar8x32_epi32(
-                    p,
-                    _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7),
-                )) as u32
-            };
-            let mask = raw_mask & tag_mask;
-            if mask != 0 {
-                for (i, out_chunk) in dists.as_chunks_mut::<8>().0[..WAYS / 8]
-                    .iter_mut()
-                    .enumerate()
-                {
-                    _mm256_storeu_si256(out_chunk, ds[i]);
-                }
-            }
-            mask
-        }
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[simd_entry]
-#[inline]
-#[target_feature(enable = "neon")]
-pub(crate) fn buckets_insert_neon<const WAYS: usize>(
-    slot: &mut [u32; WAYS],
-    target: u32,
-    _tok: impl SimdToken,
-) {
-    match WAYS {
-        4 | 8 | 16 | 32 => {
-            let mut prev = vdupq_n_u32(target);
-            for chunk in slot.as_chunks_mut::<4>().0 {
-                let p = vld1q_u32(chunk);
-                vst1q_u32(chunk, vextq_u32::<3>(prev, p));
-                prev = p;
-            }
-        }
-        _ => buckets_insert_portable(slot, target),
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[simd_entry]
-#[inline]
-#[target_feature(enable = "neon")]
-pub(crate) fn buckets_search_and_insert_neon<const WAYS: usize>(
-    slot: &mut [u32; WAYS],
-    target: u32,
-    wsize: u32,
-    tag_mask: u32,
-    dists: &mut [u32; 32],
-    _tok: impl SimdToken,
-) -> u32 {
-    const {
-        assert!(WAYS == 1 || WAYS == 4 || WAYS == 8 || WAYS == 16 || WAYS == 32);
-    }
-    if WAYS == 1 {
-        let d = bucket_search_one(&mut slot[0], target, wsize);
-        dists[0] = d;
-        return u32::from(d != 0) & tag_mask;
-    }
-    let vt = vdupq_n_u32(target);
-    let vwsize = vdupq_n_u32(wsize);
-    let mut prev = vt;
-    let mut ds = [vdupq_n_u32(0); 8];
-    let w_base = vld1q_u32(&[1u32, 2, 4, 8]);
-    let mut mask_vec = vdupq_n_u32(0);
-    for (i, chunk) in slot.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-        let p = vld1q_u32(chunk);
-        vst1q_u32(chunk, vextq_u32::<3>(prev, p));
+    let mut prev = U32Vec::splat(dw, target);
+    let step = U32Vec::<D>::LEN;
+    for chunk in slot.chunks_exact_mut(step) {
+        let p = U32Vec::load(dw, chunk);
+        p.slide_right::<1>(prev).store(chunk);
         prev = p;
-        let d = vsubq_u32(vt, p);
-        ds[i] = d;
-        let cmp = vcleq_u32(d, vwsize);
-        let w = vshlq_u32(w_base, vdupq_n_s32((i * 4) as i32));
-        mask_vec = vorrq_u32(mask_vec, vandq_u32(cmp, w));
     }
-    let mask = vaddvq_u32(mask_vec) & tag_mask;
+}
+
+#[inline(always)]
+fn buckets_insert<const WAYS: usize, D: SimdDescriptor>(slot: &mut [u32; WAYS], d: D, target: u32) {
+    if const { WAYS == 1 } {
+        slot[0] = target;
+        return;
+    }
+    if D::IS_EMULATED {
+        buckets_insert_portable(slot, target);
+        return;
+    }
+    match WAYS {
+        4 => buckets_insert_width(d.maybe_downgrade_128bit(), slot, target),
+        8 | 16 | 32 => buckets_insert_width(d.maybe_downgrade_256bit(), slot, target),
+        _ => buckets_insert_portable(slot, target),
+    }
+}
+
+#[inline(always)]
+fn buckets_search_and_insert_width<const WAYS: usize, D: SimdDescriptor>(
+    dw: D,
+    slot: &mut [u32; WAYS],
+    target: u32,
+    wsize: u32,
+    tag_mask: u32,
+    dists: &mut [u32; 32],
+) -> u32 {
+    let vt = U32Vec::splat(dw, target);
+    let vwsize = U32Vec::splat(dw, wsize);
+    let step = U32Vec::<D>::LEN;
+    let mut prev = vt;
+    let mut ds = [U32Vec::zero(dw); 8];
+    let mut raw_mask = 0u32;
+    for (i, chunk) in slot.chunks_exact_mut(step).enumerate() {
+        let p = U32Vec::load(dw, chunk);
+        p.slide_right::<1>(prev).store(chunk);
+        prev = p;
+        let diff = vt - p;
+        ds[i] = diff;
+        raw_mask |= (diff.max(vwsize).eq(vwsize).to_bitmask() as u32) << (i * step);
+    }
+    let mask = raw_mask & tag_mask;
     if mask != 0 {
-        for (i, out_chunk) in dists.as_chunks_mut::<4>().0[..WAYS / 4]
-            .iter_mut()
-            .enumerate()
-        {
-            vst1q_u32(out_chunk, ds[i]);
+        for (i, out_chunk) in dists.chunks_exact_mut(step).take(WAYS / step).enumerate() {
+            ds[i].store(out_chunk);
         }
     }
     mask
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
 #[inline(always)]
-fn buckets_insert<const WAYS: usize, S: SimdBackend>(slot: &mut [u32; WAYS], simd: S, target: u32) {
-    if const { WAYS == 1 } {
-        slot[0] = target;
-        return;
-    }
-    dispatch_simd!(
-        simd,
-        S => x64: |tok| buckets_insert_avx2(slot, target, tok),
-        neon: |tok| buckets_insert_neon(slot, target, tok),
-        scalar: buckets_insert_portable(slot, target),
-    );
-}
-
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
-#[inline(always)]
-fn buckets_search_and_insert_masked<const WAYS: usize, S: SimdBackend>(
+fn buckets_search_and_insert_masked<const WAYS: usize, D: SimdDescriptor>(
     slot: &mut [u32; WAYS],
-    simd: S,
+    d: D,
     target: u32,
     wsize: u32,
     tag_mask: u32,
     dists: &mut [u32; 32],
 ) -> u32 {
-    dispatch_simd!(
-        simd,
-        S => x64: |tok| buckets_search_and_insert_avx2(slot, target, wsize, tag_mask, dists, tok),
-        neon: |tok| buckets_search_and_insert_neon(slot, target, wsize, tag_mask, dists, tok),
-        scalar: buckets_search_and_insert_portable(slot, target, wsize, dists) & tag_mask,
-    )
+    const {
+        assert!(WAYS == 1 || WAYS == 4 || WAYS == 8 || WAYS == 16 || WAYS == 32);
+    }
+    if const { WAYS == 1 } {
+        let diff = bucket_search_one(&mut slot[0], target, wsize);
+        dists[0] = diff;
+        return u32::from(diff != 0) & tag_mask;
+    }
+    if D::IS_EMULATED {
+        return buckets_search_and_insert_portable(slot, target, wsize, dists) & tag_mask;
+    }
+    match WAYS {
+        4 => buckets_search_and_insert_width(
+            d.maybe_downgrade_128bit(),
+            slot,
+            target,
+            wsize,
+            tag_mask,
+            dists,
+        ),
+        _ => buckets_search_and_insert_width(
+            d.maybe_downgrade_256bit(),
+            slot,
+            target,
+            wsize,
+            tag_mask,
+            dists,
+        ),
+    }
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
 #[inline(always)]
-fn buckets_search_and_insert<const WAYS: usize, S: SimdBackend>(
+fn buckets_search_and_insert<const WAYS: usize, D: SimdDescriptor>(
     slot: &mut [u32; WAYS],
-    simd: S,
+    d: D,
     target: u32,
     wsize: u32,
     dists: &mut [u32; 32],
 ) -> u32 {
-    buckets_search_and_insert_masked(slot, simd, target, wsize, u32::MAX, dists)
+    buckets_search_and_insert_masked(slot, d, target, wsize, u32::MAX, dists)
 }
 
 fn shift_back_u32(table: &mut [u32], pos_mask: u32, amount: u32) {
@@ -1763,87 +1492,23 @@ fn shift_back_u32_with_u16(table: &mut [u32], tags: &mut [u16], pos_mask: u32, a
     }
 }
 
-#[cfg(target_arch = "aarch64")]
-#[inline]
-#[target_feature(enable = "neon")]
-fn movemask_u8x16_neon(v: uint8x16_t) -> u32 {
-    let w = vld1q_u8(&[1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128]);
-    let m = vandq_u8(v, w);
-    let p0 = vpaddq_u8(m, m);
-    let p1 = vpaddq_u8(p0, p0);
-    let p2 = vpaddq_u8(p1, p1);
-    vgetq_lane_u16::<0>(vreinterpretq_u16_u8(p2)) as u32
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline]
-#[target_feature(enable = "neon")]
-fn movemask_u8x32_neon(lo: uint8x16_t, hi: uint8x16_t) -> u32 {
-    let w = vld1q_u8(&[1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128]);
-    let p0 = vpaddq_u8(vandq_u8(lo, w), vandq_u8(hi, w));
-    let p1 = vpaddq_u8(p0, p0);
-    let p2 = vpaddq_u8(p1, p1);
-    vgetq_lane_u32::<0>(vreinterpretq_u32_u8(p2))
-}
-
-#[cfg(target_arch = "x86_64")]
-#[simd_entry]
-#[inline]
-#[target_feature(enable = "avx2")]
-fn diff_mask32(a: &[u8; 32], b: &[u8; 32], _tok: impl SimdToken) -> u32 {
-    !(_mm256_movemask_epi8(_mm256_cmpeq_epi8(
-        _mm256_loadu_si256(a),
-        _mm256_loadu_si256(b),
-    )) as u32)
-}
-
-#[cfg(target_arch = "aarch64")]
-#[simd_entry]
-#[inline]
-#[target_feature(enable = "neon")]
-fn diff_mask32(a: &[u8; 32], b: &[u8; 32], _tok: impl SimdToken) -> u32 {
-    let d0 = vmvnq_u8(vceqq_u8(
-        vld1q_u8(a.const_sub::<16, 0>()),
-        vld1q_u8(b.const_sub::<16, 0>()),
-    ));
-    let d1 = vmvnq_u8(vceqq_u8(
-        vld1q_u8(a.const_sub::<16, 16>()),
-        vld1q_u8(b.const_sub::<16, 16>()),
-    ));
-    movemask_u8x32_neon(d0, d1)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[simd_entry]
-#[inline]
-#[target_feature(enable = "avx2")]
-fn eq2_mask32(a0: &[u8; 32], a1: &[u8; 32], b0: u8, b1: u8, _tok: impl SimdToken) -> u32 {
-    let e0 = _mm256_cmpeq_epi8(_mm256_loadu_si256(a0), _mm256_set1_epi8(b0 as i8));
-    let e1 = _mm256_cmpeq_epi8(_mm256_loadu_si256(a1), _mm256_set1_epi8(b1 as i8));
-    _mm256_movemask_epi8(_mm256_and_si256(e0, e1)) as u32
-}
-
-#[cfg(target_arch = "aarch64")]
-#[simd_entry]
-#[inline]
-#[target_feature(enable = "neon")]
-fn eq2_mask32(a0: &[u8; 32], a1: &[u8; 32], b0: u8, b1: u8, _tok: impl SimdToken) -> u32 {
-    let (vb0, vb1) = (vdupq_n_u8(b0), vdupq_n_u8(b1));
-    let m0 = vandq_u8(
-        vceqq_u8(vld1q_u8(a0.const_sub::<16, 0>()), vb0),
-        vceqq_u8(vld1q_u8(a1.const_sub::<16, 0>()), vb1),
-    );
-    let m1 = vandq_u8(
-        vceqq_u8(vld1q_u8(a0.const_sub::<16, 16>()), vb0),
-        vceqq_u8(vld1q_u8(a1.const_sub::<16, 16>()), vb1),
-    );
-    movemask_u8x32_neon(m0, m1)
+#[inline(always)]
+fn eq2_mask32<D: SimdDescriptor>(d: D, a0: &[u8; 32], a1: &[u8; 32], b0: u8, b1: u8) -> u32 {
+    let d256 = d.maybe_downgrade_256bit();
+    let step = U8Vec::<D::Descriptor256>::LEN;
+    let (vb0, vb1) = (U8Vec::splat(d256, b0), U8Vec::splat(d256, b1));
+    let mut mask = 0u32;
+    for (i, (c0, c1)) in a0.chunks_exact(step).zip(a1.chunks_exact(step)).enumerate() {
+        let m = (U8Vec::load(d256, c0).eq(vb0) & U8Vec::load(d256, c1).eq(vb1)).to_bitmask() as u32;
+        mask |= m << (i * step);
+    }
+    mask
 }
 
 /// Returns the smallest `d` in `1..=max_d2.min(pos).min(64)` with `data[pos-d..pos-d+2] == data[pos..pos+2]`, or `u32::MAX`.
 #[inline(always)]
-pub(crate) fn find_closest_2b<S: SimdBackend>(
-    simd: S,
+pub(crate) fn find_closest_2b<D: SimdDescriptor>(
+    d: D,
     data: &[u8],
     pos: usize,
     max_d2: usize,
@@ -1853,55 +1518,49 @@ pub(crate) fn find_closest_2b<S: SimdBackend>(
         return u32::MAX;
     }
     let [b0, b1] = [data[pos], data[pos + 1]];
-    let lo = dispatch_simd!(
-        simd, S => |tok| {
-            if pos >= 32 {
-                let w = &data[pos - 32..pos + 1];
-                let m0 = eq2_mask32(w.first_chunk().unwrap(), w.last_chunk().unwrap(), b0, b1, tok);
-                if m0 != 0 {
-                    let d = (m0.leading_zeros() + 1) as usize;
-                    return if d <= lim { d as u32 } else { u32::MAX };
-                }
-                if lim <= 32 {
-                    return u32::MAX;
-                }
-                if pos >= 64 {
-                    let w2 = &data[pos - 64..pos - 31];
-                    let m1 = eq2_mask32(w2.first_chunk().unwrap(), w2.last_chunk().unwrap(), b0, b1, tok);
-                    let d = (m1.leading_zeros() + 33) as usize;
-                    return if m1 != 0 && d <= lim { d as u32 } else { u32::MAX };
-                }
-                33usize
+    let lo = if const { !D::IS_EMULATED } && pos >= 32 {
+        let w = &data[pos - 32..pos + 1];
+        let m0 = eq2_mask32(d, w.first_chunk().unwrap(), w.last_chunk().unwrap(), b0, b1);
+        if m0 != 0 {
+            let dist = (m0.leading_zeros() + 1) as usize;
+            return if dist <= lim { dist as u32 } else { u32::MAX };
+        }
+        if lim <= 32 {
+            return u32::MAX;
+        }
+        if pos >= 64 {
+            let w2 = &data[pos - 64..pos - 31];
+            let m1 = eq2_mask32(
+                d,
+                w2.first_chunk().unwrap(),
+                w2.last_chunk().unwrap(),
+                b0,
+                b1,
+            );
+            let dist = (m1.leading_zeros() + 33) as usize;
+            return if m1 != 0 && dist <= lim {
+                dist as u32
             } else {
-                1usize
-            }
-        },
+                u32::MAX
+            };
+        }
+        33usize
+    } else {
         1usize
-    );
+    };
     (lo..=lim)
-        .find(|&d| data[pos - d..pos - d + 2] == [b0, b1])
-        .map_or(u32::MAX, |d| d as u32)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[simd_entry]
-#[inline]
-#[target_feature(enable = "sse2")]
-fn diff_mask16(a: &[u8; 16], b: &[u8; 16], _tok: impl SimdToken) -> u32 {
-    !(_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128(a), _mm_loadu_si128(b))) as u32) & 0xFFFF
-}
-
-#[cfg(target_arch = "aarch64")]
-#[simd_entry]
-#[inline]
-#[target_feature(enable = "neon")]
-fn diff_mask16(a: &[u8; 16], b: &[u8; 16], _tok: impl SimdToken) -> u32 {
-    movemask_u8x16_neon(vmvnq_u8(vceqq_u8(vld1q_u8(a), vld1q_u8(b))))
+        .find(|&dist| data[pos - dist..pos - dist + 2] == [b0, b1])
+        .map_or(u32::MAX, |dist| dist as u32)
 }
 
 #[inline(always)]
-fn common_prefix_slices_from<const START: usize, S: SimdBackend>(
-    simd: S,
+fn diff_mask_vec<D: SimdDescriptor>(d: D, a: &[u8], b: &[u8]) -> u32 {
+    (!U8Vec::load(d, a).eq(U8Vec::load(d, b))).to_bitmask() as u32
+}
+
+#[inline(always)]
+fn common_prefix_slices_from<const START: usize, D: SimdDescriptor>(
+    d: D,
     s1: &[u8],
     s2: &[u8],
     max_len: usize,
@@ -1911,74 +1570,79 @@ fn common_prefix_slices_from<const START: usize, S: SimdBackend>(
         return max;
     }
     let (a, b) = (&s1[..max], &s2[..max]);
-    dispatch_simd!(
-        simd, S => |tok| {
-            let mut off = START;
-            while let (Some(c1), Some(c2)) = (
-                a.get(off..).and_then(|s| s.first_chunk::<32>()),
-                b.get(off..).and_then(|s| s.first_chunk::<32>()),
+    if const { D::IS_EMULATED } {
+        return START + common_prefix_len(&a[START..], &b[START..], max - START);
+    }
+    let d256 = d.maybe_downgrade_256bit();
+    let d128 = d.maybe_downgrade_128bit();
+    let mut off = START;
+    if const { D::Descriptor256::BYTES == 32 } {
+        while let (Some(c1), Some(c2)) = (
+            a.get(off..).and_then(|s| s.first_chunk::<32>()),
+            b.get(off..).and_then(|s| s.first_chunk::<32>()),
+        ) {
+            let mask = diff_mask_vec(d256, c1, c2);
+            if mask != 0 {
+                return off + mask.trailing_zeros() as usize;
+            }
+            off += 32;
+        }
+    }
+    if off < max {
+        while let (Some(c1), Some(c2)) = (
+            a.get(off..).and_then(|s| s.first_chunk::<16>()),
+            b.get(off..).and_then(|s| s.first_chunk::<16>()),
+        ) {
+            let m = diff_mask_vec(d128, c1, c2);
+            if m != 0 {
+                return off + m.trailing_zeros() as usize;
+            }
+            off += 16;
+            if const { D::Descriptor256::BYTES == 32 } {
+                break;
+            }
+        }
+        if let (Some(c1), Some(c2)) = (a.last_chunk::<16>(), b.last_chunk::<16>()) {
+            let m = diff_mask_vec(d128, c1, c2);
+            return if m != 0 {
+                max - 16 + m.trailing_zeros() as usize
+            } else {
+                max
+            };
+        }
+        if const { START < 16 } {
+            if let (Some(c1), Some(c2)) = (
+                a.get(off..).and_then(|s| s.first_chunk::<8>()),
+                b.get(off..).and_then(|s| s.first_chunk::<8>()),
             ) {
-                let mask = diff_mask32(c1, c2, tok);
-                if mask != 0 {
-                    return off + mask.trailing_zeros() as usize;
+                let diff = u64::from_le_bytes(*c1) ^ u64::from_le_bytes(*c2);
+                if diff != 0 {
+                    return off + (diff.trailing_zeros() >> 3) as usize;
                 }
-                off += 32;
+                off += 8;
             }
-            if off < max {
-                if let (Some(c1), Some(c2)) = (
-                    a.get(off..).and_then(|s| s.first_chunk::<16>()),
-                    b.get(off..).and_then(|s| s.first_chunk::<16>()),
-                ) {
-                    let m = diff_mask16(c1, c2, tok);
-                    if m != 0 {
-                        return off + m.trailing_zeros() as usize;
-                    }
-                    off += 16;
-                }
-                if let (Some(c1), Some(c2)) = (a.last_chunk::<16>(), b.last_chunk::<16>()) {
-                    let m = diff_mask16(c1, c2, tok);
-                    return if m != 0 {
-                        max - 16 + m.trailing_zeros() as usize
-                    } else {
-                        max
-                    };
-                }
-                if const { START < 16 } {
-                    if let (Some(c1), Some(c2)) = (
-                        a.get(off..).and_then(|s| s.first_chunk::<8>()),
-                        b.get(off..).and_then(|s| s.first_chunk::<8>()),
-                    ) {
-                        let diff = u64::from_le_bytes(*c1) ^ u64::from_le_bytes(*c2);
-                        if diff != 0 {
-                            return off + (diff.trailing_zeros() >> 3) as usize;
-                        }
-                        off += 8;
-                    }
-                    if let (Some(c1), Some(c2)) = (a.last_chunk::<8>(), b.last_chunk::<8>()) {
-                        let diff = u64::from_le_bytes(*c1) ^ u64::from_le_bytes(*c2);
-                        return if diff != 0 {
-                            max - 8 + (diff.trailing_zeros() >> 3) as usize
-                        } else {
-                            max
-                        };
-                    }
-                    while off < max {
-                        if a[off] != b[off] {
-                            return off;
-                        }
-                        off += 1;
-                    }
-                }
+            if let (Some(c1), Some(c2)) = (a.last_chunk::<8>(), b.last_chunk::<8>()) {
+                let diff = u64::from_le_bytes(*c1) ^ u64::from_le_bytes(*c2);
+                return if diff != 0 {
+                    max - 8 + (diff.trailing_zeros() >> 3) as usize
+                } else {
+                    max
+                };
             }
-            max
-        },
-        START + common_prefix_len(&a[START..], &b[START..], max - START)
-    )
+            while off < max {
+                if a[off] != b[off] {
+                    return off;
+                }
+                off += 1;
+            }
+        }
+    }
+    max
 }
 
 #[inline(always)]
-fn common_prefix_from<const START: usize, S: SimdBackend>(
-    simd: S,
+fn common_prefix_from<const START: usize, D: SimdDescriptor>(
+    d: D,
     data: &[u8],
     pos1: usize,
     pos2: usize,
@@ -1987,33 +1651,33 @@ fn common_prefix_from<const START: usize, S: SimdBackend>(
     let (Some(a), Some(b)) = (data.get(pos1..), data.get(pos2..)) else {
         return 0;
     };
-    common_prefix_slices_from::<START, S>(simd, a, b, max_len)
+    common_prefix_slices_from::<START, D>(d, a, b, max_len)
 }
 
 #[inline(always)]
-pub(crate) fn common_prefix_slices_from_16<S: SimdBackend>(simd: S, a: &[u8], b: &[u8]) -> usize {
-    common_prefix_slices_from::<16, S>(simd, a, b, MAX_COPY_LEN)
+pub(crate) fn common_prefix_slices_from_16<D: SimdDescriptor>(d: D, a: &[u8], b: &[u8]) -> usize {
+    common_prefix_slices_from::<16, D>(d, a, b, MAX_COPY_LEN)
 }
 
 #[inline(always)]
-pub(crate) fn longest_match_from_16<S: SimdBackend>(
-    simd: S,
+pub(crate) fn longest_match_from_16<D: SimdDescriptor>(
+    d: D,
     data: &[u8],
     pos1: usize,
     pos2: usize,
 ) -> usize {
-    common_prefix_from::<16, S>(simd, data, pos1, pos2, MAX_COPY_LEN)
+    common_prefix_from::<16, D>(d, data, pos1, pos2, MAX_COPY_LEN)
 }
 
 #[inline(always)]
-pub(crate) fn common_prefix_at<S: SimdBackend>(
-    simd: S,
+pub(crate) fn common_prefix_at<D: SimdDescriptor>(
+    d: D,
     data: &[u8],
     pos1: usize,
     pos2: usize,
     max_len: usize,
 ) -> usize {
-    common_prefix_from::<0, S>(simd, data, pos1, pos2, max_len)
+    common_prefix_from::<0, D>(d, data, pos1, pos2, max_len)
 }
 
 #[inline(always)]
@@ -2178,9 +1842,6 @@ const FAST_LDM_LOG: usize = 17;
 const FAST_LDM_SIZE: usize = 1 << FAST_LDM_LOG;
 const FAST_LDM_COEFF0: i16 = -24939;
 const FAST_LDM_COEFF1: i16 = 29797;
-#[cfg(target_arch = "x86_64")]
-const FAST_LDM_COEFF_PACKED: i32 =
-    (((FAST_LDM_COEFF1 as u16 as u32) << 16) | (FAST_LDM_COEFF0 as u16 as u32)) as i32;
 const FAST_LDM_MIN_DIST: usize = 32_768;
 pub(crate) const FAST_LDM_MIN_LEN: usize = 16;
 
@@ -2297,7 +1958,7 @@ impl<'a> LdmScanner<'a> {
     }
 
     #[inline(always)]
-    fn step_anchor<S: SimdBackend>(&mut self, simd: S, pos: usize) {
+    fn step_anchor<D: SimdDescriptor>(&mut self, d: D, pos: usize) {
         let Some(at_pos) = self.pfx8.cursor_at(pos) else {
             return;
         };
@@ -2315,8 +1976,8 @@ impl<'a> LdmScanner<'a> {
             let (mut best_start, mut best_end, mut best_dist) = (pos, pos, 0u32);
             for slot in b.0 {
                 if slot != 0 && (slot & 0x8000_0000) == tag_bit {
-                    let d = vpos.wrapping_sub(slot & 0x7FFF_FFFF);
-                    let du = d as usize;
+                    let dist = vpos.wrapping_sub(slot & 0x7FFF_FFFF);
+                    let du = dist as usize;
                     if du > FAST_LDM_MIN_DIST && du <= self.eff_wsize {
                         if let Some(c8) = at_pos.lookback(du) {
                             let cand = pos - du;
@@ -2337,7 +1998,7 @@ impl<'a> LdmScanner<'a> {
                                     (Some(a), Some(b)) if a == b
                                 );
                                 let m_len = if eq_hi {
-                                    longest_match_from_16(simd, self.data, c_start, m_start)
+                                    longest_match_from_16(d, self.data, c_start, m_start)
                                 } else {
                                     common_prefix_len(
                                         &self.data[c_start..],
@@ -2347,9 +2008,10 @@ impl<'a> LdmScanner<'a> {
                                 };
                                 let m_end = m_start + m_len;
                                 if m_end - m_start > best_end - best_start
-                                    || (m_end - m_start == best_end - best_start && d < best_dist)
+                                    || (m_end - m_start == best_end - best_start
+                                        && dist < best_dist)
                                 {
-                                    (best_start, best_end, best_dist) = (m_start, m_end, d);
+                                    (best_start, best_end, best_dist) = (m_start, m_end, dist);
                                 }
                             }
                         }
@@ -2377,9 +2039,9 @@ impl<'a> LdmScanner<'a> {
     }
 
     #[inline(always)]
-    fn scan_scalar<S: SimdBackend>(
+    fn scan_scalar<D: SimdDescriptor>(
         &mut self,
-        simd: S,
+        d: D,
         params: (u32, u32),
         mut p: usize,
         scan_end: usize,
@@ -2389,7 +2051,7 @@ impl<'a> LdmScanner<'a> {
                 break;
             };
             if fast_ldm_is_anchor(u32::from_le_bytes(*c4), params) {
-                self.step_anchor(simd, p);
+                self.step_anchor(d, p);
                 if self.probe_resume > p + 64 {
                     p = (self.probe_resume - 16).min(scan_end);
                     self.prev_w64 = u64::MAX;
@@ -2400,54 +2062,64 @@ impl<'a> LdmScanner<'a> {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
-    #[simd_entry]
-    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
-    #[inline(never)]
-    fn scan_avx2(
+    #[inline(always)]
+    fn scan_simd_loop<const WIN: usize, D: SimdDescriptor>(
         &mut self,
+        d: D,
         params @ (mask32, tag32): (u32, u32),
         mut p: usize,
         scan_end: usize,
-        simd: X64V3,
-        _tok: impl SimdToken,
     ) {
-        let coeff = _mm256_set1_epi32(FAST_LDM_COEFF_PACKED);
-        let mask_v = _mm256_set1_epi32(mask32 as i32);
-        let tag_v = _mm256_set1_epi32(tag32 as i32);
-        if let Some(pfx36) = BoundedPrefix::<u8, 36>::from_prefix(self.data, scan_end + 4) {
-            while let Some(bs) = pfx36.cursor_at(p) {
+        const COEFF_ARR: [i16; 16] = [
+            FAST_LDM_COEFF0,
+            FAST_LDM_COEFF1,
+            FAST_LDM_COEFF0,
+            FAST_LDM_COEFF1,
+            FAST_LDM_COEFF0,
+            FAST_LDM_COEFF1,
+            FAST_LDM_COEFF0,
+            FAST_LDM_COEFF1,
+            FAST_LDM_COEFF0,
+            FAST_LDM_COEFF1,
+            FAST_LDM_COEFF0,
+            FAST_LDM_COEFF1,
+            FAST_LDM_COEFF0,
+            FAST_LDM_COEFF1,
+            FAST_LDM_COEFF0,
+            FAST_LDM_COEFF1,
+        ];
+        let coeff = I16Vec::load(d, &COEFF_ARR);
+        let mask_v = U32Vec::splat(d, mask32);
+        let tag_v = U32Vec::splat(d, tag32);
+        let (c0, c1, c2, c3) = (
+            U32Vec::splat(d, 0x0000_00FF),
+            U32Vec::splat(d, 0x0000_FF00),
+            U32Vec::splat(d, 0x00FF_0000),
+            U32Vec::splat(d, 0xFF00_0000),
+        );
+        if let Some(pfx) = BoundedPrefix::<u8, WIN>::from_prefix(self.data, scan_end + 4) {
+            while let Some(bs) = pfx.cursor_at(p) {
+                let arr = bs.sub_array::<WIN, 0>();
                 macro_rules! eq {
                     ($off:literal) => {
-                        _mm256_cmpeq_epi32(
-                            _mm256_and_si256(
-                                _mm256_madd_epi16(
-                                    _mm256_loadu_si256(bs.sub_array::<32, $off>()),
-                                    coeff,
-                                ),
-                                mask_v,
-                            ),
-                            tag_v,
-                        )
+                        (U8Vec::load(d, &arr[$off..])
+                            .bitcast::<i16>()
+                            .madd_to_i32(coeff)
+                            .bitcast::<u32>()
+                            & mask_v)
+                            .eq(tag_v)
                     };
                 }
                 let (eq0, eq1, eq2, eq3) = (eq!(0), eq!(1), eq!(2), eq!(3));
-                let any = _mm256_or_si256(_mm256_or_si256(eq0, eq1), _mm256_or_si256(eq2, eq3));
                 let mut jumped = false;
-                if _mm256_testz_si256(any, any) == 0 {
-                    let m01 = _mm256_or_si256(
-                        _mm256_srli_epi32::<24>(eq0),
-                        _mm256_slli_epi32::<8>(_mm256_srli_epi32::<24>(eq1)),
-                    );
-                    let m23 = _mm256_or_si256(
-                        _mm256_slli_epi32::<16>(_mm256_srli_epi32::<24>(eq2)),
-                        _mm256_slli_epi32::<24>(eq3),
-                    );
-                    let mut mask = _mm256_movemask_epi8(_mm256_or_si256(m01, m23)) as u32;
+                if ((eq0 | eq1) | (eq2 | eq3)).any() {
+                    let combined = (eq0.if_then_else_zero(c0) | eq1.if_then_else_zero(c1))
+                        | (eq2.if_then_else_zero(c2) | eq3.if_then_else_zero(c3));
+                    let mut mask = (!combined.bitcast::<u8>().eq_zero()).to_bitmask() as u32;
                     while mask != 0 {
                         let pos = p + (mask.trailing_zeros() as usize);
                         mask &= mask - 1;
-                        self.step_anchor(simd, pos);
+                        self.step_anchor(d, pos);
                         if self.probe_resume > pos + 64 {
                             p = (self.probe_resume - 16).min(scan_end);
                             self.prev_w64 = u64::MAX;
@@ -2457,85 +2129,35 @@ impl<'a> LdmScanner<'a> {
                     }
                 }
                 if !jumped {
-                    p += 32;
+                    p += WIN - 4;
                 }
             }
         }
-        self.scan_scalar(simd, params, p, scan_end);
+        self.scan_scalar(d, params, p, scan_end);
     }
 
-    #[cfg(target_arch = "aarch64")]
-    #[simd_entry]
-    #[target_feature(enable = "neon")]
-    #[inline(never)]
-    fn scan_neon(
+    #[inline]
+    fn scan_dispatch<D: SimdDescriptor>(
         &mut self,
-        params @ (mask32, tag32): (u32, u32),
-        mut p: usize,
+        d: D,
+        params: (u32, u32),
+        p: usize,
         scan_end: usize,
-        simd: A64Neon,
-        _tok: impl SimdToken,
     ) {
-        let coeff = vld1q_s16(&[
-            FAST_LDM_COEFF0,
-            FAST_LDM_COEFF1,
-            FAST_LDM_COEFF0,
-            FAST_LDM_COEFF1,
-            FAST_LDM_COEFF0,
-            FAST_LDM_COEFF1,
-            FAST_LDM_COEFF0,
-            FAST_LDM_COEFF1,
-        ]);
-        let coeff_lo = vget_low_s16(coeff);
-        let mask_v = vdupq_n_u32(mask32);
-        let tag_v = vdupq_n_u32(tag32);
-        let (c0xff, c0xff00, c0xff_0000) = (
-            vdupq_n_u32(0x0000_00FF),
-            vdupq_n_u32(0x0000_FF00),
-            vdupq_n_u32(0x00FF_0000),
-        );
-        if let Some(pfx20) = BoundedPrefix::<u8, 20>::from_prefix(self.data, scan_end + 4) {
-            while let Some(bs) = pfx20.cursor_at(p) {
-                macro_rules! eq {
-                    ($off:literal) => {{
-                        let s = vreinterpretq_s16_u8(vld1q_u8(bs.sub_array::<16, $off>()));
-                        let plo = vmull_s16(vget_low_s16(s), coeff_lo);
-                        let phi = vmull_high_s16(s, coeff);
-                        let m = vreinterpretq_u32_s32(vpaddq_s32(plo, phi));
-                        vceqq_u32(vandq_u32(m, mask_v), tag_v)
-                    }};
-                }
-                let (eq0, eq1, eq2, eq3) = (eq!(0), eq!(1), eq!(2), eq!(3));
-                let any = vorrq_u32(vorrq_u32(eq0, eq1), vorrq_u32(eq2, eq3));
-                let mut jumped = false;
-                if vmaxvq_u32(any) != 0 {
-                    let m01 = vorrq_u32(vandq_u32(eq0, c0xff), vandq_u32(eq1, c0xff00));
-                    let m23 = vorrq_u32(vandq_u32(eq2, c0xff_0000), vshlq_n_u32::<24>(eq3));
-                    let mut mask = movemask_u8x16_neon(vreinterpretq_u8_u32(vorrq_u32(m01, m23)));
-                    while mask != 0 {
-                        let pos = p + (mask.trailing_zeros() as usize);
-                        mask &= mask - 1;
-                        self.step_anchor(simd, pos);
-                        if self.probe_resume > pos + 64 {
-                            p = (self.probe_resume - 16).min(scan_end);
-                            self.prev_w64 = u64::MAX;
-                            jumped = true;
-                            break;
-                        }
+        if D::IS_EMULATED {
+            self.scan_scalar(d, params, p, scan_end);
+        } else {
+            d.call(
+                #[inline(always)]
+                |d| {
+                    if const { D::BYTES == 32 } {
+                        self.scan_simd_loop::<36, D>(d, params, p, scan_end);
+                    } else {
+                        self.scan_simd_loop::<20, D>(d, params, p, scan_end);
                     }
-                }
-                if !jumped {
-                    p += 16;
-                }
-            }
+                },
+            );
         }
-        self.scan_scalar(simd, params, p, scan_end);
-    }
-
-    #[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), cold)]
-    #[inline(never)]
-    fn scan_portable(&mut self, params: (u32, u32), p: usize, scan_end: usize) {
-        self.scan_scalar(Scalar, params, p, scan_end);
     }
 }
 
@@ -2567,8 +2189,9 @@ impl FastLdmTable {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn scan_into(
+    fn scan_into_with_desc<D: SimdDescriptor>(
         &mut self,
+        d: D,
         density: u8,
         data: &[u8],
         chunk_start: usize,
@@ -2576,7 +2199,6 @@ impl FastLdmTable {
         eff_wsize: usize,
         vpos_base: usize,
         out: &mut Vec<FastLdmSpan>,
-        use_simd: bool,
     ) {
         out.clear();
         let scan_end = chunk_end.min(data.len().saturating_sub(8));
@@ -2602,13 +2224,7 @@ impl FastLdmTable {
             out,
         ) {
             let params = fast_ldm_params(density);
-            match try_simd(use_simd) {
-                #[cfg(target_arch = "x86_64")]
-                Some(tok) => sc.scan_avx2(params, scan_start, scan_end, tok, tok),
-                #[cfg(target_arch = "aarch64")]
-                Some(tok) => sc.scan_neon(params, scan_start, scan_end, tok, tok),
-                _ => sc.scan_portable(params, scan_start, scan_end),
-            }
+            sc.scan_dispatch(d, params, scan_start, scan_end);
         }
         self.scanned_vpos = self.scanned_vpos.max(vpos_base.wrapping_add(scan_end));
     }
@@ -2941,9 +2557,9 @@ impl<'a> ProbeCtx<'a> {
     }
 
     #[inline(always)]
-    fn cross_dict_rem_at_cursor<S: SimdBackend>(
+    fn cross_dict_rem_at_cursor<D: SimdDescriptor>(
         &self,
-        simd: S,
+        d: D,
         at_pos: BoundedPrefixCursor<'_, u8, 16>,
         rem: usize,
         best_len: u32,
@@ -2973,7 +2589,7 @@ impl<'a> ProbeCtx<'a> {
                 if diff8 != 0 {
                     8 + (diff8.trailing_zeros() >> 3)
                 } else {
-                    common_prefix_slices_from_16(simd, s, &data[pos..]) as u32
+                    common_prefix_slices_from_16(d, s, &data[pos..]) as u32
                 }
             } else {
                 8 + common_prefix_len(&s[8..], &data[pos + 8..], MAX_COPY_LEN - 8) as u32
@@ -3020,9 +2636,9 @@ impl<'a> ProbeCtx<'a> {
     }
 
     #[inline(always)]
-    fn in_win_tail8<S: SimdBackend>(
+    fn in_win_tail8<D: SimdDescriptor>(
         &self,
-        simd: S,
+        d: D,
         at_pos: BoundedPrefixCursor<'_, u8, 16>,
         c16: &[u8; 16],
         du: usize,
@@ -3036,14 +2652,14 @@ impl<'a> ProbeCtx<'a> {
         if bl >= 16 && !eq_chunk4(data, pos - du + bl - 3, data, pos + bl - 3) {
             0
         } else {
-            longest_match_from_16(simd, data, pos - du, pos) as u32
+            longest_match_from_16(d, data, pos - du, pos) as u32
         }
     }
 
     #[inline(always)]
-    fn lookback_len<S: SimdBackend>(
+    fn lookback_len<D: SimdDescriptor>(
         &self,
-        simd: S,
+        d: D,
         has_dict: bool,
         at_pos: BoundedPrefixCursor<'_, u8, 16>,
         du: usize,
@@ -3055,7 +2671,7 @@ impl<'a> ProbeCtx<'a> {
             if diff0 != 0 {
                 return if min8 { 0 } else { diff0.trailing_zeros() >> 3 };
             }
-            self.in_win_tail8(simd, at_pos, c16, du, best_len)
+            self.in_win_tail8(d, at_pos, c16, du, best_len)
         } else if has_dict && du > self.pos {
             let min_w = if min8 {
                 8
@@ -3064,16 +2680,16 @@ impl<'a> ProbeCtx<'a> {
             } else {
                 4
             };
-            self.cross_dict_rem_at_cursor(simd, at_pos, du - self.pos, best_len, min_w)
+            self.cross_dict_rem_at_cursor(d, at_pos, du - self.pos, best_len, min_w)
         } else {
             0
         }
     }
 
     #[inline(always)]
-    fn scan_main_candidates<S: SimdBackend, C: MatchConfig>(
+    fn scan_main_candidates<C: MatchConfig, D: SimdDescriptor>(
         &self,
-        simd: S,
+        d: D,
         has_dict: bool,
         at_pos: BoundedPrefixCursor<'_, u8, 16>,
         dists: &[u32; 32],
@@ -3090,7 +2706,7 @@ impl<'a> ProbeCtx<'a> {
             mask &= mask - 1;
             if dist != 0 {
                 let len = self.lookback_len(
-                    simd,
+                    d,
                     has_dict,
                     at_pos,
                     dist as usize,
@@ -3110,9 +2726,9 @@ impl<'a> ProbeCtx<'a> {
 
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    fn scan_raw_dict_candidates<S: SimdBackend, C: MatchConfig>(
+    fn scan_raw_dict_candidates<C: MatchConfig, D: SimdDescriptor>(
         &self,
-        simd: S,
+        d: D,
         raw_idx: &RawDictIndex,
         p64: u64,
         sec_hash: u32,
@@ -3120,7 +2736,7 @@ impl<'a> ProbeCtx<'a> {
         at_pos: BoundedPrefixCursor<'_, u8, 16>,
         best: &mut BestMatch,
     ) -> bool {
-        let Some((bucket, mut mask)) = raw_idx.search4_mask(simd, p64, sec_hash) else {
+        let Some((bucket, mut mask)) = raw_idx.search4_mask(d, p64, sec_hash) else {
             return false;
         };
         if mask == 0 {
@@ -3133,7 +2749,7 @@ impl<'a> ProbeCtx<'a> {
             mask &= mask - 1;
             let rem = *bucket.bget_masked(idx) & 0x00FF_FFFF;
             if (1..=max_rem).contains(&rem) {
-                let len = self.cross_dict_rem_at_cursor(simd, at_pos, rem as usize, best.len, 8);
+                let len = self.cross_dict_rem_at_cursor(d, at_pos, rem as usize, best.len, 8);
                 let dist = (self.pos as u32) + rem;
                 if best.try_lz(len, len, dist, self, acfg) {
                     improved = true;
@@ -3148,9 +2764,9 @@ impl<'a> ProbeCtx<'a> {
 
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
-    fn scan_dict_candidates<S: SimdBackend, C: MatchConfig>(
+    fn scan_dict_candidates<C: MatchConfig, D: SimdDescriptor>(
         &self,
-        simd: S,
+        d: D,
         d_idx: &Dict5Index,
         p64: u64,
         max_chunks: usize,
@@ -3166,7 +2782,7 @@ impl<'a> ProbeCtx<'a> {
         let dict_nice_len = (self.env.qcfg.nice_len as u32).max(128);
         let mut improved = false;
         for chunk in chunks {
-            let mut mask = Dict5Index::search8_chunk_mask(simd, chunk, target_byte5);
+            let mut mask = Dict5Index::search8_chunk_mask(d, chunk, target_byte5);
             while mask != 0 {
                 let idx = mask.trailing_zeros() as usize;
                 mask &= mask - 1;
@@ -3175,7 +2791,7 @@ impl<'a> ProbeCtx<'a> {
                     let dist = (self.pos as u32) + rem;
                     if dist != best.dist {
                         let len =
-                            self.cross_dict_rem_at_cursor(simd, at_pos, rem as usize, best.len, 6);
+                            self.cross_dict_rem_at_cursor(d, at_pos, rem as usize, best.len, 6);
                         if best.try_lz(len, len, dist, self, acfg) {
                             improved = true;
                             if len >= dict_nice_len {
@@ -3190,7 +2806,7 @@ impl<'a> ProbeCtx<'a> {
             let rem0 = chunks[0][0] & 0x00FF_FFFF;
             let dist0 = (self.pos as u32) + rem0;
             if (1..=max_rem).contains(&rem0) && dist0 <= 393_216 && dist0 != best.dist {
-                let len0 = self.cross_dict_rem_at_cursor(simd, at_pos, rem0 as usize, best.len, 5);
+                let len0 = self.cross_dict_rem_at_cursor(d, at_pos, rem0 as usize, best.len, 5);
                 if best.try_lz(len0, len0, dist0, self, acfg) {
                     improved = true;
                 }
@@ -3242,9 +2858,9 @@ impl<'a> ProbeCtx<'a> {
     }
 
     #[inline(always)]
-    fn probe_sd<S: SimdBackend>(
+    fn probe_sd<D: SimdDescriptor>(
         &self,
-        simd: S,
+        d: D,
         acfg: ArchCfg,
         best: &mut BestMatch,
         allow4: bool,
@@ -3271,12 +2887,9 @@ impl<'a> ProbeCtx<'a> {
                     e.model.explicit_cmd_off,
                 );
                 let fast = acfg.fast || !e.qcfg.ctx_block_split;
-                if let Some(sm) = static_dict::lookup_simd(
-                    simd,
-                    fast,
-                    s,
-                    (bd, mr, mo, lm, co, STATIC_MIN_DICT_GAIN),
-                ) {
+                if let Some(sm) =
+                    static_dict::lookup_simd(d, fast, s, (bd, mr, mo, lm, co, STATIC_MIN_DICT_GAIN))
+                {
                     self.finish_sd(acfg, best, sm);
                 }
             }
@@ -3451,51 +3064,44 @@ impl TableSlices1<'_> {
     }
 }
 
-trait InteriorOps<S: SimdBackend> {
+trait InteriorOps<D: SimdDescriptor> {
     #[inline(always)]
-    fn is_ht4_one(&self, _: S) -> bool {
+    fn is_ht4_one(&self, _: D) -> bool {
         false
     }
-    fn step_ht3(&mut self, simd: S, word64: u64, vpos: u32) -> u32;
+    fn step_ht3(&mut self, d: D, word64: u64, vpos: u32) -> u32;
     fn prefetch_ahead<C: MatchConfig>(
         &self,
-        simd: S,
+        d: D,
         pfx_pf: BoundedPrefix<'_, u8, INTERIOR_MARGIN>,
         pos_pf: usize,
     );
-    fn insert_main(&mut self, simd: S, p64: u64, vpos: u32, sec_hash: u32);
+    fn insert_main(&mut self, d: D, p64: u64, vpos: u32, sec_hash: u32);
     fn search_main(
         &mut self,
-        simd: S,
+        d: D,
         p64: u64,
         vpos: u32,
         sec_hash: u32,
         wsize: u32,
         dists: &mut [u32; 32],
     ) -> u32;
-    fn search_ht4(
-        &mut self,
-        simd: S,
-        p32: u32,
-        vpos: u32,
-        wsize: u32,
-        dists: &mut [u32; 32],
-    ) -> u32;
+    fn search_ht4(&mut self, d: D, p32: u32, vpos: u32, wsize: u32, dists: &mut [u32; 32]) -> u32;
     #[inline(always)]
-    fn search_ht4_one(&mut self, simd: S, p32: u32, vpos: u32, wsize: u32) -> u32 {
-        let mut d = [0u32; 32];
-        if self.search_ht4(simd, p32, vpos, wsize, &mut d) != 0 {
-            d[0]
+    fn search_ht4_one(&mut self, d: D, p32: u32, vpos: u32, wsize: u32) -> u32 {
+        let mut dists = [0u32; 32];
+        if self.search_ht4(d, p32, vpos, wsize, &mut dists) != 0 {
+            dists[0]
         } else {
             0
         }
     }
-    fn insert_ht4(&mut self, simd: S, p32: u32, vpos: u32);
+    fn insert_ht4(&mut self, d: D, p32: u32, vpos: u32);
 
     #[inline(always)]
     fn insert_positions(
         &mut self,
-        simd: S,
+        d: D,
         acfg: ArchCfg,
         data: &[u8],
         (ins_start, ins_end): (usize, usize),
@@ -3516,12 +3122,12 @@ trait InteriorOps<S: SimdBackend> {
                 for &p in main_ps {
                     if let Some(c8) = pfx8.get_at(p) {
                         let (p64, sec_h, _) = hash8_p64(u64::from_le_bytes(*c8));
-                        self.insert_main(simd, p64, vpos_base.wrapping_add(p) as u32, sec_h);
+                        self.insert_main(d, p64, vpos_base.wrapping_add(p) as u32, sec_h);
                     }
                 }
                 if let Some(c4) = pfx8.get_sub_at::<4, 0>(ins_end - 1) {
                     let p32 = u32::from_le_bytes(*c4).wrapping_mul(HASH_MUL32);
-                    self.insert_ht4(simd, p32, vpos_base.wrapping_add(ins_end - 1) as u32);
+                    self.insert_ht4(d, p32, vpos_base.wrapping_add(ins_end - 1) as u32);
                 }
             }
         } else {
@@ -3540,12 +3146,12 @@ trait InteriorOps<S: SimdBackend> {
                     let w64 = u64::from_le_bytes(*c8);
                     let vp = vpos_base.wrapping_add(p) as u32;
                     let (p64, sec_h, p32) = hash8_p64(w64);
-                    self.insert_main(simd, p64, vp, sec_h);
+                    self.insert_main(d, p64, vp, sec_h);
                     if p < h4_end || p + 5 >= ins_end {
-                        self.insert_ht4(simd, p32, vp);
+                        self.insert_ht4(d, p32, vp);
                     }
                     if acfg.ht3 && (p < h3_end || p + 4 >= ins_end) {
-                        let _ = self.step_ht3(simd, w64, vp);
+                        let _ = self.step_ht3(d, w64, vp);
                     }
                 }
                 p += 1;
@@ -3555,7 +3161,6 @@ trait InteriorOps<S: SimdBackend> {
 }
 
 /// Typed table view for `Q3..=Q9` (`(POS_BITS, WAYS, HT4_WAYS)` specialized SIMD hot paths).
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
 pub(crate) struct InteriorTables<'a, const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize> {
     table: Pow2SliceMut<'a, [u32; WAYS]>,
     tags: Option<Pow2SliceMut<'a, [u16; WAYS]>>,
@@ -3565,7 +3170,6 @@ pub(crate) struct InteriorTables<'a, const POS_BITS: u8, const WAYS: usize, cons
     ht3: Option<&'a mut [u32; HT3_SIZE]>,
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize>
     InteriorTables<'_, POS_BITS, WAYS, HT4_WAYS>
 {
@@ -3598,17 +3202,16 @@ impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize>
     }
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
-impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize, S: SimdBackend> InteriorOps<S>
+impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize, D: SimdDescriptor> InteriorOps<D>
     for InteriorTables<'_, POS_BITS, WAYS, HT4_WAYS>
 {
     #[inline(always)]
-    fn is_ht4_one(&self, _: S) -> bool {
+    fn is_ht4_one(&self, _: D) -> bool {
         const { HT4_WAYS == 1 }
     }
 
     #[inline(always)]
-    fn step_ht3(&mut self, _: S, word64: u64, vpos: u32) -> u32 {
+    fn step_ht3(&mut self, _: D, word64: u64, vpos: u32) -> u32 {
         let Some(t3) = self.ht3.as_deref_mut() else {
             return 0;
         };
@@ -3618,31 +3221,31 @@ impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize, S: SimdBacken
     #[inline(always)]
     fn prefetch_ahead<C: MatchConfig>(
         &self,
-        simd: S,
+        d: D,
         pfx_pf: BoundedPrefix<'_, u8, INTERIOR_MARGIN>,
         pos_pf: usize,
     ) {
         const { assert!(WAYS >= 4) };
-        if const { S::IS_SIMD } {
+        if const { !D::IS_EMULATED } {
             let p64 = u64::from_le_bytes(*pfx_pf.get_sub_clamped::<8, 0>(pos_pf))
                 .wrapping_mul(HASH_MUL64);
             if const { POS_BITS == 31 } {
                 if let Some(t) = self.tags.as_ref() {
-                    simd.prefetch_et0(t.get_hash64(p64));
+                    d.prefetch_et0(t.get_hash64(p64));
                 }
                 if const { WAYS >= 32 } {
                     if let Some(h) = self.heads.as_ref() {
-                        simd.prefetch_et0(h.get_hash64(p64));
+                        d.prefetch_et0(h.get_hash64(p64));
                     }
                 }
             }
-            simd.prefetch_et0(self.table.get_hash64(p64));
+            d.prefetch_et0(self.table.get_hash64(p64));
             if C::MULTI_CONTEXT && (HT4_WAYS > 1 || WAYS == 8) {
                 let p32 = p64 as u32;
-                simd.prefetch_et0(self.ht4_near.get_hash32(p32));
+                d.prefetch_et0(self.ht4_near.get_hash32(p32));
                 if const { POS_BITS == 31 } {
                     if let Some(t4) = self.ht4_tags.as_ref() {
-                        simd.prefetch_et0(t4.get_hash32(p32));
+                        d.prefetch_et0(t4.get_hash32(p32));
                     }
                 }
             }
@@ -3650,7 +3253,7 @@ impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize, S: SimdBacken
     }
 
     #[inline(always)]
-    fn insert_main(&mut self, simd: S, p64: u64, vpos: u32, sec_hash: u32) {
+    fn insert_main(&mut self, d: D, p64: u64, vpos: u32, sec_hash: u32) {
         if const { POS_BITS == 31 } {
             if const { WAYS >= 32 } {
                 if let (Some(h), Some(t)) = (self.heads.as_mut(), self.tags.as_mut()) {
@@ -3664,20 +3267,14 @@ impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize, S: SimdBacken
             } else {
                 let tag = shift_tag16(sec_hash);
                 if let Some(t) = self.tags.as_mut() {
-                    let row = t.get_hash64_mut(p64);
-                    dispatch_simd!(
-                        simd,
-                        S => x64: |tok| tags_insert_avx2(row, tag, tok),
-                        neon: |tok| tags_insert_neon(row, tag, tok),
-                        scalar: tags_insert_portable(row, tag),
-                    );
+                    tags_insert(d, t.get_hash64_mut(p64), tag);
                 }
-                buckets_insert(self.table.get_hash64_mut(p64), simd, vpos);
+                buckets_insert(self.table.get_hash64_mut(p64), d, vpos);
             }
         } else {
             buckets_insert(
                 self.table.get_hash64_mut(p64),
-                simd,
+                d,
                 encode_vpos(POS_BITS, vpos, sec_hash),
             );
         }
@@ -3686,7 +3283,7 @@ impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize, S: SimdBacken
     #[inline(always)]
     fn search_main(
         &mut self,
-        simd: S,
+        d: D,
         p64: u64,
         vpos: u32,
         sec_hash: u32,
@@ -3699,7 +3296,7 @@ impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize, S: SimdBacken
                     return 0;
                 };
                 ring_search(
-                    simd,
+                    d,
                     h.get_hash64_mut(p64),
                     t.get_hash64_mut(p64),
                     self.table.get_hash64_mut(p64),
@@ -3711,7 +3308,7 @@ impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize, S: SimdBacken
                     return 0;
                 };
                 shift_tagged_search(
-                    simd,
+                    d,
                     t.get_hash64_mut(p64),
                     self.table.get_hash64_mut(p64),
                     (sec_hash, vpos, wsize),
@@ -3721,7 +3318,7 @@ impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize, S: SimdBacken
         } else {
             buckets_search_and_insert(
                 self.table.get_hash64_mut(p64),
-                simd,
+                d,
                 encode_vpos(POS_BITS, vpos, sec_hash),
                 wsize,
                 dists,
@@ -3730,7 +3327,7 @@ impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize, S: SimdBacken
     }
 
     #[inline(always)]
-    fn search_ht4_one(&mut self, _: S, p32: u32, vpos: u32, wsize: u32) -> u32 {
+    fn search_ht4_one(&mut self, _: D, p32: u32, vpos: u32, wsize: u32) -> u32 {
         let sec = p32 << (self.ht4_near.log() & 31);
         let slot = &mut self.ht4_near.get_hash32_mut(p32)[0];
         if const { POS_BITS == 31 } {
@@ -3749,16 +3346,9 @@ impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize, S: SimdBacken
     }
 
     #[inline(always)]
-    fn search_ht4(
-        &mut self,
-        simd: S,
-        p32: u32,
-        vpos: u32,
-        wsize: u32,
-        dists: &mut [u32; 32],
-    ) -> u32 {
+    fn search_ht4(&mut self, d: D, p32: u32, vpos: u32, wsize: u32, dists: &mut [u32; 32]) -> u32 {
         if const { HT4_WAYS == 1 } {
-            dists[0] = self.search_ht4_one(simd, p32, vpos, wsize);
+            dists[0] = self.search_ht4_one(d, p32, vpos, wsize);
             return u32::from(dists[0] != 0);
         }
         let sec = p32 << (self.ht4_near.log() & 31);
@@ -3767,7 +3357,7 @@ impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize, S: SimdBacken
                 return 0;
             };
             shift_tagged_search(
-                simd,
+                d,
                 t4.get_hash32_mut(p32),
                 self.ht4_near.get_hash32_mut(p32),
                 (sec, vpos, wsize),
@@ -3776,7 +3366,7 @@ impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize, S: SimdBacken
         } else {
             buckets_search_and_insert(
                 self.ht4_near.get_hash32_mut(p32),
-                simd,
+                d,
                 encode_vpos(POS_BITS, vpos, sec),
                 wsize,
                 dists,
@@ -3785,7 +3375,7 @@ impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize, S: SimdBacken
     }
 
     #[inline(always)]
-    fn insert_ht4(&mut self, simd: S, p32: u32, vpos: u32) {
+    fn insert_ht4(&mut self, d: D, p32: u32, vpos: u32) {
         let sec = p32 << (self.ht4_near.log() & 31);
         if const { POS_BITS == 31 } {
             let tag = shift_tag16(sec);
@@ -3794,19 +3384,14 @@ impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize, S: SimdBacken
                 if const { HT4_WAYS == 1 } {
                     row[0] = tag;
                 } else {
-                    dispatch_simd!(
-                        simd,
-                        S => x64: |tok| tags_insert_avx2(row, tag, tok),
-                        neon: |tok| tags_insert_neon(row, tag, tok),
-                        scalar: tags_insert_portable(row, tag),
-                    );
+                    tags_insert(d, row, tag);
                 }
             }
-            buckets_insert(self.ht4_near.get_hash32_mut(p32), simd, vpos);
+            buckets_insert(self.ht4_near.get_hash32_mut(p32), d, vpos);
         } else {
             buckets_insert(
                 self.ht4_near.get_hash32_mut(p32),
-                simd,
+                d,
                 encode_vpos(POS_BITS, vpos, sec),
             );
         }
@@ -3873,7 +3458,6 @@ impl<T: Copy + FromZeroes + 'static> DirtyBuf<T> {
         self.buf.prefix_of_capacity_mut(self.dirty_len)
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
     #[inline(always)]
     fn pow2_mut(&mut self, expect_elems: usize) -> Option<Pow2SliceMut<'_, T>> {
         (self.buf.len() == expect_elems)
@@ -3881,7 +3465,6 @@ impl<T: Copy + FromZeroes + 'static> DirtyBuf<T> {
             .flatten()
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
     #[inline(always)]
     fn pow2_chunks_mut<const N: usize>(
         &mut self,
@@ -3998,9 +3581,9 @@ pub(crate) struct HashTable {
     dirty: bool,
 }
 
-impl InteriorOps<Scalar> for HashTable {
+impl<D: SimdDescriptor> InteriorOps<D> for HashTable {
     #[inline(always)]
-    fn step_ht3(&mut self, _: Scalar, word64: u64, vpos: u32) -> u32 {
+    fn step_ht3(&mut self, _: D, word64: u64, vpos: u32) -> u32 {
         let Some(t3) = self.ht3.as_deref_mut() else {
             return 0;
         };
@@ -4010,14 +3593,14 @@ impl InteriorOps<Scalar> for HashTable {
     #[inline(always)]
     fn prefetch_ahead<C: MatchConfig>(
         &self,
-        _: Scalar,
+        _: D,
         _: BoundedPrefix<'_, u8, INTERIOR_MARGIN>,
         _: usize,
     ) {
     }
 
     #[inline(always)]
-    fn insert_main(&mut self, _: Scalar, p64: u64, vpos: u32, sec_hash: u32) {
+    fn insert_main(&mut self, _: D, p64: u64, vpos: u32, sec_hash: u32) {
         let idx = (p64 >> ((64 - self.log) & 63)) as usize;
         scalar_insert_row(
             (self.pos_bits, self.ways as usize, idx),
@@ -4031,7 +3614,7 @@ impl InteriorOps<Scalar> for HashTable {
     #[inline(always)]
     fn search_main(
         &mut self,
-        _: Scalar,
+        _: D,
         p64: u64,
         vpos: u32,
         sec_hash: u32,
@@ -4050,14 +3633,7 @@ impl InteriorOps<Scalar> for HashTable {
     }
 
     #[inline(always)]
-    fn search_ht4(
-        &mut self,
-        _: Scalar,
-        p32: u32,
-        vpos: u32,
-        wsize: u32,
-        dists: &mut [u32; 32],
-    ) -> u32 {
+    fn search_ht4(&mut self, _: D, p32: u32, vpos: u32, wsize: u32, dists: &mut [u32; 32]) -> u32 {
         let (idx, sec) = (
             (p32 >> ((32 - self.ht4_log) & 31)) as usize,
             p32 << (self.ht4_log & 31),
@@ -4073,7 +3649,7 @@ impl InteriorOps<Scalar> for HashTable {
     }
 
     #[inline(always)]
-    fn insert_ht4(&mut self, _: Scalar, p32: u32, vpos: u32) {
+    fn insert_ht4(&mut self, _: D, p32: u32, vpos: u32) {
         let (idx, sec) = (
             (p32 >> ((32 - self.ht4_log) & 31)) as usize,
             p32 << (self.ht4_log & 31),
@@ -4208,7 +3784,6 @@ impl HashTable {
         }
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
     #[inline(always)]
     pub(crate) fn interior_mut<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize>(
         &mut self,
@@ -4255,8 +3830,9 @@ impl HashTable {
 
     #[inline]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn scan_ldm_with_density(
+    pub(crate) fn scan_ldm_with_density<D: SimdDescriptor>(
         &mut self,
+        d: D,
         density: u8,
         data: &[u8],
         chunk_start: usize,
@@ -4264,22 +3840,23 @@ impl HashTable {
         eff_wsize: usize,
         vpos_base: usize,
         out: &mut Vec<FastLdmSpan>,
-        use_simd: bool,
     ) {
         if eff_wsize <= 262_144 {
             out.clear();
             return;
         }
-        self.ldm.get_or_insert_with(FastLdmTable::new).scan_into(
-            density,
-            data,
-            chunk_start,
-            chunk_end,
-            eff_wsize,
-            vpos_base,
-            out,
-            use_simd,
-        );
+        self.ldm
+            .get_or_insert_with(FastLdmTable::new)
+            .scan_into_with_desc(
+                d,
+                density,
+                data,
+                chunk_start,
+                chunk_end,
+                eff_wsize,
+                vpos_base,
+                out,
+            );
     }
 
     fn reserve_vpos_start(
@@ -4319,6 +3896,7 @@ impl HashTable {
         seed_ht4_win: usize,
         seed_ht3: bool,
     ) {
+        let emu = <jxl_simd::Emu128Descriptor as SimdDescriptor>::new().unwrap();
         let d_len = ad.len();
         if seed_ht4_win > 0 {
             self.ensure_ht4_near();
@@ -4326,7 +3904,7 @@ impl HashTable {
                 for off in d_len.saturating_sub(seed_ht4_win)..=d_len - 4 {
                     let p32 = u32::from_le_bytes(*ad[off..].first_chunk::<4>().unwrap())
                         .wrapping_mul(HASH_MUL32);
-                    self.insert_ht4(Scalar, p32, (dv + off) as u32);
+                    self.insert_ht4(emu, p32, (dv + off) as u32);
                 }
             }
         }
@@ -4339,7 +3917,7 @@ impl HashTable {
         if (10..=20).contains(&self.log) {
             for &DictEntry(hash32, sec_hash, off) in entries {
                 if let Some(rel) = (off as usize).checked_sub(skip) {
-                    self.insert_main(Scalar, (hash32 as u64) << 32, (dv + rel) as u32, sec_hash);
+                    self.insert_main(emu, (hash32 as u64) << 32, (dv + rel) as u32, sec_hash);
                 }
             }
         }
@@ -4468,64 +4046,37 @@ impl HashTable {
 }
 
 macro_rules! def_parse_slice_interior {
-    (|$ht:ident, $simd:ident: $S:ident, $lw:ident, $hd:ident, $env:ident, $state:ident, $md:ident| $body:block) => {
-        #[cfg(target_arch = "x86_64")]
-        #[simd_entry]
-        #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
-        #[inline(never)]
-        fn parse_slice_interior_avx2<
+    (|$ht:ident, $d:ident, $lw:ident, $hd:ident, $env:ident, $state:ident, $md:ident| $body:block) => {
+        #[inline]
+        fn parse_slice_interior<
             const POS_BITS: u8,
             const WAYS: usize,
             const HT4_WAYS: usize,
             C: MatchConfig,
             const LW: bool,
             const HD: bool,
+            D: SimdDescriptor,
         >(
             mut it: InteriorTables<'_, POS_BITS, WAYS, HT4_WAYS>,
             env_ref: &SliceEnv<'_>,
             $state: &mut SliceParseState,
             $md: &mut MetablockSink<'_>,
-            $simd: X64V3,
-            _tok: impl SimdToken,
+            d: D,
         ) {
-            type $S = X64V3;
-            if !it.invariants_hold::<C>() {
-                return;
-            }
-            let $ht = &mut it;
-            let ($env, $lw, $hd) = (*env_ref, LW, HD);
-            $body
+            d.call(
+                #[inline(always)]
+                |$d| {
+                    if !it.invariants_hold::<C>() {
+                        return;
+                    }
+                    let $ht = &mut it;
+                    let ($env, $lw, $hd) = (*env_ref, LW, HD);
+                    $body
+                },
+            );
         }
 
-        #[cfg(target_arch = "aarch64")]
-        #[simd_entry]
-        #[target_feature(enable = "neon")]
-        #[inline(never)]
-        fn parse_slice_interior_neon<
-            const POS_BITS: u8,
-            const WAYS: usize,
-            const HT4_WAYS: usize,
-            C: MatchConfig,
-            const LW: bool,
-            const HD: bool,
-        >(
-            mut it: InteriorTables<'_, POS_BITS, WAYS, HT4_WAYS>,
-            env_ref: &SliceEnv<'_>,
-            $state: &mut SliceParseState,
-            $md: &mut MetablockSink<'_>,
-            $simd: A64Neon,
-            _tok: impl SimdToken,
-        ) {
-            type $S = A64Neon;
-            if !it.invariants_hold::<C>() {
-                return;
-            }
-            let $ht = &mut it;
-            let ($env, $lw, $hd) = (*env_ref, LW, HD);
-            $body
-        }
-
-        #[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), cold)]
+        #[cold]
         #[inline(never)]
         fn parse_slice_interior_portable<C: MatchConfig>(
             $ht: &mut HashTable,
@@ -4533,18 +4084,18 @@ macro_rules! def_parse_slice_interior {
             $state: &mut SliceParseState,
             $md: &mut MetablockSink<'_>,
         ) {
-            type $S = Scalar;
             if !(10..=20).contains(&$ht.log) || !(10..=20).contains(&$ht.ht4_log) {
                 return;
             }
-            let ($simd, $env) = (Scalar, *env_ref);
+            let $d = <jxl_simd::Emu128Descriptor as SimdDescriptor>::new().unwrap();
+            let $env = *env_ref;
             let ($lw, $hd) = ($env.large_window, $env.has_dict);
             $body
         }
     };
 }
 
-def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| {
+def_parse_slice_interior!(|ht, simd, large_window, has_dict, env, state, md| {
     let SliceEnv {
         data,
         active_dict,
@@ -4749,7 +4300,7 @@ def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| 
             }
         }
 
-        if pctx.scan_main_candidates::<S, C>(simd, has_dict, at_pos, &dists, mask, &mut best) {
+        if pctx.scan_main_candidates::<C, _>(simd, has_dict, at_pos, &dists, mask, &mut best) {
             best_is_rep = false;
         }
         let max_local_for_dict = if C::FAST_MATCHING {
@@ -4779,7 +4330,7 @@ def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| 
         {
             if const { C::FAST_MATCHING } {
                 if let Some(raw_idx) = env.raw_dict_idx {
-                    if pctx.scan_raw_dict_candidates::<S, C>(
+                    if pctx.scan_raw_dict_candidates::<C, _>(
                         simd,
                         raw_idx,
                         p64,
@@ -4798,7 +4349,7 @@ def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| 
                     max_dict_chunks
                 };
                 let (dp64, _, _) = hash5_p64(word64);
-                if pctx.scan_dict_candidates::<S, C>(
+                if pctx.scan_dict_candidates::<C, _>(
                     simd,
                     d_idx,
                     dp64,
@@ -5056,10 +4607,10 @@ def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| 
                         gain: best.gain + 16,
                     };
                     let mut found1 = pctx1
-                        .scan_main_candidates::<S, C>(simd, has_dict, at_p1, &dists, m1, &mut b1);
+                        .scan_main_candidates::<C, _>(simd, has_dict, at_p1, &dists, m1, &mut b1);
                     if has_dict && b1.len < nice_len && p1 < max_dict_pos {
                         if let Some(raw_idx) = env.raw_dict_idx {
-                            found1 |= pctx1.scan_raw_dict_candidates::<S, C>(
+                            found1 |= pctx1.scan_raw_dict_candidates::<C, _>(
                                 simd,
                                 raw_idx,
                                 p64_1,
@@ -5127,7 +4678,7 @@ def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| 
 });
 
 impl HashTable {
-    #[cfg_attr(target_arch = "x86_64", cold)]
+    #[cold]
     #[inline(never)]
     fn parse_tail_env(
         &self,
@@ -5251,7 +4802,14 @@ impl HashTable {
                     let _ = best.try_lz(mlen, mlen, d, &pctx, acfg);
                 }
             }
-            pctx.probe_sd(Scalar, acfg, &mut best, true, lw, hd);
+            pctx.probe_sd(
+                <jxl_simd::Emu128Descriptor as SimdDescriptor>::new().unwrap(),
+                acfg,
+                &mut best,
+                true,
+                lw,
+                hd,
+            );
             if best.dist != 0 {
                 md.emit_command(
                     md.has_lit_ctx(),
@@ -5275,8 +4833,9 @@ impl HashTable {
 
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn parse_slice<C: MatchConfig>(
+    pub(crate) fn parse_slice_with_desc<C: MatchConfig, D: SimdDescriptor>(
         &mut self,
+        d: D,
         qcfg: QualityCfg,
         large_window: bool,
         has_dict: bool,
@@ -5290,7 +4849,6 @@ impl HashTable {
         state: &mut SliceParseState,
         md: &mut MetablockSink<'_>,
         model: &SliceCostModel,
-        use_simd: bool,
     ) {
         let slice_start = state.pos;
         if slice_start >= target_end {
@@ -5316,6 +4874,7 @@ impl HashTable {
                 .as_mut()
                 .map_or_else(Vec::new, |l| std::mem::take(&mut l.spans));
             self.scan_ldm_with_density(
+                d,
                 u8::from(self.ways <= 2),
                 data,
                 slice_start,
@@ -5323,7 +4882,6 @@ impl HashTable {
                 eff_wsize,
                 vpos_base,
                 &mut spans,
-                use_simd,
             );
             spans
         } else {
@@ -5347,7 +4905,7 @@ impl HashTable {
             use_sd,
         };
         if interior_end > slice_start {
-            C::run_interior(self, &env, state, md, try_simd(use_simd));
+            C::run_interior_with_desc(d, self, &env, state, md);
         }
         if target_end == data_len {
             let tail = state.anchor.max(interior_end).max(slice_start);
@@ -5363,24 +4921,49 @@ impl HashTable {
         self.next_vpos += new_pos - slice_start;
         (self.max_vpos_used, state.pos) = (self.next_vpos, new_pos);
     }
+
+    #[cfg(test)]
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn parse_slice<C: MatchConfig>(
+        &mut self,
+        qcfg: QualityCfg,
+        large_window: bool,
+        has_dict: bool,
+        data_win: (&[u8], usize, usize),
+        dict_info: (&[u8], usize, Option<&RawDictIndex>, Option<&Dict5Index>),
+        state: &mut SliceParseState,
+        md: &mut MetablockSink<'_>,
+        model: &SliceCostModel,
+        use_simd: bool,
+    ) {
+        with_simd_256!(use_simd, |d| {
+            self.parse_slice_with_desc::<C, _>(
+                d,
+                qcfg,
+                large_window,
+                has_dict,
+                data_win,
+                dict_info,
+                state,
+                md,
+                model,
+            );
+        });
+    }
 }
 
 #[cfg(test)]
 mod test {
-    #[cfg(target_arch = "aarch64")]
-    use super::A64Neon;
-    #[cfg(target_arch = "x86_64")]
-    use super::X64V3;
     use super::{
         bucket_search_one, buckets_insert_portable, buckets_search_and_insert_portable,
-        encode_vpos, max_virtual_pos, HashTable, InteriorOps, PreparedDictionary, Scalar,
-        SimdBackend,
+        encode_vpos, max_virtual_pos, HashTable, InteriorOps, PreparedDictionary,
     };
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    use simd_tokens::{simd_entry, SimdToken};
+    use jxl_simd::{Emu128Descriptor, SimdDescriptor};
 
     #[test]
     fn test_buckets_portable_and_shift_back() {
+        let emu = Emu128Descriptor::new().unwrap();
         let (mut b, w, mut d) = ([0u32; 8], (1 << 24) - 16, [0u32; 32]);
         for (o, s, m) in [(10, 0xAB, 0), (20, 0xAB, 1), (30, 0x12, 0), (50, 0xAB, 6)] {
             let target = encode_vpos(25, w + 1 + o, s << 24);
@@ -5414,7 +4997,7 @@ mod test {
         ] {
             assert_eq!(
                 ht31.interior_mut::<31, 4, 1>(false).unwrap().search_main(
-                    Scalar,
+                    emu,
                     0,
                     w30 + 1 + o,
                     sh,
@@ -5450,7 +5033,7 @@ mod test {
         (htr.next_vpos, htr.max_vpos_used) = (base_vp as usize, base_vp as usize);
         for k in 0..35u32 {
             let _ = htr.interior_mut::<31, 32, 4>(false).unwrap().search_main(
-                Scalar,
+                emu,
                 0,
                 base_vp + k * 200,
                 0xAB00_0000,
@@ -5462,7 +5045,7 @@ mod test {
         htr.ensure_vpos_capacity(1000, 1000);
         // Only `k = 30..=34` (`max_vp - 1500 ..= max_vp - 700`) survive expiration.
         let m_after = htr.interior_mut::<31, 32, 4>(false).unwrap().search_main(
-            Scalar,
+            emu,
             0,
             1001,
             0xAB00_0000,
@@ -5475,11 +5058,11 @@ mod test {
         );
     }
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    fn check_ht_seq<const P: u8, const W: usize, const H4W: usize, S: SimdBackend>(
-        simd: S,
+    fn check_ht_seq<const P: u8, const W: usize, const H4W: usize, D: SimdDescriptor>(
+        d: D,
         wsize: u32,
     ) {
+        let emu = Emu128Descriptor::new().unwrap();
         let (base, p64_7, p32_5) = (wsize + 1, 7u64 << 54, 5u32 << 22);
         let steps = if cfg!(miri) { 16u32 } else { 70u32 };
         if W == 1 {
@@ -5517,24 +5100,29 @@ mod test {
             let (vp, sh) = (base + step * 100, (step % 5).wrapping_mul(0x8567_9ABC));
             if step % 7 == 5 {
                 let mut ia = ht_a.interior_mut::<P, W, H4W>(false).unwrap();
-                ia.insert_main(simd, p64_7, vp, sh);
-                ia.insert_ht4(simd, p32_5, vp);
+                ia.insert_main(d, p64_7, vp, sh);
+                ia.insert_ht4(d, p32_5, vp);
                 let mut ip = ht_p.interior_mut::<P, W, H4W>(false).unwrap();
-                ip.insert_main(Scalar, p64_7, vp, sh);
-                ip.insert_ht4(Scalar, p32_5, vp);
+                ip.insert_main(emu, p64_7, vp, sh);
+                ip.insert_ht4(emu, p32_5, vp);
                 assert_eq!(
                     (&ht_a.table[r.clone()], ht_a.tags.get(r.clone())),
                     (&ht_p.table[r.clone()], ht_p.tags.get(r.clone()))
                 );
                 continue;
             }
-            let (mut d_avx, mut d_port) = ([0u32; 32], [0u32; 32]);
-            let (m_avx, m_port) = (
-                ht_a.interior_mut::<P, W, H4W>(false)
-                    .unwrap()
-                    .search_main(simd, p64_7, vp, sh, wsize, &mut d_avx),
+            let (mut d_simd, mut d_port) = ([0u32; 32], [0u32; 32]);
+            let (m_simd, m_port) = (
+                ht_a.interior_mut::<P, W, H4W>(false).unwrap().search_main(
+                    d,
+                    p64_7,
+                    vp,
+                    sh,
+                    wsize,
+                    &mut d_simd,
+                ),
                 ht_p.interior_mut::<P, W, H4W>(false).unwrap().search_main(
-                    Scalar,
+                    emu,
                     p64_7,
                     vp,
                     sh,
@@ -5543,60 +5131,48 @@ mod test {
                 ),
             );
             assert_eq!(
-                (m_avx, &ht_a.table[r.clone()], ht_a.tags.get(r.clone())),
+                (m_simd, &ht_a.table[r.clone()], ht_a.tags.get(r.clone())),
                 (m_port, &ht_p.table[r.clone()], ht_p.tags.get(r.clone()))
             );
             for i in 0..W {
-                assert!((m_avx & (1 << i)) == 0 || d_avx[i] == d_port[i]);
+                assert!((m_simd & (1 << i)) == 0 || d_simd[i] == d_port[i]);
             }
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
-    #[simd_entry]
-    #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
-    fn run_test_buckets_avx2(simd: X64V3, _token: impl SimdToken) {
-        let (w24, w30) = ((1 << 24) - 16, (1 << 30) - 16);
-        macro_rules! chk {
-            ($($p:literal : $(($w:literal, $h4w:literal)),+);+ $(;)?) => {
-                $($(check_ht_seq::<$p, $w, $h4w, X64V3>(simd, if $p == 25 { w24 } else { w30 });)+)+
-            };
-        }
-        chk!(
-            25: (1, 1), (4, 1), (8, 1), (16, 4), (32, 4);
-            31: (1, 1), (4, 1), (8, 1), (16, 4), (32, 4)
+    fn run_test_buckets_desc<D: SimdDescriptor>(d: D) {
+        d.call(
+            #[inline(always)]
+            |d| {
+                let (w24, w30) = ((1 << 24) - 16, (1 << 30) - 16);
+                macro_rules! chk {
+                ($($p:literal : $(($w:literal, $h4w:literal)),+);+ $(;)?) => {
+                    $($(check_ht_seq::<$p, $w, $h4w, D>(d, if $p == 25 { w24 } else { w30 });)+)+
+                };
+            }
+                chk!(
+                    25: (1, 1), (4, 1), (8, 1), (16, 4), (32, 4);
+                    31: (1, 1), (4, 1), (8, 1), (16, 4), (32, 4)
+                );
+            },
         );
     }
 
-    #[cfg(target_arch = "x86_64")]
     #[test]
-    fn test_buckets_avx2() {
-        if let Some(token) = X64V3::try_new() {
-            run_test_buckets_avx2(token, token);
+    fn test_buckets_simd_parity() {
+        run_test_buckets_desc(Emu128Descriptor::new().unwrap());
+        #[cfg(target_arch = "x86_64")]
+        {
+            if let Some(d) = jxl_simd::AvxDescriptor::new() {
+                run_test_buckets_desc(d);
+            }
+            if let Some(d) = jxl_simd::Sse42Descriptor::new() {
+                run_test_buckets_desc(d);
+            }
         }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[simd_entry]
-    #[target_feature(enable = "neon")]
-    fn run_test_buckets_neon(simd: A64Neon, _token: impl SimdToken) {
-        let (w24, w30) = ((1 << 24) - 16, (1 << 30) - 16);
-        macro_rules! chk {
-            ($($p:literal : $(($w:literal, $h4w:literal)),+);+ $(;)?) => {
-                $($(check_ht_seq::<$p, $w, $h4w, A64Neon>(simd, if $p == 25 { w24 } else { w30 });)+)+
-            };
-        }
-        chk!(
-            25: (1, 1), (4, 1), (8, 1), (16, 4), (32, 4);
-            31: (1, 1), (4, 1), (8, 1), (16, 4), (32, 4)
-        );
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn test_buckets_neon() {
-        if let Some(token) = A64Neon::try_new() {
-            run_test_buckets_neon(token, token);
+        #[cfg(target_arch = "aarch64")]
+        if let Some(d) = jxl_simd::NeonDescriptor::new() {
+            run_test_buckets_desc(d);
         }
     }
 
@@ -5627,15 +5203,16 @@ mod test {
             (ht_unbaked.next_vpos + 7) as u32,
             (ht_cached.next_vpos + 7) as u32,
         );
+        let emu = Emu128Descriptor::new().unwrap();
         let (mu, mc) = (
             ht_unbaked
                 .interior_mut::<25, 8, 4>(true)
                 .unwrap()
-                .search_main(Scalar, p64, vp_u, sec, wsize as u32, &mut d_u),
+                .search_main(emu, p64, vp_u, sec, wsize as u32, &mut d_u),
             ht_cached
                 .interior_mut::<25, 8, 4>(true)
                 .unwrap()
-                .search_main(Scalar, p64, vp_c, sec, wsize as u32, &mut d_c),
+                .search_main(emu, p64, vp_c, sec, wsize as u32, &mut d_c),
         );
         assert_eq!(mu, mc);
         assert_ne!(mu, 0);
@@ -5649,11 +5226,11 @@ mod test {
             ht_unbaked
                 .interior_mut::<25, 8, 4>(true)
                 .unwrap()
-                .search_ht4(Scalar, p32, vp_u, wsize as u32, &mut d_u),
+                .search_ht4(emu, p32, vp_u, wsize as u32, &mut d_u),
             ht_cached
                 .interior_mut::<25, 8, 4>(true)
                 .unwrap()
-                .search_ht4(Scalar, p32, vp_c, wsize as u32, &mut d_c),
+                .search_ht4(emu, p32, vp_c, wsize as u32, &mut d_c),
         );
         assert_eq!(m4u, m4c);
         for i in 0..4 {
@@ -5685,38 +5262,32 @@ mod test {
         }
         let idx = super::RawDictIndex::build(&dict);
         let idx5 = super::Dict5Index::build(&dict);
-        let simd = crate::constants::try_simd(true);
-        for off in (0..dict.len() - 8).step_by(37) {
-            let w = u64::from_le_bytes(*dict[off..off + 8].first_chunk::<8>().unwrap());
-            let (p64, sec, _) = super::hash8_p64(w);
-            let res_scalar = idx.search4_mask(Scalar, p64, sec);
-            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-            if let Some(tok) = simd {
-                let res_simd = idx.search4_mask(tok, p64, sec);
+        let emu = Emu128Descriptor::new().unwrap();
+        crate::constants::with_simd_256!(true, |d| {
+            for off in (0..dict.len() - 8).step_by(37) {
+                let w = u64::from_le_bytes(*dict[off..off + 8].first_chunk::<8>().unwrap());
+                let (p64, sec, _) = super::hash8_p64(w);
+                let res_scalar = idx.search4_mask(emu, p64, sec);
+                let res_simd = idx.search4_mask(d, p64, sec);
                 assert_eq!(
                     res_simd.map(|(b, m)| (*b, m)),
                     res_scalar.map(|(b, m)| (*b, m))
                 );
             }
-            let _ = (simd, res_scalar);
-        }
-        let (p_this, _, _) = super::hash5_p64(super::load_word64_padded(b"this.c00"));
-        let chunks = idx5.bucket_chunks(p_this, 4).unwrap();
-        assert!(chunks.len() >= 2);
-        for chunk in chunks {
-            let tag = u32::from(b'c');
-            let m_scalar = super::Dict5Index::search8_chunk_mask(Scalar, chunk, tag);
-            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-            if let Some(tok) = simd {
+            let (p_this, _, _) = super::hash5_p64(super::load_word64_padded(b"this.c00"));
+            let chunks = idx5.bucket_chunks(p_this, 4).unwrap();
+            assert!(chunks.len() >= 2);
+            for chunk in chunks {
+                let tag = u32::from(b'c');
+                let m_scalar = super::Dict5Index::search8_chunk_mask(emu, chunk, tag);
                 assert_eq!(
-                    super::Dict5Index::search8_chunk_mask(tok, chunk, tag),
+                    super::Dict5Index::search8_chunk_mask(d, chunk, tag),
                     m_scalar
                 );
             }
-            let _ = (simd, m_scalar);
-        }
+        });
 
-        // Also verify all 8 lane positions + tag collisions on `dict5_search8_*` directly.
+        // Also verify all 8 lane positions + tag collisions on `dict5_search8_simd` directly.
         let mut b8 = [0u32; 8];
         for (i, slot) in b8.iter_mut().enumerate() {
             let tag = if i % 2 == 0 { 0xABu32 } else { 0xCDu32 };
@@ -5724,18 +5295,21 @@ mod test {
         }
         let scalar_ab = super::dict5_search8_scalar(&b8, 0xAB);
         assert_eq!(scalar_ab, 0b0101_0101);
-        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-        if let Some(tok) = simd {
-            #[cfg(target_arch = "x86_64")]
-            {
-                assert_eq!(super::dict5_search8_avx2(&b8, 0xAB, tok), scalar_ab);
-                assert_eq!(super::dict5_search8_avx2(&b8, 0xCD, tok), 0b1010_1010);
-            }
-            #[cfg(target_arch = "aarch64")]
-            {
-                assert_eq!(super::dict5_search8_neon(&b8, 0xAB, tok), scalar_ab);
-                assert_eq!(super::dict5_search8_neon(&b8, 0xCD, tok), 0b1010_1010);
-            }
+        assert_eq!(super::dict5_search8_simd(emu, &b8, 0xAB), scalar_ab);
+        assert_eq!(super::dict5_search8_simd(emu, &b8, 0xCD), 0b1010_1010);
+        crate::constants::with_simd_256!(true, |d| {
+            assert_eq!(super::dict5_search8_simd(d, &b8, 0xAB), scalar_ab);
+            assert_eq!(super::dict5_search8_simd(d, &b8, 0xCD), 0b1010_1010);
+        });
+        #[cfg(target_arch = "x86_64")]
+        if let Some(sse) = jxl_simd::Sse42Descriptor::new() {
+            sse.call(
+                #[inline(always)]
+                |sse| {
+                    assert_eq!(super::dict5_search8_simd(sse, &b8, 0xAB), scalar_ab);
+                    assert_eq!(super::dict5_search8_simd(sse, &b8, 0xCD), 0b1010_1010);
+                },
+            );
         }
     }
 }

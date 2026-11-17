@@ -23,8 +23,7 @@ use lsb_bitwriter::{BitWriter, OutSlice};
 
 use crate::compress::build_stream_engine;
 use crate::constants::{
-    try_simd, window_size, OptSimd, INITIAL_LAST_DISTANCES, LARGE_MAX_WBITS, MIN_WBITS,
-    STD_MAX_WBITS, WBITS,
+    window_size, INITIAL_LAST_DISTANCES, LARGE_MAX_WBITS, MIN_WBITS, STD_MAX_WBITS, WBITS,
 };
 use crate::fast_onepass::fast_twopass_max_output_size_for;
 use crate::hashtable::PreparedDictionary;
@@ -127,6 +126,17 @@ pub(crate) trait ChunkStreamEncoder: Send + Sync {
         wsize
     }
     #[allow(clippy::too_many_arguments)]
+    fn run_chunks_with_desc<D: jxl_simd::SimdDescriptor>(
+        &mut self,
+        d: D,
+        ctx: (Option<usize>, bool, usize),
+        in_buf: &[u8],
+        range: core::ops::Range<usize>,
+        dict: Option<&PreparedDictionary>,
+        ring: &mut [u32; 2],
+        bw: &mut BitWriter<'_>,
+    );
+    #[allow(clippy::too_many_arguments)]
     fn run_chunks(
         &mut self,
         ctx: (Option<usize>, bool, usize),
@@ -135,8 +145,12 @@ pub(crate) trait ChunkStreamEncoder: Send + Sync {
         dict: Option<&PreparedDictionary>,
         ring: &mut [u32; 2],
         bw: &mut BitWriter<'_>,
-        simd: OptSimd,
-    );
+        use_simd: bool,
+    ) {
+        crate::constants::with_simd_256!(use_simd, |d| {
+            self.run_chunks_with_desc(d, ctx, in_buf, range, dict, ring, bw);
+        });
+    }
 }
 
 pub(crate) struct ChunkStreamBackend<E> {
@@ -222,7 +236,7 @@ impl<E: ChunkStreamEncoder> StreamEngine for ChunkStreamBackend<E> {
             dict,
             &mut self.ring,
             bw,
-            try_simd(true),
+            true,
         );
         eof
     }
