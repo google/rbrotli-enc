@@ -24,12 +24,80 @@
 mod bounded_slice;
 mod bounded_usize;
 
-#[cfg(target_arch = "aarch64")]
-pub mod safe_aarch64;
-#[cfg(target_arch = "x86_64")]
-pub mod safe_x86_64;
 pub use bounded_slice::*;
 pub use bounded_usize::*;
+
+/// Prefetches all 64-byte cache lines covered by `r` into L1 cache for reading.
+#[inline(always)]
+pub fn prefetch_t0<T: ?Sized>(r: &T) {
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    {
+        let base = (r as *const T).cast::<i8>();
+        for i in (0..core::mem::size_of_val(r)).step_by(64) {
+            // SAFETY: SSE is baseline on `x86_64` and `_mm_prefetch` is a non-faulting hint over
+            // the live object backing `r`.
+            unsafe {
+                core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(
+                    base.wrapping_add(i),
+                );
+            }
+        }
+    }
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    {
+        let base = (r as *const T).cast::<u8>();
+        for i in (0..core::mem::size_of_val(r)).step_by(64) {
+            // SAFETY: `i < size_of_val(r)` stays within the live object backing `r`, and `prfm` is
+            // a non-faulting read-only cache-prefetch hint with no writes or flag effects.
+            unsafe {
+                let p = base.add(i);
+                core::arch::asm!(
+                    "prfm pldl1keep, [{p}]",
+                    p = in(reg) p,
+                    options(nostack, preserves_flags, readonly),
+                );
+            }
+        }
+    }
+    #[cfg(not(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(miri))))]
+    let _ = r;
+}
+
+/// Prefetches all 64-byte cache lines covered by `r` into L1 cache with write intent.
+#[inline(always)]
+pub fn prefetch_et0<T: ?Sized>(r: &T) {
+    #[cfg(all(target_arch = "x86_64", not(miri)))]
+    {
+        let base = (r as *const T).cast::<i8>();
+        for i in (0..core::mem::size_of_val(r)).step_by(64) {
+            // SAFETY: SSE is baseline on `x86_64` and `_mm_prefetch` is a non-faulting hint over
+            // the live object backing `r`.
+            unsafe {
+                core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_ET0 }>(
+                    base.wrapping_add(i),
+                );
+            }
+        }
+    }
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    {
+        let base = (r as *const T).cast::<u8>();
+        for i in (0..core::mem::size_of_val(r)).step_by(64) {
+            // SAFETY: `i < size_of_val(r)` stays within the live object backing `r`, and `prfm` is
+            // a non-faulting write-intent cache-prefetch hint with no writes or flag effects.
+            unsafe {
+                let p = base.add(i);
+                core::arch::asm!(
+                    "prfm pstl1keep, [{p}]",
+                    p = in(reg) p,
+                    options(nostack, preserves_flags, readonly),
+                );
+            }
+        }
+    }
+    #[cfg(not(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(miri))))]
+    let _ = r;
+}
 
 #[cfg(test)]
 mod tests {
@@ -178,18 +246,10 @@ mod tests {
         }
         assert_eq!(&padded[7..12], &[70, 80, 90, 100, 110]);
 
-        #[cfg(target_arch = "x86_64")]
-        if let Some(tok) = <safe_x86_64::X64V3 as simd_tokens::SimdToken>::try_new() {
-            use safe_x86_64::X64V3Ext;
-            let x = 0x100u64;
-            tok.prefetch_et0(&x);
-        }
-
-        #[cfg(target_arch = "aarch64")]
-        if let Some(tok) = <safe_aarch64::A64Neon as simd_tokens::SimdToken>::try_new() {
-            use safe_aarch64::A64NeonExt;
-            let x = 0x100u64;
-            tok.prefetch_et0(&x);
-        }
+        let x = [0x100u64; 32];
+        prefetch_t0(&x);
+        prefetch_et0(&x);
+        prefetch_t0(&());
+        prefetch_et0(&());
     }
 }

@@ -20,8 +20,8 @@ unsafe fn ptr_at<T>(base: *const T, offset: usize) -> *const T {
     if std::mem::size_of::<T>() == 0 {
         base
     } else {
-        // SAFETY: Caller guarantees `offset` lies within the live `&[T]` backing `base`, whose
-        // byte size is at most `isize::MAX` whenever `size_of::<T>() > 0`.
+        // SAFETY: Caller guarantees `offset` lies within the live slice/array allocation `[T]`
+        // backing `base`, whose byte size is at most `isize::MAX` whenever `size_of::<T>() > 0`.
         unsafe { base.add(offset) }
     }
 }
@@ -459,28 +459,27 @@ impl<T, const N: usize> BoundedArrayExt<T, N> for [T; N] {
     #[inline(always)]
     fn bget_masked(&self, index: usize) -> &T {
         const { assert!(N.is_power_of_two()) };
-        // SAFETY: `N` is a power of two (`>= 1`), so `(index & (N - 1)) < N == self.len()`.
-        unsafe { self.get_unchecked(index & (N - 1)) }
+        &self[index & (N - 1)]
     }
 
     #[inline(always)]
     fn bget_masked_mut(&mut self, index: usize) -> &mut T {
         const { assert!(N.is_power_of_two()) };
-        // SAFETY: `N` is a power of two (`>= 1`), so `(index & (N - 1)) < N == self.len()`.
-        unsafe { self.get_unchecked_mut(index & (N - 1)) }
+        &mut self[index & (N - 1)]
     }
 
     #[inline(always)]
     fn const_sub<const SIZE: usize, const OFFSET: usize>(&self) -> &[T; SIZE] {
         const { assert!(N as u128 >= OFFSET as u128 + SIZE as u128) };
-        // SAFETY: `OFFSET + SIZE <= N == self.len()`.
-        unsafe { &*(ptr_at(self.as_ptr(), OFFSET) as *const [T; SIZE]) }
+        self.split_at(OFFSET).1.first_chunk::<SIZE>().unwrap()
     }
 
     #[inline(always)]
     fn const_sub_mut<const SIZE: usize, const OFFSET: usize>(&mut self) -> &mut [T; SIZE] {
         const { assert!(N as u128 >= OFFSET as u128 + SIZE as u128) };
-        // SAFETY: `OFFSET + SIZE <= N == self.len()`.
-        unsafe { &mut *(ptr_at_mut(self.as_mut_ptr(), OFFSET) as *mut [T; SIZE]) }
+        self.split_at_mut(OFFSET)
+            .1
+            .first_chunk_mut::<SIZE>()
+            .unwrap()
     }
 }

@@ -66,6 +66,7 @@ macro_rules! make_bounded_type {
 
             #[inline(always)]
             pub const fn get(&self) -> $ty {
+                const { assert!(MAX <= $ty::MAX as usize) };
                 self.0
             }
 
@@ -106,6 +107,7 @@ make_bounded_type!(BoundedU16, u16);
 impl<const BOUND: usize> From<BoundedU8<BOUND>> for BoundedUsize<BOUND> {
     #[inline(always)]
     fn from(value: BoundedU8<BOUND>) -> Self {
+        const { assert!(BOUND <= u8::MAX as usize) };
         BoundedUsize(value.0 as usize)
     }
 }
@@ -113,6 +115,7 @@ impl<const BOUND: usize> From<BoundedU8<BOUND>> for BoundedUsize<BOUND> {
 impl<const BOUND: usize> From<BoundedU16<BOUND>> for BoundedUsize<BOUND> {
     #[inline(always)]
     fn from(value: BoundedU16<BOUND>) -> Self {
+        const { assert!(BOUND <= u16::MAX as usize) };
         BoundedUsize(value.0 as usize)
     }
 }

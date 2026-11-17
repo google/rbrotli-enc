@@ -19,8 +19,9 @@
 //! let mut buf = [1u8; 4];
 //! let _ = lsb_bitwriter::slice_as_uninit_mut(&mut buf);
 //! ```
+use bounded_utils::BoundedUsize;
 use core::slice;
-use std::{mem::MaybeUninit, ptr::copy_nonoverlapping};
+use std::mem::MaybeUninit;
 
 /// Iterators whose [`ExactSizeIterator::len`] and [`Iterator::size_hint`] are *guaranteed* to
 /// equal the exact number of elements remaining to be yielded.
@@ -66,9 +67,8 @@ impl<'a> OutSlice<'a> {
 
     #[inline(always)]
     pub fn write_at(&mut self, offset: usize, src: &[u8]) {
-        for (slot, &b) in self.0[offset..offset + src.len()].iter_mut().zip(src) {
-            slot.write(b);
-        }
+        let end = offset.checked_add(src.len()).unwrap();
+        self.0[offset..end].write_copy_of_slice(src);
     }
 }
 
@@ -117,8 +117,8 @@ struct CursorState {
 /// A BitWriter allows to efficiently pack bits into bytes in the way specified
 /// for most common compression formats, including at least Deflate, Brotli, JPEG,
 /// PNG and JPEG XL.
-// Invariant: the first `state.bytes_written` bytes in `buf` are always initialized, and
-// `state.bits_in_buffer < 8` outside an active `BitStreamCursor`.
+// Invariant: `state.bytes_written <= buf.len()`, the first `state.bytes_written` bytes in `buf` are
+// always initialized, and `state.bits_in_buffer < 8` outside an active `BitStreamCursor`.
 pub struct BitWriter<'a> {
     buf: &'a mut [MaybeUninit<u8>],
     state: CursorState,
@@ -162,16 +162,13 @@ impl<'a> BitWriter<'a> {
         assert!(count <= 56);
         debug_assert!(self.state.bits_in_buffer < 8);
         debug_assert!(bits & !((1u64 << count) - 1) == 0);
-        if self.buf.len() - self.state.bytes_written >= 8 {
+        if let Some(dst8) = self
+            .buf
+            .get_mut(self.state.bytes_written..)
+            .and_then(|s| s.first_chunk_mut::<8>())
+        {
             self.state.bit_buffer |= bits << self.state.bits_in_buffer;
-            // SAFETY: `self.buf.len() - self.state.bytes_written >= 8` guarantees 8 writable bytes.
-            unsafe {
-                self.buf
-                    .as_mut_ptr()
-                    .add(self.state.bytes_written)
-                    .cast::<u64>()
-                    .write_unaligned(self.state.bit_buffer.to_le());
-            }
+            dst8.write_copy_of_slice(&self.state.bit_buffer.to_le_bytes());
             let total = self.state.bits_in_buffer + count;
             let bytes = total >> 3;
             self.state.bits_in_buffer = total & 7;
@@ -202,19 +199,7 @@ impl<'a> BitWriter<'a> {
     pub fn write_bytes_aligned(&mut self, bytes: &[u8]) {
         self.zero_pad_to_byte();
         let end = self.state.bytes_written.checked_add(bytes.len()).unwrap();
-        assert!(self.buf.len() >= end);
-        // SAFETY: `MaybeUninit<u8>` has the same layout as `u8`, `bytes` does not overlap
-        // `self.buf` (which is `&mut`), and `self.buf.len() >= end` was checked above.
-        unsafe {
-            copy_nonoverlapping(
-                bytes.as_ptr(),
-                self.buf
-                    .as_mut_ptr()
-                    .add(self.state.bytes_written)
-                    .cast::<u8>(),
-                bytes.len(),
-            );
-        }
+        self.buf[self.state.bytes_written..end].write_copy_of_slice(bytes);
         self.state.bytes_written = end;
     }
 
@@ -253,7 +238,9 @@ impl<'a> BitWriter<'a> {
     /// `(complete_bytes, tail_nbits, tail_bits)` with `tail_nbits < 8`.
     pub fn finalize_unpadded(self) -> (&'a [u8], usize, u64) {
         debug_assert!(self.state.bits_in_buffer < 8);
-        // SAFETY: the first `self.state.bytes_written` bytes of `self.buf` are initialized.
+        debug_assert!(self.state.bytes_written <= self.buf.len());
+        // SAFETY: the first `self.state.bytes_written <= self.buf.len()` bytes of `self.buf` are
+        // initialized.
         let bytes = unsafe {
             slice::from_raw_parts(self.buf.as_ptr().cast::<u8>(), self.state.bytes_written)
         };
@@ -284,6 +271,37 @@ impl<'a> BitWriter<'a> {
     pub fn finalize(mut self) -> &'a [u8] {
         self.zero_pad_to_byte();
         self.finalize_unpadded().0
+    }
+
+    /// Reserves `cap` spare bytes in `out_vec`, runs `f` on a [`BitWriter`] backed directly by
+    /// `out_vec`'s uninitialized spare capacity, and commits the initialized bytes into `out_vec`.
+    /// When `pad_to_byte` is `true`, zero-pads any trailing partial byte and returns `(0, 0)`;
+    /// otherwise returns `(tail_nbits, tail_bits)` with `tail_nbits < 8`.
+    pub fn append_to_vec(
+        out_vec: &mut Vec<u8>,
+        cap: usize,
+        carry_bits: u8,
+        carry_byte: u8,
+        pad_to_byte: bool,
+        f: impl FnOnce(&mut BitWriter<'_>),
+    ) -> (u8, u8) {
+        out_vec.reserve(cap);
+        let base_len = out_vec.len();
+        let (written_len, carry) = {
+            let spare = &mut out_vec.spare_capacity_mut()[..cap];
+            let mut bw = BitWriter::new_uninit_with_carry(spare, carry_bits, carry_byte);
+            f(&mut bw);
+            if pad_to_byte {
+                (bw.finalize().len(), (0, 0))
+            } else {
+                let (written, tail_nbits, tail_bits) = bw.finalize_unpadded();
+                (written.len(), (tail_nbits as u8, tail_bits as u8))
+            }
+        };
+        // SAFETY: `BitWriter` initializes `0..written_len` (`written_len <= cap`), and `reserve`
+        // ensured `base_len + written_len <= base_len + cap <= out_vec.capacity()`.
+        unsafe { out_vec.set_len(base_len + written_len) };
+        carry
     }
 }
 
@@ -531,8 +549,6 @@ unsafe impl<A: GuaranteedSizeIterator, B: GuaranteedSizeIterator> GuaranteedSize
     for core::iter::Zip<A, B>
 {
 }
-
-use bounded_utils::BoundedUsize;
 
 #[cfg(test)]
 mod tests {
@@ -830,5 +846,35 @@ mod tests {
         assert_eq!(bw1.total_bits(), 140);
         assert_eq!(bw2.finalize(), &[0xEF, 0xBE]);
         assert_eq!(bw1.finalize().len(), 18);
+    }
+
+    #[test]
+    fn test_append_to_vec_carry_and_finalize() {
+        let mut out = vec![0xAA];
+        let (cb0, cbyte0) = BitWriter::append_to_vec(&mut out, 32, 0, 0, false, |bw| {
+            bw.write(5, 0b1_0110);
+            bw.write(8, 0xCA);
+        });
+        assert_eq!((cb0, cbyte0), (5, 0xCA >> 3));
+        assert_eq!(out.len(), 2);
+
+        let (cb1, cbyte1) = BitWriter::append_to_vec(&mut out, 32, cb0, cbyte0, false, |bw| {
+            let mut cur = bw.cursor();
+            put(&mut cur, 6, 0b10_1101);
+        });
+        assert_eq!((cb1, cbyte1), (3, 0b101));
+
+        let end = BitWriter::append_to_vec(&mut out, 16, cb1, cbyte1, true, |bw| {
+            bw.write_bytes_aligned(b"XY");
+        });
+        assert_eq!(end, (0, 0));
+
+        let mut exp_buf = [0u8; 64];
+        let mut ref_bw = BitWriter::new(&mut exp_buf);
+        ref_bw.write(5, 0b1_0110);
+        ref_bw.write(8, 0xCA);
+        ref_bw.write(6, 0b10_1101);
+        ref_bw.write_bytes_aligned(b"XY");
+        assert_eq!(&out[1..], ref_bw.finalize());
     }
 }

@@ -17,9 +17,9 @@
 pub(crate) struct Scalar;
 
 #[cfg(target_arch = "aarch64")]
-pub(crate) use bounded_utils::safe_aarch64::{A64Neon, A64NeonExt};
+pub(crate) type A64Neon = simd_tokens::NeonToken;
 #[cfg(target_arch = "x86_64")]
-pub(crate) use bounded_utils::safe_x86_64::{X64V3Ext, X64V3};
+pub(crate) type X64V3 = simd_tokens::Avx2Token;
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) type OptSimd = Option<X64V3>;
@@ -96,12 +96,12 @@ impl SimdBackend for X64V3 {
 
     #[inline(always)]
     fn prefetch_et0<T>(self, r: &T) {
-        X64V3Ext::prefetch_et0(self, r);
+        bounded_utils::prefetch_et0(r);
     }
 
     #[inline(always)]
     fn prefetch_t0<T>(self, r: &T) {
-        X64V3Ext::prefetch_t0(self, r);
+        bounded_utils::prefetch_t0(r);
     }
 
     #[inline(always)]
@@ -116,12 +116,12 @@ impl SimdBackend for A64Neon {
 
     #[inline(always)]
     fn prefetch_et0<T>(self, r: &T) {
-        A64NeonExt::prefetch_et0(self, r);
+        bounded_utils::prefetch_et0(r);
     }
 
     #[inline(always)]
     fn prefetch_t0<T>(self, r: &T) {
-        A64NeonExt::prefetch_t0(self, r);
+        bounded_utils::prefetch_t0(r);
     }
 
     #[inline(always)]
