@@ -14,81 +14,27 @@
 
 use std::{
     mem::MaybeUninit,
-    panic::{catch_unwind, AssertUnwindSafe},
     ptr::{null, null_mut},
     slice::{from_raw_parts, from_raw_parts_mut},
 };
 
 /// cbindgen:ignore
-pub struct RBrotliEncoder {
-    inner: rbrotli_enc_lib::Encoder,
-    poisoned: bool,
-}
-
-impl RBrotliEncoder {
-    #[inline]
-    fn with_mut<T>(
-        &mut self,
-        fallback: T,
-        f: impl FnOnce(&mut rbrotli_enc_lib::Encoder) -> T,
-    ) -> T {
-        if self.poisoned {
-            return fallback;
-        }
-        match catch_unwind(AssertUnwindSafe(|| f(&mut self.inner))) {
-            Ok(v) => v,
-            Err(_) => {
-                self.poisoned = true;
-                fallback
-            }
-        }
-    }
-}
-
-const _: fn() = || {
-    fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<RBrotliEncoder>();
-    assert_send_sync::<RBrotliDictionary>();
-};
+#[repr(transparent)]
+pub struct RBrotliEncoder(rbrotli_enc_lib::Encoder);
 
 /// cbindgen:ignore
 type RBrotliDictionary = rbrotli_enc_lib::PreparedDictionary;
 
 /// cbindgen:ignore
-pub struct RBrotliStreamingEncoder {
-    inner: rbrotli_enc_lib::StreamingEncoder,
-    poisoned: bool,
-}
-
-impl RBrotliStreamingEncoder {
-    #[inline]
-    fn with_mut<T>(
-        &mut self,
-        fallback: T,
-        f: impl FnOnce(&mut rbrotli_enc_lib::StreamingEncoder) -> T,
-    ) -> T {
-        if self.poisoned {
-            return fallback;
-        }
-        match catch_unwind(AssertUnwindSafe(|| f(&mut self.inner))) {
-            Ok(v) => v,
-            Err(_) => {
-                self.poisoned = true;
-                fallback
-            }
-        }
-    }
-}
+#[repr(transparent)]
+pub struct RBrotliStreamingEncoder(rbrotli_enc_lib::StreamingEncoder);
 
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<RBrotliEncoder>();
+    assert_send_sync::<RBrotliDictionary>();
     assert_send_sync::<RBrotliStreamingEncoder>();
 };
-
-#[inline]
-fn ffi_guard<T>(fallback: T, f: impl FnOnce() -> T) -> T {
-    catch_unwind(AssertUnwindSafe(f)).unwrap_or(fallback)
-}
 
 #[inline]
 unsafe fn ptr_ref<'a, T>(ptr: *const T) -> Option<&'a T> {
@@ -211,13 +157,10 @@ pub extern "C" fn RBrotliEncMakeEncoderWithParams(
     lgwin: u32,
     num_threads: usize,
 ) -> *mut RBrotliEncoder {
-    ffi_guard(null_mut(), || {
-        let lgwin = if lgwin == 0 { 24 } else { lgwin };
-        Box::into_raw(Box::new(RBrotliEncoder {
-            inner: rbrotli_enc_lib::Encoder::with_threads(quality, lgwin, num_threads),
-            poisoned: false,
-        }))
-    })
+    let lgwin = if lgwin == 0 { 24 } else { lgwin };
+    Box::into_raw(Box::new(RBrotliEncoder(
+        rbrotli_enc_lib::Encoder::with_threads(quality, lgwin, num_threads),
+    )))
 }
 
 /// Prepares a reusable raw LZ77 Shared/Compound Dictionary for `(quality, lgwin)` (`lgwin == 0`
@@ -236,19 +179,17 @@ pub unsafe extern "C" fn RBrotliEncMakeDictionary(
     quality: u32,
     lgwin: u32,
 ) -> *mut RBrotliDictionary {
-    ffi_guard(null_mut(), || {
-        if len > RBrotliDictionary::MAX_RAW_LEN {
-            return null_mut();
-        }
-        // SAFETY: caller guarantees `data` points to `len` initialized bytes when `len > 0`.
-        let Some(slice) = (unsafe { raw_slice(data, len) }) else {
-            return null_mut();
-        };
-        let lgwin = if lgwin == 0 { 24 } else { lgwin };
-        Box::into_raw(Box::new(RBrotliDictionary::with_lgwin(
-            slice, quality, lgwin,
-        )))
-    })
+    if len > RBrotliDictionary::MAX_RAW_LEN {
+        return null_mut();
+    }
+    // SAFETY: caller guarantees `data` points to `len` initialized bytes when `len > 0`.
+    let Some(slice) = (unsafe { raw_slice(data, len) }) else {
+        return null_mut();
+    };
+    let lgwin = if lgwin == 0 { 24 } else { lgwin };
+    Box::into_raw(Box::new(RBrotliDictionary::with_lgwin(
+        slice, quality, lgwin,
+    )))
 }
 
 /// Frees `dict` if non-null.
@@ -257,10 +198,8 @@ pub unsafe extern "C" fn RBrotliEncMakeDictionary(
 /// `dict` must be null or a live pointer from `RBrotliEncMakeDictionary`, not used afterwards.
 #[no_mangle]
 pub unsafe extern "C" fn RBrotliEncFreeDictionary(dict: *mut RBrotliDictionary) {
-    ffi_guard((), || {
-        // SAFETY: caller guarantees non-null `dict` came from `RBrotliEncMakeDictionary` and is freed once.
-        unsafe { free_boxed(dict) };
-    });
+    // SAFETY: caller guarantees non-null `dict` came from `RBrotliEncMakeDictionary` and is freed once.
+    unsafe { free_boxed(dict) };
 }
 
 /// Equivalent to [`RBrotliEncCompressWithDict`] with `dict = NULL`.
@@ -287,10 +226,14 @@ pub unsafe extern "C" fn RBrotliEncCompress(
 /// # Safety
 /// - `encoder` must be a live `RBrotliEncMakeEncoder*` pointer with exclusive access.
 /// - If non-null, `dict` must be a live `RBrotliEncMakeDictionary` pointer with shared read access.
-/// - If `len > 0`, `data` must point to `len` initialized bytes.
-/// - `out_data` (initialized) and `out_len` must be distinct, non-null, aligned, and writable.
+/// - If `len > 0`, `data` must point to `len` initialized bytes and must not point into internal
+///   buffers owned by `encoder` (for example, a prior `*out_data == NULL` result returned from the
+///   same `encoder`).
+/// - `out_data` (initialized) and `out_len` must be distinct, non-null, aligned, writable, and must
+///   not overlap `encoder`, `dict`, or `data`.
 /// - If `*out_data` is non-null, `*out_len` must be initialized and `*out_data` must point to
-///   `*out_len` writable bytes that do not overlap `data`, `dict`, `out_data`, or `out_len`.
+///   `*out_len` writable bytes that do not overlap `encoder`, `data`, `dict`, `out_data`, or
+///   `out_len`.
 /// - If `*out_data` is null on entry, the returned `*out_data` buffer is owned by `encoder` and
 ///   read-only; callers must not mutate its contents or deallocate it.
 #[no_mangle]
@@ -302,47 +245,43 @@ pub unsafe extern "C" fn RBrotliEncCompressWithDict(
     out_data: *mut *mut MaybeUninit<u8>,
     out_len: *mut usize,
 ) -> bool {
-    ffi_guard(false, || {
-        (|| {
-            if out_data.is_null()
-                || out_len.is_null()
-                || !out_data.is_aligned()
-                || !out_len.is_aligned()
-                || (!dict.is_null() && !dict.is_aligned())
-            {
-                return None;
+    (|| {
+        if out_data.is_null()
+            || out_len.is_null()
+            || !out_data.is_aligned()
+            || !out_len.is_aligned()
+            || (!dict.is_null() && !dict.is_aligned())
+        {
+            return None;
+        }
+        // SAFETY: caller guarantees exclusive `encoder` validity when non-null and initialized `data`.
+        let (encoder, data) = unsafe { (ptr_mut(encoder)?, raw_slice(data, len)?) };
+        // SAFETY: `out_data` is non-null, aligned, and initialized.
+        let out_ptr = unsafe { out_data.read() };
+        let out_buf = if out_ptr.is_null() {
+            None
+        } else {
+            // SAFETY: when `out_ptr` is non-null, caller guarantees `*out_len` writable elements.
+            Some(unsafe { raw_mut_slice(out_ptr, out_len.read())? })
+        };
+        // SAFETY: caller guarantees shared validity of non-null `dict` for this call.
+        let dict_opt = unsafe { dict.as_ref() };
+        let out = match dict_opt {
+            Some(dict_ref) => encoder.0.compress_with_dict(data, dict_ref, out_buf)?,
+            None => encoder.0.compress(data, out_buf)?,
+        };
+        let (internal_ptr, written_len) = (out.as_ptr() as *mut MaybeUninit<u8>, out.len());
+        // SAFETY: `out_data` and `out_len` are non-null and valid for writes. Preserve
+        // non-null caller `*out_data` untouched so its mutable provenance is retained.
+        unsafe {
+            if out_ptr.is_null() {
+                out_data.write(internal_ptr);
             }
-            // SAFETY: caller guarantees exclusive `encoder` validity when non-null and initialized `data`.
-            let (encoder, data) = unsafe { (ptr_mut(encoder)?, raw_slice(data, len)?) };
-            // SAFETY: `out_data` is non-null, aligned, and initialized.
-            let out_ptr = unsafe { out_data.read() };
-            let out_buf = if out_ptr.is_null() {
-                None
-            } else {
-                // SAFETY: when `out_ptr` is non-null, caller guarantees `*out_len` writable elements.
-                Some(unsafe { raw_mut_slice(out_ptr, out_len.read())? })
-            };
-            // SAFETY: caller guarantees shared validity of non-null `dict` for this call.
-            let dict_opt = unsafe { dict.as_ref() };
-            encoder.with_mut(None, |inner| {
-                let out = match dict_opt {
-                    Some(dict_ref) => inner.compress_with_dict(data, dict_ref, out_buf)?,
-                    None => inner.compress(data, out_buf)?,
-                };
-                let (internal_ptr, written_len) = (out.as_ptr() as *mut MaybeUninit<u8>, out.len());
-                // SAFETY: `out_data` and `out_len` are non-null and valid for writes. Preserve
-                // non-null caller `*out_data` untouched so its mutable provenance is retained.
-                unsafe {
-                    if out_ptr.is_null() {
-                        out_data.write(internal_ptr);
-                    }
-                    out_len.write(written_len);
-                }
-                Some(())
-            })
-        })()
-        .is_some()
-    })
+            out_len.write(written_len);
+        }
+        Some(())
+    })()
+    .is_some()
 }
 
 /// Upper bound on compressed byte count for `in_size` input bytes (returns `0` if `encoder` is
@@ -356,12 +295,8 @@ pub unsafe extern "C" fn RBrotliEncMaxRequiredSize(
     encoder: *const RBrotliEncoder,
     in_size: usize,
 ) -> usize {
-    ffi_guard(0, || {
-        // SAFETY: caller guarantees shared validity of non-null `encoder` during this call.
-        unsafe { ptr_ref(encoder) }
-            .filter(|enc| !enc.poisoned)
-            .map_or(0, |enc| enc.inner.max_required_size(in_size))
-    })
+    // SAFETY: caller guarantees shared validity of non-null `encoder` during this call.
+    unsafe { ptr_ref(encoder) }.map_or(0, |enc| enc.0.max_required_size(in_size))
 }
 
 /// Frees `encoder` if non-null.
@@ -370,10 +305,8 @@ pub unsafe extern "C" fn RBrotliEncMaxRequiredSize(
 /// `encoder` must be null or a live `RBrotliEncMakeEncoder*` pointer, not used afterwards.
 #[no_mangle]
 pub unsafe extern "C" fn RBrotliEncFreeEncoder(encoder: *mut RBrotliEncoder) {
-    ffi_guard((), || {
-        // SAFETY: caller guarantees non-null `encoder` came from `RBrotliEncMakeEncoder*` and is freed once.
-        unsafe { free_boxed(encoder) };
-    });
+    // SAFETY: caller guarantees non-null `encoder` came from `RBrotliEncMakeEncoder*` and is freed once.
+    unsafe { free_boxed(encoder) };
 }
 
 /// Creates a new streaming encoder for `quality` (`lgwin = 24`, 1 thread).
@@ -390,13 +323,10 @@ pub extern "C" fn RBrotliEncMakeStreamingEncoderWithParams(
     lgwin: u32,
     num_threads: usize,
 ) -> *mut RBrotliStreamingEncoder {
-    ffi_guard(null_mut(), || {
-        let lgwin = if lgwin == 0 { 24 } else { lgwin };
-        Box::into_raw(Box::new(RBrotliStreamingEncoder {
-            inner: rbrotli_enc_lib::StreamingEncoder::with_threads(quality, lgwin, num_threads),
-            poisoned: false,
-        }))
-    })
+    let lgwin = if lgwin == 0 { 24 } else { lgwin };
+    Box::into_raw(Box::new(RBrotliStreamingEncoder(
+        rbrotli_enc_lib::StreamingEncoder::with_threads(quality, lgwin, num_threads),
+    )))
 }
 
 /// Frees `encoder` if non-null.
@@ -405,10 +335,8 @@ pub extern "C" fn RBrotliEncMakeStreamingEncoderWithParams(
 /// `encoder` must be null or a live `RBrotliEncMakeStreamingEncoder*` pointer, not used afterwards.
 #[no_mangle]
 pub unsafe extern "C" fn RBrotliEncFreeStreamingEncoder(encoder: *mut RBrotliStreamingEncoder) {
-    ffi_guard((), || {
-        // SAFETY: caller guarantees non-null `encoder` came from `RBrotliEncMakeStreamingEncoder*`.
-        unsafe { free_boxed(encoder) };
-    });
+    // SAFETY: caller guarantees non-null `encoder` came from `RBrotliEncMakeStreamingEncoder*`.
+    unsafe { free_boxed(encoder) };
 }
 
 /// Resets `encoder` for a fresh Brotli stream (clearing buffered data, framing state, and any
@@ -418,15 +346,10 @@ pub unsafe extern "C" fn RBrotliEncFreeStreamingEncoder(encoder: *mut RBrotliStr
 /// If non-null, `encoder` must be a live streaming encoder with exclusive access.
 #[no_mangle]
 pub unsafe extern "C" fn RBrotliEncStreamingReset(encoder: *mut RBrotliStreamingEncoder) {
-    ffi_guard((), || {
-        // SAFETY: caller guarantees `encoder` is valid and exclusively borrowed when non-null.
-        if let Some(enc) = unsafe { ptr_mut(encoder) } {
-            match catch_unwind(AssertUnwindSafe(|| enc.inner.reset())) {
-                Ok(()) => enc.poisoned = false,
-                Err(_) => enc.poisoned = true,
-            }
-        }
-    });
+    // SAFETY: caller guarantees `encoder` is valid and exclusively borrowed when non-null.
+    if let Some(enc) = unsafe { ptr_mut(encoder) } {
+        enc.0.reset();
+    }
 }
 
 /// Attaches a prepared dictionary to `encoder` before encoding starts (`dict` may be freed right
@@ -439,12 +362,9 @@ pub unsafe extern "C" fn RBrotliEncStreamingAttachDictionary(
     encoder: *mut RBrotliStreamingEncoder,
     dict: *const RBrotliDictionary,
 ) -> bool {
-    ffi_guard(false, || {
-        // SAFETY: caller guarantees exclusive `encoder` and shared `dict` validity when non-null.
-        unsafe { ptr_mut(encoder).zip(ptr_ref(dict)) }.is_some_and(|(enc, dict_ref)| {
-            enc.with_mut(false, |inner| inner.set_dictionary(dict_ref).is_ok())
-        })
-    })
+    // SAFETY: caller guarantees exclusive `encoder` and shared `dict` validity when non-null.
+    unsafe { ptr_mut(encoder).zip(ptr_ref(dict)) }
+        .is_some_and(|(enc, dict_ref)| enc.0.set_dictionary(dict_ref).is_ok())
 }
 
 /// Incrementally compresses `*next_in` (`*available_in` bytes) into `*next_out` (`*available_out`
@@ -457,7 +377,9 @@ pub unsafe extern "C" fn RBrotliEncStreamingAttachDictionary(
 /// - `available_in` and `available_out` must be distinct, non-null, aligned, initialized, and
 ///   readable/writable.
 /// - When `*available_in > 0`, `next_in` must be non-null, aligned, initialized, and
-///   readable/writable, and `*next_in` must point to `*available_in` initialized readable bytes.
+///   readable/writable, and `*next_in` must point to `*available_in` initialized readable bytes
+///   that do not overlap internal buffers owned by `encoder` (such as a pointer returned by
+///   [`RBrotliEncTakeOutput`] on the same `encoder`).
 /// - When `*available_out > 0`, `next_out` must be non-null, aligned, initialized, and
 ///   readable/writable, and `*next_out` must point to `*available_out` writable bytes that do not
 ///   overlap `encoder` (or any attached dictionary), `*next_in`, `available_in`, `next_in`,
@@ -473,83 +395,80 @@ pub unsafe extern "C" fn RBrotliEncCompressStream(
     next_out: *mut *mut MaybeUninit<u8>,
     total_out: *mut usize,
 ) -> bool {
-    ffi_guard(false, || {
-        (|| {
-            let req_op = op.to_rust()?;
-            if available_in.is_null()
-                || !available_in.is_aligned()
-                || available_out.is_null()
-                || !available_out.is_aligned()
-                || (!total_out.is_null() && !total_out.is_aligned())
-            {
-                return None;
-            }
-            // SAFETY: caller guarantees exclusive `encoder` and initialized `available_*` pointers.
-            let (enc, avail_in, avail_out) =
-                unsafe { (ptr_mut(encoder)?, available_in.read(), available_out.read()) };
+    (|| {
+        let req_op = op.to_rust()?;
+        if available_in.is_null()
+            || !available_in.is_aligned()
+            || available_out.is_null()
+            || !available_out.is_aligned()
+            || (!total_out.is_null() && !total_out.is_aligned())
+        {
+            return None;
+        }
+        // SAFETY: caller guarantees exclusive `encoder` and initialized `available_*` pointers.
+        let (enc, avail_in, avail_out) =
+            unsafe { (ptr_mut(encoder)?, available_in.read(), available_out.read()) };
 
-            // Chunk `avail_in > isize::MAX` (e.g. `> 2 GiB` buffers on 32-bit targets) into `isize::MAX`
-            // `Process` steps so `slice::from_raw_parts` never exceeds `isize::MAX`.
-            let (step_op, step_in_len) = if avail_in > isize::MAX as usize {
-                (rbrotli_enc_lib::StreamOp::Process, isize::MAX as usize)
-            } else {
-                (req_op, avail_in)
-            };
+        // Chunk `avail_in > isize::MAX` (e.g. `> 2 GiB` buffers on 32-bit targets) into `isize::MAX`
+        // `Process` steps so `slice::from_raw_parts` never exceeds `isize::MAX`.
+        let (step_op, step_in_len) = if avail_in > isize::MAX as usize {
+            (rbrotli_enc_lib::StreamOp::Process, isize::MAX as usize)
+        } else {
+            (req_op, avail_in)
+        };
 
-            let (in_ptr, in_slice) = if step_in_len == 0 {
-                (null(), &[][..])
-            } else {
-                // SAFETY: when `avail_in > 0`, caller guarantees valid `next_in` and `*next_in`.
-                let p = unsafe { *ptr_ref(next_in)? };
-                // SAFETY: `p` points to `step_in_len` initialized readable bytes when non-null.
-                (p, unsafe { raw_slice(p, step_in_len)? })
-            };
-            let (out_ptr, out_slice) = if avail_out == 0 {
-                (null_mut(), &mut [][..])
-            } else {
-                // SAFETY: when `avail_out > 0`, caller guarantees valid `next_out` and `*next_out`.
-                let p = unsafe { *ptr_ref(next_out)? };
-                // SAFETY: `p` points to `avail_out` writable non-overlapping bytes when non-null.
-                (p, unsafe { raw_mut_slice(p, avail_out)? })
-            };
-            let (res, tot_out) = enc.with_mut(None, |inner| {
-                let r = inner
-                    .compress_stream_uninit(step_op, in_slice, out_slice)
-                    .ok()?;
-                Some((r, inner.total_out()))
-            })?;
-            if res.bytes_consumed > 0 {
-                // SAFETY: `bytes_consumed > 0` implies non-null `in_ptr` (`bytes_consumed <= step_in_len`)
-                // and aligned writable `available_in` / `next_in`.
-                unsafe {
-                    available_in.write(avail_in - res.bytes_consumed);
-                    next_in.write(in_ptr.add(res.bytes_consumed));
-                }
+        let (in_ptr, in_slice) = if step_in_len == 0 {
+            (null(), &[][..])
+        } else {
+            // SAFETY: when `avail_in > 0`, caller guarantees valid `next_in` and `*next_in`.
+            let p = unsafe { *ptr_ref(next_in)? };
+            // SAFETY: `p` points to `step_in_len` initialized readable bytes when non-null.
+            (p, unsafe { raw_slice(p, step_in_len)? })
+        };
+        let (out_ptr, out_slice) = if avail_out == 0 {
+            (null_mut(), &mut [][..])
+        } else {
+            // SAFETY: when `avail_out > 0`, caller guarantees valid `next_out` and `*next_out`.
+            let p = unsafe { *ptr_ref(next_out)? };
+            // SAFETY: `p` points to `avail_out` writable non-overlapping bytes when non-null.
+            (p, unsafe { raw_mut_slice(p, avail_out)? })
+        };
+        let res = enc
+            .0
+            .compress_stream_uninit(step_op, in_slice, out_slice)
+            .ok()?;
+        let tot_out = enc.0.total_out();
+        if res.bytes_consumed > 0 {
+            // SAFETY: `bytes_consumed > 0` implies non-null `in_ptr` (`bytes_consumed <= step_in_len`)
+            // and aligned writable `available_in` / `next_in`.
+            unsafe {
+                available_in.write(avail_in - res.bytes_consumed);
+                next_in.write(in_ptr.add(res.bytes_consumed));
             }
-            if res.bytes_written > 0 {
-                // SAFETY: `bytes_written > 0` implies non-null `out_ptr` (`bytes_written <= out_slice.len()`)
-                // and aligned writable `available_out` / `next_out`. Re-read `available_out` so even
-                // aliased `available_in == available_out` pointers stay deterministic without UB.
-                unsafe {
-                    available_out.write(available_out.read().saturating_sub(res.bytes_written));
-                    next_out.write(out_ptr.add(res.bytes_written));
-                }
+        }
+        if res.bytes_written > 0 {
+            // SAFETY: `bytes_written > 0` implies non-null `out_ptr` (`bytes_written <= out_slice.len()`)
+            // and aligned writable `available_out` / `next_out`. Re-read `available_out` so even
+            // aliased `available_in == available_out` pointers stay deterministic without UB.
+            unsafe {
+                available_out.write(available_out.read().saturating_sub(res.bytes_written));
+                next_out.write(out_ptr.add(res.bytes_written));
             }
-            if !total_out.is_null() {
-                let tot = usize::try_from(tot_out).unwrap_or(usize::MAX);
-                // SAFETY: `total_out` is non-null, aligned, writable, and distinct from `*next_out`.
-                unsafe { total_out.write(tot) };
-            }
-            Some(())
-        })()
-        .is_some()
-    })
+        }
+        if !total_out.is_null() {
+            let tot = usize::try_from(tot_out).unwrap_or(usize::MAX);
+            // SAFETY: `total_out` is non-null, aligned, writable, and distinct from `*next_out`.
+            unsafe { total_out.write(tot) };
+        }
+        Some(())
+    })()
+    .is_some()
 }
 
 /// Zero-copy drain of staged output bytes (`*size == 0` drains all, else at most `*size`), writing
 /// drained length to `*size` (`0` whenever null is returned and `size` is valid) and returning a
-/// pointer valid until the next mutating `encoder` call (or null when `*size == 0` or on invalid /
-/// poisoned `encoder`).
+/// pointer valid until the next mutating `encoder` call (or null when `*size == 0` or on invalid
+/// `encoder`).
 ///
 /// # Safety
 /// - If non-null, `encoder` must be a live streaming encoder with exclusive access.
@@ -560,28 +479,24 @@ pub unsafe extern "C" fn RBrotliEncTakeOutput(
     encoder: *mut RBrotliStreamingEncoder,
     size: *mut usize,
 ) -> *const u8 {
-    ffi_guard(null(), || {
-        // SAFETY: caller guarantees `size` is aligned, initialized, writable, and distinct when non-null.
-        let Some(size_ref) = (unsafe { ptr_mut(size) }) else {
-            return null();
-        };
-        let raw_req = *size_ref;
-        *size_ref = 0;
-        // SAFETY: caller guarantees exclusive `encoder` validity when non-null.
-        let Some(enc) = (unsafe { ptr_mut(encoder) }) else {
-            return null();
-        };
-        let req = if raw_req == 0 { usize::MAX } else { raw_req };
-        enc.with_mut(null(), |inner| {
-            let chunk = inner.take_output(req);
-            *size_ref = chunk.len();
-            if chunk.is_empty() {
-                null()
-            } else {
-                chunk.as_ptr()
-            }
-        })
-    })
+    // SAFETY: caller guarantees `size` is aligned, initialized, writable, and distinct when non-null.
+    let Some(size_ref) = (unsafe { ptr_mut(size) }) else {
+        return null();
+    };
+    let raw_req = *size_ref;
+    *size_ref = 0;
+    // SAFETY: caller guarantees exclusive `encoder` validity when non-null.
+    let Some(enc) = (unsafe { ptr_mut(encoder) }) else {
+        return null();
+    };
+    let req = if raw_req == 0 { usize::MAX } else { raw_req };
+    let chunk = enc.0.take_output(req);
+    *size_ref = chunk.len();
+    if chunk.is_empty() {
+        null()
+    } else {
+        chunk.as_ptr()
+    }
 }
 
 /// Returns `true` if staged compressed output bytes remain in `encoder`.
@@ -590,10 +505,8 @@ pub unsafe extern "C" fn RBrotliEncTakeOutput(
 /// If non-null, `encoder` must be a valid streaming encoder with shared read access.
 #[no_mangle]
 pub unsafe extern "C" fn RBrotliEncHasMoreOutput(encoder: *const RBrotliStreamingEncoder) -> bool {
-    ffi_guard(false, || {
-        // SAFETY: `encoder` is checked for alignment; caller upholds validity when non-null.
-        unsafe { ptr_ref(encoder) }.is_some_and(|enc| !enc.poisoned && enc.inner.has_more_output())
-    })
+    // SAFETY: `encoder` is checked for alignment; caller upholds validity when non-null.
+    unsafe { ptr_ref(encoder) }.is_some_and(|enc| enc.0.has_more_output())
 }
 
 /// Returns `true` if `encoder` has emitted `ISLAST = 1` and drained all staged output.
@@ -602,16 +515,14 @@ pub unsafe extern "C" fn RBrotliEncHasMoreOutput(encoder: *const RBrotliStreamin
 /// If non-null, `encoder` must be a valid streaming encoder with shared read access.
 #[no_mangle]
 pub unsafe extern "C" fn RBrotliEncIsFinished(encoder: *const RBrotliStreamingEncoder) -> bool {
-    ffi_guard(false, || {
-        // SAFETY: `encoder` is checked for alignment; caller upholds validity when non-null.
-        unsafe { ptr_ref(encoder) }.is_some_and(|enc| !enc.poisoned && enc.inner.is_finished())
-    })
+    // SAFETY: `encoder` is checked for alignment; caller upholds validity when non-null.
+    unsafe { ptr_ref(encoder) }.is_some_and(|enc| enc.0.is_finished())
 }
 
 /// Returns true if this machine is supported by the encoder.
 #[no_mangle]
 pub extern "C" fn RBrotliEncIsSupported() -> bool {
-    ffi_guard(false, rbrotli_enc_lib::Encoder::is_supported)
+    rbrotli_enc_lib::Encoder::is_supported()
 }
 
 #[cfg(test)]
@@ -942,7 +853,7 @@ mod test {
 
             // 6. Aliased `&zero` across `available_in`, `available_out`, and `total_out` on
             //    `PROCESS` after reset is sound, `FORCE_U32` sentinel is rejected as an op, and
-            //    panic-poisoned handles reject reuse until `RBrotliEncStreamingReset`.
+            //    bounded `RBrotliEncTakeOutput` (`*size > 0`) zeroes `*size` whenever returning `NULL`.
             RBrotliEncStreamingReset(stream);
             let mut shared_zero = 0usize;
             let shared_ptr: *mut usize = &mut shared_zero;
@@ -965,37 +876,9 @@ mod test {
                 shared_ptr,
             ));
 
-            assert!(!(*enc).with_mut(false, |_| -> bool { panic!("simulated FFI panic") }));
-            assert_eq!(RBrotliEncMaxRequiredSize(enc, 64), 0);
-            assert!(!RBrotliEncCompress(
-                enc,
-                rep.as_ptr(),
-                rep.len(),
-                &mut out_p,
-                &mut out_n
-            ));
-
-            assert!(!(*stream).with_mut(false, |_| -> bool { panic!("simulated stream panic") }));
-            assert!(!RBrotliEncHasMoreOutput(stream));
-            assert!(!RBrotliEncIsFinished(stream));
-            // Bounded `RBrotliEncTakeOutput` (`*size > 0`) MUST zero `*size` whenever returning
-            // `NULL` (on null or panic-poisoned encoders, as well as empty staged output).
             let mut bounded_cap = 4096usize;
             assert!(RBrotliEncTakeOutput(ptr::null_mut(), &mut bounded_cap).is_null());
             assert_eq!(bounded_cap, 0);
-            bounded_cap = 4096;
-            assert!(RBrotliEncTakeOutput(stream, &mut bounded_cap).is_null());
-            assert_eq!(bounded_cap, 0);
-            assert!(!RBrotliEncCompressStream(
-                stream,
-                RBrotliEncStreamOp::RBROTLI_ENC_STREAM_FINISH,
-                shared_ptr,
-                ptr::null_mut(),
-                shared_ptr,
-                ptr::null_mut(),
-                ptr::null_mut(),
-            ));
-            RBrotliEncStreamingReset(stream);
             bounded_cap = 4096;
             assert!(RBrotliEncTakeOutput(stream, &mut bounded_cap).is_null());
             assert_eq!(bounded_cap, 0);

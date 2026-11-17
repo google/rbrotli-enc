@@ -110,10 +110,14 @@ bool RBrotliEncCompress(RBrotliEncoder *encoder,
  * # Safety
  * - `encoder` must be a live `RBrotliEncMakeEncoder*` pointer with exclusive access.
  * - If non-null, `dict` must be a live `RBrotliEncMakeDictionary` pointer with shared read access.
- * - If `len > 0`, `data` must point to `len` initialized bytes.
- * - `out_data` (initialized) and `out_len` must be distinct, non-null, aligned, and writable.
+ * - If `len > 0`, `data` must point to `len` initialized bytes and must not point into internal
+ *   buffers owned by `encoder` (for example, a prior `*out_data == NULL` result returned from the
+ *   same `encoder`).
+ * - `out_data` (initialized) and `out_len` must be distinct, non-null, aligned, writable, and must
+ *   not overlap `encoder`, `dict`, or `data`.
  * - If `*out_data` is non-null, `*out_len` must be initialized and `*out_data` must point to
- *   `*out_len` writable bytes that do not overlap `data`, `dict`, `out_data`, or `out_len`.
+ *   `*out_len` writable bytes that do not overlap `encoder`, `data`, `dict`, `out_data`, or
+ *   `out_len`.
  * - If `*out_data` is null on entry, the returned `*out_data` buffer is owned by `encoder` and
  *   read-only; callers must not mutate its contents or deallocate it.
  */
@@ -193,7 +197,9 @@ bool RBrotliEncStreamingAttachDictionary(RBrotliStreamingEncoder *encoder,
  * - `available_in` and `available_out` must be distinct, non-null, aligned, initialized, and
  *   readable/writable.
  * - When `*available_in > 0`, `next_in` must be non-null, aligned, initialized, and
- *   readable/writable, and `*next_in` must point to `*available_in` initialized readable bytes.
+ *   readable/writable, and `*next_in` must point to `*available_in` initialized readable bytes
+ *   that do not overlap internal buffers owned by `encoder` (such as a pointer returned by
+ *   [`RBrotliEncTakeOutput`] on the same `encoder`).
  * - When `*available_out > 0`, `next_out` must be non-null, aligned, initialized, and
  *   readable/writable, and `*next_out` must point to `*available_out` writable bytes that do not
  *   overlap `encoder` (or any attached dictionary), `*next_in`, `available_in`, `next_in`,
@@ -211,8 +217,8 @@ bool RBrotliEncCompressStream(RBrotliStreamingEncoder *encoder,
 /**
  * Zero-copy drain of staged output bytes (`*size == 0` drains all, else at most `*size`), writing
  * drained length to `*size` (`0` whenever null is returned and `size` is valid) and returning a
- * pointer valid until the next mutating `encoder` call (or null when `*size == 0` or on invalid /
- * poisoned `encoder`).
+ * pointer valid until the next mutating `encoder` call (or null when `*size == 0` or on invalid
+ * `encoder`).
  *
  * # Safety
  * - If non-null, `encoder` must be a live streaming encoder with exclusive access.
