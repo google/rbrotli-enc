@@ -250,7 +250,6 @@ pub struct StreamingEncoder {
     dict: Option<PreparedDictionary>,
     in_buf: Vec<u8>,
     out_buf: Vec<u8>,
-    scratch_bw: Vec<u8>,
     st: StreamState,
 }
 
@@ -274,7 +273,6 @@ impl StreamingEncoder {
             dict: None,
             in_buf: Vec::new(),
             out_buf: Vec::new(),
-            scratch_bw: Vec::new(),
             st: StreamState::default(),
         }
     }
@@ -374,37 +372,35 @@ impl StreamingEncoder {
             self.st.out_pos = 0;
         }
         let cap = max_bytes.saturating_add(64);
-        if self.scratch_bw.len() < cap {
-            self.scratch_bw.resize(cap, 0);
-        }
-        let mut bw = BitWriter::new_with_carry(
-            &mut self.scratch_bw[..cap],
+        let (wbits, dict_ref, in_buf, engine) = (
+            self.wbits,
+            self.dict.as_ref(),
+            &self.in_buf,
+            &mut self.engine,
+        );
+        let header_written = &mut self.st.header_written;
+        (self.st.carry_bits, self.st.carry_byte) = BitWriter::append_to_vec(
+            &mut self.out_buf,
+            cap,
             self.st.carry_bits,
             self.st.carry_byte,
-        );
-        if !self.st.header_written {
-            metablock::write_window_bits(self.wbits, self.wbits > STD_MAX_WBITS, &mut bw);
-            self.st.header_written = true;
-        }
-        match op {
-            Some(op) => {
-                let closed = self
-                    .engine
-                    .emit_step(op, &self.in_buf, self.dict.as_ref(), &mut bw);
-                if op == StreamOp::Finish && !closed {
-                    metablock::write_empty_last_metablock(&mut bw);
+            op == Some(StreamOp::Finish),
+            |bw| {
+                if !*header_written {
+                    metablock::write_window_bits(wbits, wbits > STD_MAX_WBITS, bw);
+                    *header_written = true;
                 }
-            }
-            None => metablock::write_empty_metadata_metablock(&mut bw),
-        }
-        if op == Some(StreamOp::Finish) {
-            self.out_buf.extend_from_slice(bw.finalize());
-            (self.st.carry_bits, self.st.carry_byte) = (0, 0);
-        } else {
-            let (written, tail_nbits, tail_bits) = bw.finalize_unpadded();
-            self.out_buf.extend_from_slice(written);
-            (self.st.carry_bits, self.st.carry_byte) = (tail_nbits as u8, tail_bits as u8);
-        }
+                match op {
+                    Some(op) => {
+                        let closed = engine.emit_step(op, in_buf, dict_ref, bw);
+                        if op == StreamOp::Finish && !closed {
+                            metablock::write_empty_last_metablock(bw);
+                        }
+                    }
+                    None => metablock::write_empty_metadata_metablock(bw),
+                }
+            },
+        );
     }
 
     fn maybe_compact(&mut self) {

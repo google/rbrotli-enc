@@ -18,7 +18,7 @@
 use crate::constants::A64Neon;
 #[cfg(target_arch = "x86_64")]
 use crate::constants::X64V3;
-use crate::constants::{try_simd, Scalar, SimdBackend, HASH_MUL32, STD_MAX_RAW_STATIC_DIST};
+use crate::constants::{try_simd, Scalar, SimdBackend, HASH_MUL32};
 use crate::hashtable::{
     common_prefix_at, common_prefix_len, common_suffix_len, find_closest_2b, hash5_p64,
     load_word64_padded, FastLdmSpan,
@@ -1255,8 +1255,17 @@ fn build_chunk_matches_impl<S: SimdBackend>(
             && longest_lz < max_lz_for_static
             && (is_q11 || stream_pos < 524_288 || (stream_pos < 1_048_576 && longest_lz < 6))
         {
-            let base_dist = (stream_pos.min(wsize) as u64) + (cfg.full_dict_len as u64) + 1;
-            if base_dist <= STD_MAX_RAW_STATIC_DIST as u64 {
+            let (base_dist, max_raw_dist) = crate::hashtable::static_dict_bounds(
+                stream_pos,
+                wsize,
+                if env.dict.is_empty() {
+                    0
+                } else {
+                    cfg.full_dict_len
+                },
+                false,
+            );
+            if base_dist <= max_raw_dist as u64 {
                 let min_dict_out = longest_lz.saturating_sub(1).max(4);
                 let slice = &data[stream_pos..chunk_end];
                 if is_q11 {
@@ -1264,7 +1273,7 @@ fn build_chunk_matches_impl<S: SimdBackend>(
                     static_dict::for_each_dict121_match(
                         slice,
                         base_dist,
-                        STD_MAX_RAW_STATIC_DIST,
+                        max_raw_dist,
                         min_dict_out,
                         |ol, bl, rd| out.push_static_dedup(sc_start, ol, bl, rd),
                     );
@@ -1272,14 +1281,7 @@ fn build_chunk_matches_impl<S: SimdBackend>(
                     simd,
                     false,
                     slice,
-                    (
-                        base_dist,
-                        STD_MAX_RAW_STATIC_DIST,
-                        min_dict_out as u32,
-                        180,
-                        320,
-                        16,
-                    ),
+                    (base_dist, max_raw_dist, min_dict_out as u32, 180, 320, 16),
                 ) {
                     out.static_cands.push(StaticMatchCand {
                         out_len: sm.out_len,

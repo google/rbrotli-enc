@@ -19,8 +19,6 @@ use crate::map_to_sym::{
 };
 use crate::metablock::ContextMode;
 use crate::static_dict;
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-use bounded_utils::PairedPrefix;
 use bounded_utils::{
     BoundedArrayExt, BoundedPrefix, BoundedPrefixCursor, BoundedUsize, Pow2SliceMut,
 };
@@ -136,9 +134,22 @@ const fn arch_cfg<C: MatchConfig>() -> ArchCfg {
 }
 
 macro_rules! def_arch {
+    (@call $pb:literal, $w:literal, $h4w:literal, $cfg:ty, $lw:literal, $dict:literal,
+           $ht:expr, $env:expr, $state:expr, $md:expr, $tok:expr) => {
+        if let Some(it) = $ht.interior_mut::<$pb, $w, $h4w>(<$cfg>::USE_3B_TABLE) {
+            #[cfg(target_arch = "x86_64")]
+            return parse_slice_interior_avx2::<$pb, $w, $h4w, $cfg, $lw, $dict>(
+                it, $env, $state, $md, $tok, $tok,
+            );
+            #[cfg(target_arch = "aarch64")]
+            return parse_slice_interior_neon::<$pb, $w, $h4w, $cfg, $lw, $dict>(
+                it, $env, $state, $md, $tok, $tok,
+            );
+        }
+    };
     ($name:ident: fast=$fm:literal, shift=$sh:literal, lvl=$lv:literal, lazy2=$l2:literal, dctx=$dc:literal, mctx=$mc:literal, ht3=$h3:literal;
-     avx2=[$(($pb:literal, $w:literal, $h4w:literal, $lw:literal)),+ $(,)?];
-     dict=[$(($dpb:literal, $dw:literal, $dh4w:literal)),+ $(,)?]) => {
+     std=[$(($pb:literal, $w:literal, $h4w:literal)),+ $(,)?];
+     lw=[$(($lpb:literal, $lw_w:literal, $lh4w:literal)),+ $(,)?]) => {
         pub(crate) struct $name;
         impl MatchConfig for $name {
             const FAST_MATCHING: bool = $fm;
@@ -160,38 +171,17 @@ macro_rules! def_arch {
                 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
                 if let Some(tok) = simd {
                     let eff_lw = env.large_window && env.win.1 > FAST_LDM_MIN_DIST;
-                    if !env.has_dict {
-                        match (ht.pos_bits, ht.ways, ht.ht4_ways, eff_lw) {
-                            $(($pb, $w, $h4w, $lw) => {
-                                if let Some(it) = ht.interior_mut::<$pb, $w, $h4w>(Self::USE_3B_TABLE) {
-                                    #[cfg(target_arch = "x86_64")]
-                                    return parse_slice_interior_avx2::<$pb, $w, $h4w, Self, $lw, false>(
-                                        it, env, state, md, tok, tok,
-                                    );
-                                    #[cfg(target_arch = "aarch64")]
-                                    return parse_slice_interior_neon::<$pb, $w, $h4w, Self, $lw, false>(
-                                        it, env, state, md, tok, tok,
-                                    );
-                                }
-                            })+
-                            _ => {}
-                        }
-                    } else if !eff_lw {
-                        match (ht.pos_bits, ht.ways, ht.ht4_ways) {
-                            $(($dpb, $dw, $dh4w) => {
-                                if let Some(it) = ht.interior_mut::<$dpb, $dw, $dh4w>(Self::USE_3B_TABLE) {
-                                    #[cfg(target_arch = "x86_64")]
-                                    return parse_slice_interior_avx2::<$dpb, $dw, $dh4w, Self, false, true>(
-                                        it, env, state, md, tok, tok,
-                                    );
-                                    #[cfg(target_arch = "aarch64")]
-                                    return parse_slice_interior_neon::<$dpb, $dw, $dh4w, Self, false, true>(
-                                        it, env, state, md, tok, tok,
-                                    );
-                                }
-                            })+
-                            _ => {}
-                        }
+                    match (ht.pos_bits, ht.ways, ht.ht4_ways, eff_lw, env.has_dict) {
+                        $(($pb, $w, $h4w, false, false) => {
+                            def_arch!(@call $pb, $w, $h4w, Self, false, false, ht, env, state, md, tok);
+                        })+
+                        $(($pb, $w, $h4w, false, true) => {
+                            def_arch!(@call $pb, $w, $h4w, Self, false, true, ht, env, state, md, tok);
+                        })+
+                        $(($lpb, $lw_w, $lh4w, true, false) => {
+                            def_arch!(@call $lpb, $lw_w, $lh4w, Self, true, false, ht, env, state, md, tok);
+                        })+
+                        _ => {}
                     }
                 }
                 let _ = simd;
@@ -202,41 +192,29 @@ macro_rules! def_arch {
 }
 
 def_arch!(ArchQ3:  fast=true,  shift=6,  lvl=1, lazy2=false, dctx=false, mctx=false, ht3=false;
-    avx2=[
-        (25, 4, 1, false), (25, 8, 1, false),
-        (25, 4, 1, true), (25, 8, 1, true),
-        (31, 4, 1, true), (31, 8, 1, true),
-    ];
-    dict=[(25, 4, 1), (25, 8, 1)]);
+    std=[(25, 4, 1), (25, 8, 1)];
+    lw=[(25, 4, 1), (25, 8, 1), (31, 4, 1), (31, 8, 1)]);
 def_arch!(ArchQ35: fast=false, shift=5,  lvl=1, lazy2=false, dctx=false, mctx=false, ht3=false;
-    avx2=[
-        (25, 4, 1, false), (25, 8, 1, false),
-        (25, 4, 1, true), (25, 8, 1, true),
-        (31, 4, 1, true), (31, 8, 1, true),
-    ];
-    dict=[(25, 4, 1), (25, 8, 1)]);
+    std=[(25, 4, 1), (25, 8, 1)];
+    lw=[(25, 4, 1), (25, 8, 1), (31, 4, 1), (31, 8, 1)]);
 def_arch!(ArchQ4:  fast=false, shift=7,  lvl=1, lazy2=false, dctx=false, mctx=false, ht3=false;
-    avx2=[(25, 4, 1, false), (25, 8, 1, false), (25, 8, 1, true), (31, 8, 1, true)];
-    dict=[(25, 4, 1), (25, 8, 1)]);
+    std=[(25, 4, 1), (25, 8, 1)];
+    lw=[(25, 8, 1), (31, 8, 1)]);
 def_arch!(ArchQ56: fast=false, shift=8,  lvl=1, lazy2=false, dctx=true,  mctx=true,  ht3=true;
-    avx2=[
-        (25, 8, 1, false), (25, 8, 4, false), (25, 16, 4, false),
-        (25, 8, 1, true), (25, 8, 4, true), (25, 16, 4, true),
-        (31, 8, 1, true), (31, 8, 4, true), (31, 16, 4, true),
-    ];
-    dict=[(25, 8, 1), (25, 8, 4), (25, 16, 4)]);
+std=[(25, 8, 1), (25, 8, 4), (25, 16, 4)];
+lw=[
+    (25, 8, 1), (25, 8, 4), (25, 16, 4),
+    (31, 8, 1), (31, 8, 4), (31, 16, 4),
+]);
 def_arch!(ArchQ78: fast=false, shift=8,  lvl=2, lazy2=false, dctx=true,  mctx=true,  ht3=true;
-avx2=[
-    (25, 8, 1, false), (25, 8, 4, false), (25, 16, 1, false), (25, 16, 4, false), (25, 32, 4, false),
-    (25, 8, 1, true), (25, 16, 4, true), (25, 32, 4, true),
-    (31, 8, 1, true), (31, 16, 4, true), (31, 32, 4, true),
-];
-dict=[
-    (25, 8, 1), (25, 8, 4), (25, 16, 1), (25, 16, 4), (25, 32, 4),
+std=[(25, 8, 1), (25, 8, 4), (25, 16, 1), (25, 16, 4), (25, 32, 4)];
+lw=[
+    (25, 8, 1), (25, 16, 4), (25, 32, 4),
+    (31, 8, 1), (31, 16, 4), (31, 32, 4),
 ]);
 def_arch!(ArchQ9:  fast=false, shift=99, lvl=3, lazy2=true,  dctx=true,  mctx=true,  ht3=true;
-    avx2=[(25, 16, 1, false), (25, 32, 4, false), (25, 32, 4, true), (31, 32, 4, true)];
-    dict=[(25, 16, 1), (25, 32, 4)]);
+    std=[(25, 16, 1), (25, 32, 4)];
+    lw=[(25, 32, 4), (31, 32, 4)]);
 
 #[inline(always)]
 pub(crate) fn load_word64_padded(slice: &[u8]) -> u64 {
@@ -1922,40 +1900,43 @@ fn diff_mask16(a: &[u8; 16], b: &[u8; 16], _tok: impl SimdToken) -> u32 {
 }
 
 #[inline(always)]
-fn common_prefix_from<const START: usize, S: SimdBackend>(
+fn common_prefix_slices_from<const START: usize, S: SimdBackend>(
     simd: S,
-    data: &[u8],
-    pos1: usize,
-    pos2: usize,
+    s1: &[u8],
+    s2: &[u8],
     max_len: usize,
 ) -> usize {
+    let max = s1.len().min(s2.len()).min(max_len);
+    if START > 0 && max <= START {
+        return max;
+    }
+    let (a, b) = (&s1[..max], &s2[..max]);
     dispatch_simd!(
         simd, S => |tok| {
-            let Some(pair) = PairedPrefix::new(data, pos1, pos2, max_len) else {
-                return 0;
-            };
-            let max = pair.len();
-            if START > 0 && max <= START {
-                return max;
-            }
             let mut off = START;
-            while let Some((s1, s2)) = pair.chunks_at::<32>(off) {
-                let mask = diff_mask32(s1, s2, tok);
+            while let (Some(c1), Some(c2)) = (
+                a.get(off..).and_then(|s| s.first_chunk::<32>()),
+                b.get(off..).and_then(|s| s.first_chunk::<32>()),
+            ) {
+                let mask = diff_mask32(c1, c2, tok);
                 if mask != 0 {
                     return off + mask.trailing_zeros() as usize;
                 }
                 off += 32;
             }
             if off < max {
-                if let Some((s1, s2)) = pair.chunks_at::<16>(off) {
-                    let m = diff_mask16(s1, s2, tok);
+                if let (Some(c1), Some(c2)) = (
+                    a.get(off..).and_then(|s| s.first_chunk::<16>()),
+                    b.get(off..).and_then(|s| s.first_chunk::<16>()),
+                ) {
+                    let m = diff_mask16(c1, c2, tok);
                     if m != 0 {
                         return off + m.trailing_zeros() as usize;
                     }
                     off += 16;
                 }
-                if let Some((s1, s2)) = pair.last_chunks::<16>() {
-                    let m = diff_mask16(s1, s2, tok);
+                if let (Some(c1), Some(c2)) = (a.last_chunk::<16>(), b.last_chunk::<16>()) {
+                    let m = diff_mask16(c1, c2, tok);
                     return if m != 0 {
                         max - 16 + m.trailing_zeros() as usize
                     } else {
@@ -1963,23 +1944,26 @@ fn common_prefix_from<const START: usize, S: SimdBackend>(
                     };
                 }
                 if const { START < 16 } {
-                    if let Some((s1, s2)) = pair.chunks_at::<8>(off) {
-                        let diff = u64::from_le_bytes(*s1) ^ u64::from_le_bytes(*s2);
+                    if let (Some(c1), Some(c2)) = (
+                        a.get(off..).and_then(|s| s.first_chunk::<8>()),
+                        b.get(off..).and_then(|s| s.first_chunk::<8>()),
+                    ) {
+                        let diff = u64::from_le_bytes(*c1) ^ u64::from_le_bytes(*c2);
                         if diff != 0 {
                             return off + (diff.trailing_zeros() >> 3) as usize;
                         }
                         off += 8;
                     }
-                    if let Some((s1, s2)) = pair.last_chunks::<8>() {
-                        let diff = u64::from_le_bytes(*s1) ^ u64::from_le_bytes(*s2);
+                    if let (Some(c1), Some(c2)) = (a.last_chunk::<8>(), b.last_chunk::<8>()) {
+                        let diff = u64::from_le_bytes(*c1) ^ u64::from_le_bytes(*c2);
                         return if diff != 0 {
                             max - 8 + (diff.trailing_zeros() >> 3) as usize
                         } else {
                             max
                         };
                     }
-                    while let Some((&[a], &[b])) = pair.chunks_at::<1>(off) {
-                        if a != b {
+                    while off < max {
+                        if a[off] != b[off] {
                             return off;
                         }
                         off += 1;
@@ -1988,64 +1972,27 @@ fn common_prefix_from<const START: usize, S: SimdBackend>(
             }
             max
         },
-        {
-            let max = data.len().saturating_sub(pos2.max(pos1)).min(max_len);
-            if START > 0 && max <= START {
-                return max;
-            }
-            let (Some(a), Some(b)) = (data.get(pos1 + START..), data.get(pos2 + START..)) else {
-                return max.min(START);
-            };
-            START + common_prefix_len(a, b, max - START)
-        }
+        START + common_prefix_len(&a[START..], &b[START..], max - START)
     )
 }
 
 #[inline(always)]
+fn common_prefix_from<const START: usize, S: SimdBackend>(
+    simd: S,
+    data: &[u8],
+    pos1: usize,
+    pos2: usize,
+    max_len: usize,
+) -> usize {
+    let (Some(a), Some(b)) = (data.get(pos1..), data.get(pos2..)) else {
+        return 0;
+    };
+    common_prefix_slices_from::<START, S>(simd, a, b, max_len)
+}
+
+#[inline(always)]
 pub(crate) fn common_prefix_slices_from_16<S: SimdBackend>(simd: S, a: &[u8], b: &[u8]) -> usize {
-    let limit = MAX_COPY_LEN.min(a.len()).min(b.len());
-    if limit <= 16 {
-        return limit;
-    }
-    dispatch_simd!(
-        simd,
-        S => |tok| {
-            let (a, b) = (&a[..limit], &b[..limit]);
-            let mut off = 16;
-            while let (Some(s1), Some(s2)) = (
-                a.get(off..).and_then(|s| s.first_chunk::<32>()),
-                b.get(off..).and_then(|s| s.first_chunk::<32>()),
-            ) {
-                let mask = diff_mask32(s1, s2, tok);
-                if mask != 0 {
-                    return off + mask.trailing_zeros() as usize;
-                }
-                off += 32;
-            }
-            if off < limit {
-                if let (Some(s1), Some(s2)) = (
-                    a.get(off..).and_then(|s| s.first_chunk::<16>()),
-                    b.get(off..).and_then(|s| s.first_chunk::<16>()),
-                ) {
-                    let m = diff_mask16(s1, s2, tok);
-                    if m != 0 {
-                        return off + m.trailing_zeros() as usize;
-                    }
-                    off += 16;
-                }
-                if off < limit {
-                    if let (Some(s1), Some(s2)) = (a.last_chunk::<16>(), b.last_chunk::<16>()) {
-                        let m = diff_mask16(s1, s2, tok);
-                        if m != 0 {
-                            return limit - 16 + m.trailing_zeros() as usize;
-                        }
-                    }
-                }
-            }
-            limit
-        },
-        16 + common_prefix_len(&a[16..limit], &b[16..limit], limit - 16)
-    )
+    common_prefix_slices_from::<16, S>(simd, a, b, MAX_COPY_LEN)
 }
 
 #[inline(always)]

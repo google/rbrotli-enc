@@ -1815,32 +1815,30 @@ impl MetablockData {
             bw,
         );
         let est_single_bits = (bw.total_bits() - start_bits) + payload_bits;
-        if block_data.len() >= 64 && (block_data.len() as u64) * 8 + 48 < est_single_bits {
+        let use_uncomp =
+            block_data.len() >= 64 && (block_data.len() as u64) * 8 + 48 < est_single_bits;
+        let target_bits = if use_uncomp {
             bw.restore(cp);
             self.dist_ring = saved_ring;
-            write_uncompressed_metablock(block_data, bw);
-            let uncomp_bits = bw.total_bits() - start_bits;
-            if self.try_overwrite_multi_block(
-                cfg,
-                bw,
-                (cp, uncomp_bits, saved_ring),
-                (trailing_literals, npostfix, ndirect),
-                (full_data, mb_start, mb_end),
-            ) {
-                return false;
-            }
-            self.total_icd = 0;
-            return true;
-        }
-
+            metablock::write_mlen_header(block_data.len(), false, true, bw);
+            bw.zero_pad_to_byte();
+            (bw.total_bits() - start_bits) + (block_data.len() as u64) * 8
+        } else {
+            est_single_bits
+        };
         if self.try_overwrite_multi_block(
             cfg,
             bw,
-            (cp, est_single_bits, saved_ring),
+            (cp, target_bits, saved_ring),
             (trailing_literals, npostfix, ndirect),
             (full_data, mb_start, mb_end),
         ) {
             return false;
+        }
+        if use_uncomp {
+            bw.write_bytes_aligned(block_data);
+            self.total_icd = 0;
+            return true;
         }
 
         match simd_tok {
@@ -2404,6 +2402,7 @@ const fn max_two_pass_output_size(input_len: usize) -> usize {
 type OptDict<'a> = Option<&'a PreparedDictionary>;
 
 trait EncoderImpl: Send + Sync {
+    fn checked_max_output_size(&self, input_len: usize) -> Option<usize>;
     fn compress_into(&mut self, data: &[u8], dict: OptDict<'_>, bw: &mut BitWriter<'_>);
 }
 
@@ -2422,6 +2421,10 @@ fn select_tier<T: Copy>(
 }
 
 impl EncoderImpl for (OnePassEncoder, [(u8, u8); 3]) {
+    fn checked_max_output_size(&self, input_len: usize) -> Option<usize> {
+        fast_twopass_checked_max_output_size_for(input_len, ONEPASS_CHUNK_SIZE)
+    }
+
     fn compress_into(&mut self, data: &[u8], dict: OptDict<'_>, bw: &mut BitWriter<'_>) {
         let (_, (mls, log)) = select_tier(self.0.wbits(), data.len(), None, self.1);
         self.0.configure(mls, log as u32);
@@ -2430,6 +2433,10 @@ impl EncoderImpl for (OnePassEncoder, [(u8, u8); 3]) {
 }
 
 impl EncoderImpl for (FastTwoPassEncoder, [(u8, u8, u8); 3]) {
+    fn checked_max_output_size(&self, input_len: usize) -> Option<usize> {
+        fast_twopass_checked_max_output_size_for(input_len, FAST_TWOPASS_CHUNK_SIZE)
+    }
+
     fn compress_into(&mut self, data: &[u8], dict: OptDict<'_>, bw: &mut BitWriter<'_>) {
         let (eff_len, (mls, log, slog)) = select_tier(self.0.wbits(), data.len(), None, self.1);
         self.0
@@ -2439,6 +2446,10 @@ impl EncoderImpl for (FastTwoPassEncoder, [(u8, u8, u8); 3]) {
 }
 
 impl<C: MatchConfig> EncoderImpl for EncoderInternal<C> {
+    fn checked_max_output_size(&self, input_len: usize) -> Option<usize> {
+        checked_max_two_pass_output_size(input_len)
+    }
+
     fn compress_into(&mut self, data: &[u8], dict: OptDict<'_>, bw: &mut BitWriter<'_>) {
         let (eff_len, TierParams(ways, ht4_ways, log, ht4_log, mb_kib)) = select_tier(
             self.wbits,
@@ -2465,6 +2476,10 @@ impl<C: MatchConfig> EncoderImpl for EncoderInternal<C> {
 }
 
 impl EncoderImpl for Q11Encoder {
+    fn checked_max_output_size(&self, input_len: usize) -> Option<usize> {
+        input_len.checked_mul(2)?.checked_add(1024 + 64)
+    }
+
     fn compress_into(&mut self, data: &[u8], dict: OptDict<'_>, bw: &mut BitWriter<'_>) {
         Q11Encoder::compress_into(self, data, dict, bw);
     }
@@ -2672,7 +2687,6 @@ type OptOut<'a> = Option<&'a mut [MaybeUninit<u8>]>;
 pub struct Encoder {
     inner: Box<dyn EncoderImpl>,
     bwbuf: Vec<MaybeUninit<u8>>,
-    quality: u8,
 }
 
 const _: fn() = || {
@@ -2710,7 +2724,6 @@ impl Encoder {
         Encoder {
             inner,
             bwbuf: Vec::new(),
-            quality: quality.min(12) as u8,
         }
     }
 
@@ -2721,16 +2734,9 @@ impl Encoder {
     /// `max_required_size(data.len()) > isize::MAX as usize`; use [`crate::StreamingEncoder`] for
     /// arbitrarily large streams (especially on 32-bit targets).
     pub fn max_required_size(&self, input_len: usize) -> usize {
-        self.raw_max_required_size(input_len).unwrap_or(usize::MAX)
-    }
-
-    fn raw_max_required_size(&self, input_len: usize) -> Option<usize> {
-        match self.quality {
-            0 => fast_twopass_checked_max_output_size_for(input_len, ONEPASS_CHUNK_SIZE),
-            1 => fast_twopass_checked_max_output_size_for(input_len, FAST_TWOPASS_CHUNK_SIZE),
-            2..=9 => checked_max_two_pass_output_size(input_len),
-            _ => input_len.checked_mul(2)?.checked_add(1024 + 64),
-        }
+        self.inner
+            .checked_max_output_size(input_len)
+            .unwrap_or(usize::MAX)
     }
 
     fn encode_with<'a>(
@@ -2741,7 +2747,8 @@ impl Encoder {
     ) -> Option<&'a [u8]> {
         let dict = dict.filter(|d| !d.is_empty());
         let max_req = self
-            .raw_max_required_size(data.len())
+            .inner
+            .checked_max_output_size(data.len())
             .filter(|&n| n <= isize::MAX as usize)?;
         match out_buf {
             Some(b) if b.len() >= max_req => {
@@ -2758,9 +2765,7 @@ impl Encoder {
                 let encoded = bw.finalize();
                 match out_buf {
                     Some(b) if encoded.len() <= b.len() => {
-                        let mut out_bw = BitWriter::new_uninit(&mut b[..encoded.len()]);
-                        out_bw.write_bytes_aligned(encoded);
-                        Some(out_bw.finalize())
+                        Some(b[..encoded.len()].write_copy_of_slice(encoded))
                     }
                     Some(_) => None,
                     None => Some(encoded),

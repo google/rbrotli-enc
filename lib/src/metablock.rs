@@ -249,7 +249,12 @@ pub(crate) struct Header<'a> {
 }
 
 #[inline(always)]
-fn write_mlen_header(len: usize, is_last: bool, is_uncompressed: bool, bw: &mut BitWriter) {
+pub(crate) fn write_mlen_header(
+    len: usize,
+    is_last: bool,
+    is_uncompressed: bool,
+    bw: &mut BitWriter,
+) {
     assert!((1..=(1 << 24)).contains(&len), "invalid len {len}");
     debug_assert!(!(is_last && is_uncompressed));
     let mnibbles = usize::from(len > (1 << 16)) + usize::from(len > (1 << 20));
