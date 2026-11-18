@@ -551,57 +551,59 @@ pub(crate) struct IcdBatchBufs {
     pub dist_sym: [u32; 8],
 }
 
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 pub(crate) fn insert_copy_len_to_sym_and_bits_simd<D: SimdDescriptor, const TWO_DIST_CTX: bool>(
     d: D,
     insert: &[u32; 8],
     copy: &[u32; 8],
     bufs: &mut IcdBatchBufs,
 ) {
-    let d = d.maybe_downgrade_256bit();
-    let step = U32Vec::<D::Descriptor256>::LEN;
-    let table = splat_128_u8(d, &[0, 2, 3, 6, 0, 4, 5, 8, 0, 7, 9, 10, 0, 0, 0, 0]);
-    let mask7 = U32Vec::splat(d, 0x7);
-    let one = U32Vec::splat(d, 1);
+    crate::constants::simd_step!(d.maybe_downgrade_256bit(), |d| {
+        let step = U32Vec::<D::Descriptor256>::LEN;
+        let table = splat_128_u8(d, &[0, 2, 3, 6, 0, 4, 5, 8, 0, 7, 9, 10, 0, 0, 0, 0]);
+        let mask7 = U32Vec::splat(d, 0x7);
+        let one = U32Vec::splat(d, 1);
 
-    for (h, (ins_c, copy_c)) in insert
-        .chunks_exact(step)
-        .zip(copy.chunks_exact(step))
-        .enumerate()
-    {
-        let base = h * step;
-        let ins_v = U32Vec::load(d, ins_c).bitcast::<i32>();
-        let copy_v = U32Vec::load(d, copy_c).bitcast::<i32>();
-        if TWO_DIST_CTX {
-            let ctx = copy_v
-                .gt(I32Vec::splat(d, 4))
-                .if_then_else_zero(I32Vec::splat(d, 1))
-                .bitcast::<u32>();
-            ctx.store(&mut bufs.dist_ctx[base..]);
+        for (h, (ins_c, copy_c)) in insert
+            .chunks_exact(step)
+            .zip(copy.chunks_exact(step))
+            .enumerate()
+        {
+            let base = h * step;
+            let ins_v = U32Vec::load(d, ins_c).bitcast::<i32>();
+            let copy_v = U32Vec::load(d, copy_c).bitcast::<i32>();
+            if TWO_DIST_CTX {
+                let ctx = copy_v
+                    .gt(I32Vec::splat(d, 4))
+                    .if_then_else_zero(I32Vec::splat(d, 1))
+                    .bitcast::<u32>();
+                ctx.store(&mut bufs.dist_ctx[base..]);
+            }
+            let (ic, inb, ib) = insert_len_to_sym_and_bits_simd(d, ins_v);
+            let (cc, _, cb) = copy_len_to_sym_and_bits_simd(d, copy_v);
+            let (cb_u, inb_u, ib_u) = (
+                cb.bitcast::<u32>(),
+                inb.bitcast::<u32>(),
+                ib.bitcast::<u32>(),
+            );
+            let lo = cb_u.promote_lo::<u64>().shl_vec(inb_u.promote_lo::<u64>())
+                | ib_u.promote_lo::<u64>();
+            let hi = cb_u.promote_hi::<u64>().shl_vec(inb_u.promote_hi::<u64>())
+                | ib_u.promote_hi::<u64>();
+            lo.store(&mut bufs.iac_bits[base..]);
+            hi.store(&mut bufs.iac_bits[base + step / 2..]);
+
+            let (ic_u, cc_u) = (ic.bitcast::<u32>(), cc.bitcast::<u32>());
+            let bits64 = (cc_u & mask7) | (ic_u & mask7).shl::<3>();
+            let idx = (one + cc_u.shr::<3>()) | ic_u.shr::<3>().shl::<2>();
+            let offset = table
+                .table_lookup_bytes_or_zero(idx.bitcast::<u8>())
+                .bitcast::<u32>()
+                .shl::<6>();
+            (bits64 | offset).store(&mut bufs.iac_sym[base..]);
         }
-        let (ic, inb, ib) = insert_len_to_sym_and_bits_simd(d, ins_v);
-        let (cc, _, cb) = copy_len_to_sym_and_bits_simd(d, copy_v);
-        let (cb_u, inb_u, ib_u) = (
-            cb.bitcast::<u32>(),
-            inb.bitcast::<u32>(),
-            ib.bitcast::<u32>(),
-        );
-        let lo =
-            cb_u.promote_lo::<u64>().shl_vec(inb_u.promote_lo::<u64>()) | ib_u.promote_lo::<u64>();
-        let hi =
-            cb_u.promote_hi::<u64>().shl_vec(inb_u.promote_hi::<u64>()) | ib_u.promote_hi::<u64>();
-        lo.store(&mut bufs.iac_bits[base..]);
-        hi.store(&mut bufs.iac_bits[base + step / 2..]);
-
-        let (ic_u, cc_u) = (ic.bitcast::<u32>(), cc.bitcast::<u32>());
-        let bits64 = (cc_u & mask7) | (ic_u & mask7).shl::<3>();
-        let idx = (one + cc_u.shr::<3>()) | ic_u.shr::<3>().shl::<2>();
-        let offset = table
-            .table_lookup_bytes_or_zero(idx.bitcast::<u8>())
-            .bitcast::<u32>()
-            .shl::<6>();
-        (bits64 | offset).store(&mut bufs.iac_sym[base..]);
-    }
+    });
 }
 
 #[inline(always)]
@@ -728,47 +730,49 @@ pub(crate) fn match_short_dist_code(d: u32, ring: [u32; 4]) -> Option<u8> {
 
 /// Unpacks 16 interleaved `(even, odd)` `HuffmanCodeEntry::to_u32()` lanes and packs them into
 /// 4 bounded `(nbits, bits)` quadwords (`16 -> 32 -> 64` variable shifts).
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 pub(crate) fn pack_even_odd_16<D: SimdDescriptor>(
     d: D,
     even: [u32; 8],
     odd: [u32; 8],
 ) -> ([BoundedUsize<64>; 4], [u64; 4]) {
-    let d = d.maybe_downgrade_256bit();
-    let step = U32Vec::<D::Descriptor256>::LEN;
-    let mask16 = U32Vec::splat(d, 0x0000_FFFF);
-    let mask32 = U64Vec::splat(d, 0x0000_0000_FFFF_FFFF);
-    let (mut n, mut ba) = ([0u64; 4], [0u64; 4]);
-    for (h, (e_c, o_c)) in even
-        .chunks_exact(step)
-        .zip(odd.chunks_exact(step))
-        .enumerate()
-    {
-        let (h_even, h_odd) = (U32Vec::load(d, e_c), U32Vec::load(d, o_c));
-        let nbits = h_odd.shl::<16>() | (mask16 & h_even);
-        let bits = h_even.shr::<16>() | mask16.andnot(h_odd);
+    crate::constants::simd_step!(d.maybe_downgrade_256bit(), |d| {
+        let step = U32Vec::<D::Descriptor256>::LEN;
+        let mask16 = U32Vec::splat(d, 0x0000_FFFF);
+        let mask32 = U64Vec::splat(d, 0x0000_0000_FFFF_FFFF);
+        let (mut n, mut ba) = ([0u64; 4], [0u64; 4]);
+        for (h, (e_c, o_c)) in even
+            .chunks_exact(step)
+            .zip(odd.chunks_exact(step))
+            .enumerate()
+        {
+            let (h_even, h_odd) = (U32Vec::load(d, e_c), U32Vec::load(d, o_c));
+            let nbits = h_odd.shl::<16>() | (mask16 & h_even);
+            let bits = h_even.shr::<16>() | mask16.andnot(h_odd);
 
-        let nbits_lo = mask16 & nbits;
-        let nbits32 = nbits.shr::<16>() + nbits_lo;
-        let bits32 = (mask16 & bits) | bits.shr::<16>().shl_vec(nbits_lo);
+            let nbits_lo = mask16 & nbits;
+            let nbits32 = nbits.shr::<16>() + nbits_lo;
+            let bits32 = (mask16 & bits) | bits.shr::<16>().shl_vec(nbits_lo);
 
-        let (nb32_64, b32_64) = (nbits32.bitcast::<u64>(), bits32.bitcast::<u64>());
-        let nbits32_lo = mask32 & nb32_64;
-        let nbits64 = nb32_64.shr::<32>() + nbits32_lo;
-        let bits64 = (mask32 & b32_64) | b32_64.shr::<32>().shl_vec(nbits32_lo);
-        nbits64.store(&mut n[h * (step / 2)..]);
-        bits64.store(&mut ba[h * (step / 2)..]);
-    }
-    let [n0, n1, n2, n3] = n;
-    (
-        [
-            bound64_from_u63(n0 as usize),
-            bound64_from_u63(n1 as usize),
-            bound64_from_u63(n2 as usize),
-            bound64_from_u63(n3 as usize),
-        ],
-        ba,
-    )
+            let (nb32_64, b32_64) = (nbits32.bitcast::<u64>(), bits32.bitcast::<u64>());
+            let nbits32_lo = mask32 & nb32_64;
+            let nbits64 = nb32_64.shr::<32>() + nbits32_lo;
+            let bits64 = (mask32 & b32_64) | b32_64.shr::<32>().shl_vec(nbits32_lo);
+            nbits64.store(&mut n[h * (step / 2)..]);
+            bits64.store(&mut ba[h * (step / 2)..]);
+        }
+        let [n0, n1, n2, n3] = n;
+        (
+            [
+                bound64_from_u63(n0 as usize),
+                bound64_from_u63(n1 as usize),
+                bound64_from_u63(n2 as usize),
+                bound64_from_u63(n3 as usize),
+            ],
+            ba,
+        )
+    })
 }
 
 #[inline(always)]
@@ -920,79 +924,83 @@ fn emit_literals_slow(
     emit_literals_scalar(slice, lut, cur);
 }
 
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 fn emit_literals_simd_core<D: SimdDescriptor>(
     d: D,
     slice: &[u8],
     lut: &[HuffmanCodeEntry; 256],
     cur: &mut BitStreamCursor<'_, '_>,
 ) {
-    let mut local = cur.detach();
-    let rem = if slice.len() >= 16 {
-        let (chunks, rem) = slice.as_chunks::<16>();
-        let Ok(mut batch) = local.try_batch_iter::<4, _>(chunks.iter()) else {
-            drop(local);
-            emit_literals_slow(slice, lut, cur);
-            return;
-        };
-        while let Some((c16, slot)) = batch.next_slot() {
-            let (na, ba) = pack_even_odd_16(
-                d,
-                [
-                    lut[c16[0] as usize].to_u32(),
-                    lut[c16[2] as usize].to_u32(),
-                    lut[c16[4] as usize].to_u32(),
-                    lut[c16[6] as usize].to_u32(),
-                    lut[c16[8] as usize].to_u32(),
-                    lut[c16[10] as usize].to_u32(),
-                    lut[c16[12] as usize].to_u32(),
-                    lut[c16[14] as usize].to_u32(),
-                ],
-                [
-                    lut[c16[1] as usize].to_u32(),
-                    lut[c16[3] as usize].to_u32(),
-                    lut[c16[5] as usize].to_u32(),
-                    lut[c16[7] as usize].to_u32(),
-                    lut[c16[9] as usize].to_u32(),
-                    lut[c16[11] as usize].to_u32(),
-                    lut[c16[13] as usize].to_u32(),
-                    lut[c16[15] as usize].to_u32(),
-                ],
-            );
-            slot.put::<4>(na, ba);
-        }
-        rem
-    } else {
-        slice
-    };
-    if !rem.is_empty() {
-        let Some(slot) = local.try_slot::<4>() else {
-            drop(local);
-            emit_literals_slow(rem, lut, cur);
-            return;
-        };
-        let (quads, tail) = rem.as_chunks::<4>();
-        let (nt, bt) = pack_lits_1_to_4_bounded(tail, lut);
-        match quads {
-            [] => slot.put([nt], [bt]),
-            [q0] => {
-                let (n0, b0) = pack_quad_bounded(q0, lut);
-                slot.put([n0, nt], [b0, bt]);
-            }
-            [q0, q1] => {
-                let ((n0, b0), (n1, b1)) = (pack_quad_bounded(q0, lut), pack_quad_bounded(q1, lut));
-                slot.put([n0, n1, nt], [b0, b1, bt]);
-            }
-            [q0, q1, q2, ..] => {
-                let ((n0, b0), (n1, b1), (n2, b2)) = (
-                    pack_quad_bounded(q0, lut),
-                    pack_quad_bounded(q1, lut),
-                    pack_quad_bounded(q2, lut),
+    crate::constants::simd_step!(d, |d| {
+        let mut local = cur.detach();
+        let rem = if slice.len() >= 16 {
+            let (chunks, rem) = slice.as_chunks::<16>();
+            let Ok(mut batch) = local.try_batch_iter::<4, _>(chunks.iter()) else {
+                drop(local);
+                emit_literals_slow(slice, lut, cur);
+                return;
+            };
+            while let Some((c16, slot)) = batch.next_slot() {
+                let (na, ba) = pack_even_odd_16(
+                    d,
+                    [
+                        lut[c16[0] as usize].to_u32(),
+                        lut[c16[2] as usize].to_u32(),
+                        lut[c16[4] as usize].to_u32(),
+                        lut[c16[6] as usize].to_u32(),
+                        lut[c16[8] as usize].to_u32(),
+                        lut[c16[10] as usize].to_u32(),
+                        lut[c16[12] as usize].to_u32(),
+                        lut[c16[14] as usize].to_u32(),
+                    ],
+                    [
+                        lut[c16[1] as usize].to_u32(),
+                        lut[c16[3] as usize].to_u32(),
+                        lut[c16[5] as usize].to_u32(),
+                        lut[c16[7] as usize].to_u32(),
+                        lut[c16[9] as usize].to_u32(),
+                        lut[c16[11] as usize].to_u32(),
+                        lut[c16[13] as usize].to_u32(),
+                        lut[c16[15] as usize].to_u32(),
+                    ],
                 );
-                slot.put([n0, n1, n2, nt], [b0, b1, b2, bt]);
+                slot.put::<4>(na, ba);
+            }
+            rem
+        } else {
+            slice
+        };
+        if !rem.is_empty() {
+            let Some(slot) = local.try_slot::<4>() else {
+                drop(local);
+                emit_literals_slow(rem, lut, cur);
+                return;
+            };
+            let (quads, tail) = rem.as_chunks::<4>();
+            let (nt, bt) = pack_lits_1_to_4_bounded(tail, lut);
+            match quads {
+                [] => slot.put([nt], [bt]),
+                [q0] => {
+                    let (n0, b0) = pack_quad_bounded(q0, lut);
+                    slot.put([n0, nt], [b0, bt]);
+                }
+                [q0, q1] => {
+                    let ((n0, b0), (n1, b1)) =
+                        (pack_quad_bounded(q0, lut), pack_quad_bounded(q1, lut));
+                    slot.put([n0, n1, nt], [b0, b1, bt]);
+                }
+                [q0, q1, q2, ..] => {
+                    let ((n0, b0), (n1, b1), (n2, b2)) = (
+                        pack_quad_bounded(q0, lut),
+                        pack_quad_bounded(q1, lut),
+                        pack_quad_bounded(q2, lut),
+                    );
+                    slot.put([n0, n1, n2, nt], [b0, b1, b2, bt]);
+                }
             }
         }
-    }
+    });
 }
 
 #[inline(always)]
@@ -1037,7 +1045,8 @@ pub(crate) fn emit_cmd_no_lits(
     }
 }
 
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_cmd_and_lits<const DETACH: bool, const N: usize, D: SimdDescriptor>(
     d: D,

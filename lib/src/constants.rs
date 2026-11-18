@@ -19,6 +19,35 @@ pub(crate) fn call_emu<R>(f: impl FnOnce(jxl_simd::Emu128Descriptor) -> R) -> R 
     f(jxl_simd::Emu128Descriptor::new().unwrap())
 }
 
+/// Evaluates `body` with `d` in release builds, or inside an outlined `d.call(...)` boundary in
+/// debug builds so `-O0` vector temporaries never accumulate across the caller's stack frame.
+#[cfg(not(debug_assertions))]
+#[allow(unused_macros)]
+macro_rules! simd_step {
+    ($d:expr, |$d_inner:ident| $body:expr) => {{
+        #[allow(clippy::redundant_locals)]
+        let $d_inner = $d;
+        $body
+    }};
+}
+
+/// Evaluates `body` with `d` in release builds, or inside an outlined `d.call(...)` boundary in
+/// debug builds so `-O0` vector temporaries never accumulate across the caller's stack frame.
+#[cfg(debug_assertions)]
+#[allow(unused_macros)]
+macro_rules! simd_step {
+    ($d:expr, |$d_inner:ident| $body:expr) => {
+        jxl_simd::SimdDescriptor::call(
+            $d,
+            #[inline(always)]
+            |$d_inner| $body,
+        )
+    };
+}
+
+#[allow(unused_imports)]
+pub(crate) use simd_step;
+
 /// Evaluates `body` with the widest hardware SIMD descriptor of at most 256 bits (`AvxDescriptor`
 /// or `Sse42Descriptor` on `x86_64`, `NeonDescriptor` on `aarch64`, `Simd128Descriptor` on
 /// `wasm32`) when `use_simd` is true, falling back to [`jxl_simd::Emu128Descriptor`].

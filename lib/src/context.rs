@@ -16,9 +16,12 @@
 
 use crate::constants::{with_simd, MAX_LIT};
 use crate::metablock::ContextMode;
+use hugepage_buffer::HugePageBuf;
 use jxl_simd::{I32Vec, SimdDescriptor, U32Vec};
+use zerocopy::FromZeroes;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, FromZeroes)]
+#[repr(C)]
 pub(crate) struct LiteralHistogram {
     pub(crate) data: [u32; MAX_LIT],
     pub(crate) total: u32,
@@ -496,10 +499,41 @@ pub(crate) const ALL_CONTEXT_MODES: [ContextMode; 4] = [
     ContextMode::LSB6,
 ];
 
+/// Reusable heap-backed scratch (`48 KiB`) for conditional-entropy `ContextMode` ranking,
+/// avoiding large stack frames on 64 KiB fibers.
+pub(crate) struct CtxRankScratch {
+    counts: HugePageBuf<u16>,
+    dirty: HugePageBuf<u16>,
+}
+
+impl CtxRankScratch {
+    pub(crate) const fn new() -> Self {
+        Self {
+            counts: HugePageBuf::new(),
+            dirty: HugePageBuf::new(),
+        }
+    }
+
+    fn buffers(&mut self) -> (&mut [u16; 64 * MAX_LIT], &mut [u16; 8 * 1024]) {
+        let c = self
+            .counts
+            .resize_or_grow_zeroed(64 * MAX_LIT)
+            .first_chunk_mut::<{ 64 * MAX_LIT }>()
+            .unwrap();
+        let d = self
+            .dirty
+            .resize_or_grow_zeroed(8 * 1024)
+            .first_chunk_mut::<{ 8 * 1024 }>()
+            .unwrap();
+        (c, d)
+    }
+}
+
 /// Scores each `ContextMode` in `modes` (`<= 4`) by empirical conditional entropy (+ `1.5` bits MDL
 /// penalty per populated `(ctx, byte)` bin) across up to `MAX_RANGES` (`<= 8`) 1 KiB windows,
-/// returning `(mode, bits_fp16)` sorted ascending.
-pub(crate) fn rank_sampled_ctx_modes<const MAX_RANGES: usize>(
+/// returning `(mode, bits_fp16)` sorted ascending, using caller-provided heap scratch.
+pub(crate) fn rank_sampled_ctx_modes_with<const MAX_RANGES: usize>(
+    scratch: &mut CtxRankScratch,
     modes: &[ContextMode],
     data: &[u8],
     total_len: usize,
@@ -525,8 +559,7 @@ pub(crate) fn rank_sampled_ctx_modes<const MAX_RANGES: usize>(
         MAX_RANGES
     };
 
-    let mut counts = [0u16; 64 * MAX_LIT];
-    let mut dirty = [0u16; 8 * 1024];
+    let (counts, dirty) = scratch.buffers();
     let mut out = [(ContextMode::UTF8, u64::MAX); 4];
     for (slot_out, &mode) in out.iter_mut().zip(modes.iter()) {
         let mut ctx_totals = [0u32; 64];
@@ -565,12 +598,32 @@ pub(crate) fn rank_sampled_ctx_modes<const MAX_RANGES: usize>(
     out
 }
 
-pub(crate) fn choose_context_mode_modes(data: &[u8], modes: &[ContextMode]) -> ContextMode {
+#[cfg(test)]
+pub(crate) fn rank_sampled_ctx_modes<const MAX_RANGES: usize>(
+    modes: &[ContextMode],
+    data: &[u8],
+    total_len: usize,
+    pos_at: impl Fn(usize) -> usize,
+) -> [(ContextMode, u64); 4] {
+    let mut scratch = CtxRankScratch::new();
+    rank_sampled_ctx_modes_with::<MAX_RANGES>(&mut scratch, modes, data, total_len, pos_at)
+}
+
+pub(crate) fn choose_context_mode_modes_with(
+    scratch: &mut CtxRankScratch,
+    data: &[u8],
+    modes: &[ContextMode],
+) -> ContextMode {
     if data.len() < 64 {
         ContextMode::UTF8
     } else {
-        rank_sampled_ctx_modes::<4>(modes, data, data.len(), |pos| pos)[0].0
+        rank_sampled_ctx_modes_with::<4>(scratch, modes, data, data.len(), |pos| pos)[0].0
     }
+}
+
+pub(crate) fn choose_context_mode_modes(data: &[u8], modes: &[ContextMode]) -> ContextMode {
+    let mut scratch = CtxRankScratch::new();
+    choose_context_mode_modes_with(&mut scratch, data, modes)
 }
 
 #[cfg(test)]

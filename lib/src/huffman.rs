@@ -185,14 +185,34 @@ fn merge_and_assign<const K_CAP: usize, const TWO_CAP: usize>(
         internal_weight[int_tail] = w1 + w2;
     }
 
-    // Compute exact node depths in a single backward pass (root is `2 * k - 2` at depth 0).
-    let mut depth = [0u16; TWO_CAP];
+    // Compute exact node depths in-place in `parent` (root `2 * k - 2` has depth 0, and
+    // `parent[node] > node` strictly for every `node < 2 * k - 2`).
+    parent[2 * k - 2] = 0;
     for node in (0..(2 * k - 2)).rev() {
-        depth[node] = depth[parent[node] as usize] + 1;
+        parent[node] = parent[parent[node] as usize] + 1;
     }
 
-    let len_counts = assign_kraft_limited_depths(&depth[..k], raw, max_len, b);
+    let len_counts = assign_kraft_limited_depths(&parent[..k], raw, max_len, b);
     assign_canonical_bits(b, &len_counts, nz_syms);
+}
+
+#[inline(never)]
+fn build_from_counts_704(
+    counts: &[u32],
+    max_len: usize,
+    b: &mut [HuffmanCodeEntry],
+) -> Option<u16> {
+    build_from_counts::<704>(counts, max_len, b)
+}
+
+#[cold]
+#[inline(never)]
+fn build_from_counts_max(
+    counts: &[u32],
+    max_len: usize,
+    b: &mut [HuffmanCodeEntry],
+) -> Option<u16> {
+    build_from_counts::<MAX_HUFFMAN_ALPHABET>(counts, max_len, b)
 }
 
 fn build_from_counts<const RAW_CAP: usize>(
@@ -263,9 +283,9 @@ impl<'a> HuffmanCode<'a> {
         } else if n <= 272 {
             build_from_counts::<272>(counts, max_len, b)
         } else if n <= 704 {
-            build_from_counts::<704>(counts, max_len, b)
+            build_from_counts_704(counts, max_len, b)
         } else {
-            build_from_counts::<MAX_HUFFMAN_ALPHABET>(counts, max_len, b)
+            build_from_counts_max(counts, max_len, b)
         };
         (remainder, HuffmanCode { code: b, singleton })
     }

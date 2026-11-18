@@ -14,8 +14,10 @@
 
 //! Unified RFC 7932 built-in static dictionary (`kBrotliDictionary` + all 121 transforms).
 
+use hugepage_buffer::HugePageBuf;
 use jxl_simd::SimdDescriptor;
 use std::sync::OnceLock;
+use zerocopy::FromZeroes;
 
 const RFC7932_DICT: &[u8; 122_784] = include_bytes!("rfc7932_dict.bin");
 
@@ -576,7 +578,7 @@ fn apply_upper_rfc7932(dst: &mut [u8], word: &[u8], upper_all: bool) {
 pub(crate) const FAST_DICT_LOG2: usize = 11;
 pub(crate) const FAST_DICT_SLOTS: usize = 1 << FAST_DICT_LOG2;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, FromZeroes)]
 #[repr(C)]
 struct FastDictCold {
     w_tail: u64,
@@ -585,6 +587,7 @@ struct FastDictCold {
     base_len: u16,
 }
 
+#[derive(Clone, Copy, FromZeroes)]
 #[repr(C, align(64))]
 pub(crate) struct FastDictTable {
     head: [u64; FAST_DICT_SLOTS],
@@ -613,18 +616,12 @@ fn expand_transform_rfc7932(out: &mut [u8; 64], bl: usize, wi: usize, tid: usize
 }
 
 pub(crate) fn fast_dict() -> &'static FastDictTable {
-    static FAST: OnceLock<Box<FastDictTable>> = OnceLock::new();
-    FAST.get_or_init(|| {
-        let mut table = Box::new(FastDictTable {
-            head: [0x00FF_FFFF_FFFF_FFFF; FAST_DICT_SLOTS],
-            cold: [FastDictCold {
-                w_tail: 0,
-                dict_idx: 0,
-                gain_base_q5: 0,
-                base_len: 0,
-            }; FAST_DICT_SLOTS],
-        });
-        let mut best_scores = [0u64; FAST_DICT_SLOTS];
+    static FAST: OnceLock<HugePageBuf<FastDictTable>> = OnceLock::new();
+    &FAST.get_or_init(|| {
+        let mut table_buf = HugePageBuf::<FastDictTable>::new_zeroed(1);
+        let table = &mut table_buf[0];
+        table.head.fill(0x00FF_FFFF_FFFF_FFFF);
+        let mut best_scores = vec![0u64; FAST_DICT_SLOTS];
         let mut buf = [0u8; 64];
 
         for (tid, &(pid, op, sid)) in RAW_TRANSFORMS.iter().enumerate() {
@@ -692,8 +689,8 @@ pub(crate) fn fast_dict() -> &'static FastDictTable {
                 }
             }
         }
-        table
-    })
+        table_buf
+    })[0]
 }
 
 #[inline(always)]
