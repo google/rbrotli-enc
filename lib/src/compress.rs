@@ -118,20 +118,46 @@ impl CtxHists {
 }
 
 struct HistogramBuffers {
-    iac_hist: [u32; IAC_HIST_BUF_SIZE],
-    dist_hist: [u32; DIST_HIST_BUF_SIZE],
-    lit_hist: LiteralHistogram,
+    iac_hist: HugePageBuf<u32>,
+    dist_hist: HugePageBuf<u32>,
+    lit_hist: HugePageBuf<LiteralHistogram>,
     ctx_hists: Option<Box<CtxHists>>,
+    ctx_rank: context::CtxRankScratch,
+    dist_samples: Vec<(u8, u32)>,
 }
 
 impl HistogramBuffers {
     fn new() -> Self {
         Self {
-            iac_hist: [0; IAC_HIST_BUF_SIZE],
-            dist_hist: [0; DIST_HIST_BUF_SIZE],
-            lit_hist: LiteralHistogram::default(),
+            iac_hist: HugePageBuf::new(),
+            dist_hist: HugePageBuf::new(),
+            lit_hist: HugePageBuf::new(),
             ctx_hists: None,
+            ctx_rank: context::CtxRankScratch::new(),
+            dist_samples: Vec::new(),
         }
+    }
+
+    #[inline(always)]
+    fn ensure_hists(
+        &mut self,
+    ) -> (
+        &mut [u32; IAC_HIST_BUF_SIZE],
+        &mut [u32; DIST_HIST_BUF_SIZE],
+        &mut LiteralHistogram,
+    ) {
+        let iac = self
+            .iac_hist
+            .resize_or_grow_zeroed(IAC_HIST_BUF_SIZE)
+            .first_chunk_mut::<IAC_HIST_BUF_SIZE>()
+            .unwrap();
+        let dist = self
+            .dist_hist
+            .resize_or_grow_zeroed(DIST_HIST_BUF_SIZE)
+            .first_chunk_mut::<DIST_HIST_BUF_SIZE>()
+            .unwrap();
+        let lit = &mut self.lit_hist.resize_or_grow_zeroed(1)[0];
+        (iac, dist, lit)
     }
 
     #[inline(always)]
@@ -223,7 +249,7 @@ fn refresh_cost_model<C: MatchConfig>(
         cost_model.update_scalars_from_lit_mult::<C>(lm, eff_wsize);
     } else if C::COST_MODEL_LEVEL >= 2 {
         if reset_cmd_priors {
-            if let Some(stats) = cost_model.cmd_stats.as_deref_mut() {
+            if let Some(stats) = cost_model.cmd_stats.first_mut() {
                 stats.reset_priors();
             }
         }
@@ -254,9 +280,13 @@ fn jsd_bit_gain(a: &LiteralHistogram, b: &LiteralHistogram) -> u64 {
 }
 
 #[inline]
-fn choose_ctx_mode_for<C: MatchConfig>(data: &[u8]) -> ContextMode {
+fn choose_ctx_mode_for<C: MatchConfig>(
+    scratch: &mut context::CtxRankScratch,
+    data: &[u8],
+) -> ContextMode {
     if C::MULTI_CONTEXT {
-        context::choose_context_mode_modes(
+        context::choose_context_mode_modes_with(
+            scratch,
             &data[..data.len().min(SLICE_SIZE)],
             &[ContextMode::UTF8, ContextMode::Signed],
         )
@@ -671,15 +701,14 @@ impl MetablockData {
         out.total = (b_emitted.len() + b_tail.len()) as u32;
     }
 
-    fn select_distance_params(&self, cfg: FlushCfg) -> (u8, u8) {
+    fn select_distance_params(&self, cfg: FlushCfg, samples: &mut Vec<(u8, u32)>) -> (u8, u8) {
+        samples.clear();
         if !cfg.auto_dist_params || self.total_icd < 128 {
             return (0, 0);
         }
         const MAX_SAMPLE: usize = 1024;
         let mut ring = self.dist_ring;
-        let mut samples = [(0u8, 0u32); MAX_SAMPLE];
-        let (mut n_sample, mut raw_seen, mut raw_mask, mut max_raw_d) =
-            (0usize, 0usize, 0usize, 0u32);
+        let (mut raw_seen, mut raw_mask, mut max_raw_d) = (0usize, 0usize, 0u32);
 
         for idx in 0..(self.total_icd as usize) {
             let raw = self.distance[idx];
@@ -691,27 +720,21 @@ impl MetablockData {
             };
             if is_raw {
                 max_raw_d = max_raw_d.max(d);
-                if n_sample == MAX_SAMPLE && (raw_seen & raw_mask) == 0 {
+                if samples.len() == MAX_SAMPLE && (raw_seen & raw_mask) == 0 {
                     for k in 0..(MAX_SAMPLE / 2) {
                         samples[k] = samples[2 * k];
                     }
-                    n_sample = MAX_SAMPLE / 2;
+                    samples.truncate(MAX_SAMPLE / 2);
                     raw_mask = (raw_mask << 1) | 1;
                 }
                 if (raw_seen & raw_mask) == 0 {
-                    samples[n_sample] = (u8::from(cfg.two_dist_ctx && self.copy_len[idx] > 4), d);
-                    n_sample += 1;
+                    samples.push((u8::from(cfg.two_dist_ctx && self.copy_len[idx] > 4), d));
                 }
                 raw_seen += 1;
             }
         }
 
-        select_distance_params_from_samples(
-            &samples[..n_sample],
-            raw_seen,
-            max_raw_d,
-            cfg.large_window,
-        )
+        select_distance_params_from_samples(samples, raw_seen, max_raw_d, cfg.large_window)
     }
 
     #[inline(always)]
@@ -803,7 +826,8 @@ impl MetablockData {
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    #[cfg_attr(debug_assertions, inline(never))]
     fn commit_icd_batch<const TWO_DIST_CTX: bool>(
         base_i: usize,
         limit: usize,
@@ -1454,8 +1478,8 @@ impl MetablockData {
             } else {
                 (256 + (w_len / 12)) as i32
             };
-            let mut wins = [LiteralHistogram::default(); 8];
-            for (w, wh) in wins.iter_mut().enumerate().take(n_win) {
+            let mut wins = HugePageBuf::<LiteralHistogram>::new_zeroed(n_win);
+            for (w, wh) in wins.iter_mut().enumerate() {
                 let (s, e) = (w * w_len, if w + 1 == n_win { tl } else { (w + 1) * w_len });
                 count_literals_x4(&self.literals[s..e], &mut wh.data);
                 wh.total = (e - s) as u32;
@@ -1599,9 +1623,8 @@ impl MetablockData {
             return None;
         }
         if cfg.max_lit_clusters <= 6 {
-            let single_bits =
-                context::slice_entropy_fp16(&histo_buf.lit_hist.data, histo_buf.lit_hist.total)
-                    >> 16;
+            let lit_hist = &histo_buf.lit_hist[0];
+            let single_bits = context::slice_entropy_fp16(&lit_hist.data, lit_hist.total) >> 16;
             let multi_bits: u64 = cl_flat
                 .as_chunks::<MAX_LIT>()
                 .0
@@ -1626,12 +1649,11 @@ impl MetablockData {
         cmap: &[u8; 64],
         bw: &mut BitWriter,
     ) -> u64 {
-        let HistogramBuffers {
-            ref iac_hist,
-            ref mut dist_hist,
-            ref mut lit_hist,
-            ..
-        } = *histo_buf;
+        let (iac_hist, dist_hist, lit_hist) = (
+            &histo_buf.iac_hist[..IAC_HIST_BUF_SIZE],
+            &mut histo_buf.dist_hist[..DIST_HIST_BUF_SIZE],
+            &mut histo_buf.lit_hist[0],
+        );
         let dist_alpha = dist_alphabet_size(npostfix, ndirect, cfg.large_window);
         let (iac_dist_buf, mut lit_buf) = self.histogram_buf.split_at_mut(LIT_BASE);
         let (iac_slot, dist_area) = iac_dist_buf.split_at_mut(DIST_BASE);
@@ -1733,21 +1755,25 @@ impl MetablockData {
     ) -> bool {
         self.add_remaining_literals(cfg.multi_context, full_data, anchor, mb_end);
         let block_data = &full_data[mb_start..mb_end];
-        if let Some(pre) = precomputed_lit_hist {
-            histo_buf.lit_hist = *pre;
-        } else {
-            count_literals_x4(
-                &self.literals[..self.total_literals as usize],
-                &mut histo_buf.lit_hist.data,
-            );
-            histo_buf.lit_hist.total = self.total_literals;
-        }
-        if should_emit_uncompressed(
-            block_data.len(),
-            self.total_icd,
-            self.total_literals,
-            &histo_buf.lit_hist.data,
-        ) {
+        let should_uncomp = {
+            let (_, _, lit_hist) = histo_buf.ensure_hists();
+            if let Some(pre) = precomputed_lit_hist {
+                *lit_hist = *pre;
+            } else {
+                count_literals_x4(
+                    &self.literals[..self.total_literals as usize],
+                    &mut lit_hist.data,
+                );
+                lit_hist.total = self.total_literals;
+            }
+            should_emit_uncompressed(
+                block_data.len(),
+                self.total_icd,
+                self.total_literals,
+                &lit_hist.data,
+            )
+        };
+        if should_uncomp {
             self.total_icd = 0;
             write_uncompressed_metablock(block_data, bw);
             return true;
@@ -1762,47 +1788,49 @@ impl MetablockData {
         let (use_multi_ctx, cmap) = multi_ctx
             .as_ref()
             .map_or((false, [0u8; 64]), |(_, _, m)| (true, *m));
-        let (npostfix, ndirect) = self.select_distance_params(cfg);
+        let (npostfix, ndirect) = self.select_distance_params(cfg, &mut histo_buf.dist_samples);
         let dist_alpha = dist_alphabet_size(npostfix, ndirect, cfg.large_window);
-        histo_buf.iac_hist.fill(0);
-        histo_buf.dist_hist[..dist_alpha].fill(0);
-        if cfg.two_dist_ctx {
-            histo_buf.dist_hist[MAX_HUFFMAN_ALPHABET..][..dist_alpha].fill(0);
-        }
         assert!(self.total_icd as usize + 8 <= self.insert_len.len());
-
-        match simd_tok {
-            #[cfg(target_arch = "x86_64")]
-            Some(tok) => with_const_bool!(cfg.two_dist_ctx, |TD| {
-                self.encode_symbols_avx2::<TD>(
-                    npostfix,
-                    ndirect,
-                    trailing_literals,
-                    &mut histo_buf.iac_hist,
-                    &mut histo_buf.dist_hist,
-                    tok,
-                )
-            }),
-            #[cfg(target_arch = "aarch64")]
-            Some(tok) => with_const_bool!(cfg.two_dist_ctx, |TD| {
-                self.encode_symbols_neon::<TD>(
-                    npostfix,
-                    ndirect,
-                    trailing_literals,
-                    &mut histo_buf.iac_hist,
-                    &mut histo_buf.dist_hist,
-                    tok,
-                )
-            }),
-            _ => with_const_bool!(cfg.two_dist_ctx, |TD| {
-                self.hist_icd_portable::<TD>(
-                    npostfix,
-                    ndirect,
-                    trailing_literals,
-                    &mut histo_buf.iac_hist,
-                    &mut histo_buf.dist_hist,
-                )
-            }),
+        {
+            let (iac_hist, dist_hist, _) = histo_buf.ensure_hists();
+            iac_hist.fill(0);
+            dist_hist[..dist_alpha].fill(0);
+            if cfg.two_dist_ctx {
+                dist_hist[MAX_HUFFMAN_ALPHABET..][..dist_alpha].fill(0);
+            }
+            match simd_tok {
+                #[cfg(target_arch = "x86_64")]
+                Some(tok) => with_const_bool!(cfg.two_dist_ctx, |TD| {
+                    self.encode_symbols_avx2::<TD>(
+                        npostfix,
+                        ndirect,
+                        trailing_literals,
+                        iac_hist,
+                        dist_hist,
+                        tok,
+                    )
+                }),
+                #[cfg(target_arch = "aarch64")]
+                Some(tok) => with_const_bool!(cfg.two_dist_ctx, |TD| {
+                    self.encode_symbols_neon::<TD>(
+                        npostfix,
+                        ndirect,
+                        trailing_literals,
+                        iac_hist,
+                        dist_hist,
+                        tok,
+                    )
+                }),
+                _ => with_const_bool!(cfg.two_dist_ctx, |TD| {
+                    self.hist_icd_portable::<TD>(
+                        npostfix,
+                        ndirect,
+                        trailing_literals,
+                        iac_hist,
+                        dist_hist,
+                    )
+                }),
+            }
         }
         let payload_bits = self.build_codes_and_write_header(
             cfg,
@@ -1896,8 +1924,7 @@ struct EncoderInternal<C: MatchConfig> {
     md: MetablockData,
     hb: HistogramBuffers,
     cost_model: SliceCostModel,
-    mb_lit_hist: LiteralHistogram,
-    slice_lit_hist: LiteralHistogram,
+    lit_hists: HugePageBuf<LiteralHistogram>,
     qcfg: QualityCfg,
     wbits: usize,
     large_window: bool,
@@ -1915,8 +1942,7 @@ impl<C: MatchConfig> EncoderInternal<C> {
             md: MetablockData::new(),
             hb: HistogramBuffers::new(),
             cost_model: SliceCostModel::new_for_config::<C>(),
-            mb_lit_hist: LiteralHistogram::default(),
-            slice_lit_hist: LiteralHistogram::default(),
+            lit_hists: HugePageBuf::new_zeroed(2),
             qcfg,
             wbits,
             large_window,
@@ -1990,8 +2016,7 @@ impl<C: MatchConfig> EncoderInternal<C> {
             accum_ctx_lits(hb_ctx, &ctx_buf[..chunk], &data[tail..tail + chunk]);
             tail += chunk;
         }
-        let marg = marg_override
-            .unwrap_or([&self.mb_lit_hist, &self.slice_lit_hist][usize::from(use_slice_hist)]);
+        let marg = marg_override.unwrap_or(&self.lit_hists[usize::from(use_slice_hist)]);
         self.cost_model
             .update_ctx_lit_table(hb_ctx, &marg.data, marg.total);
     }
@@ -2061,23 +2086,22 @@ impl<C: MatchConfig> EncoderInternal<C> {
             }
         };
         let eff_wsize = effective_window_size(wsize, in_buf.len(), full_dict_len);
-        let init_mode = choose_ctx_mode_for::<C>(in_buf);
+        let init_mode = choose_ctx_mode_for::<C>(&mut self.hb.ctx_rank, in_buf);
         self.cost_model.ctx_mode = init_mode;
         self.md.reset(init_mode, true);
         let sample = &in_buf[..in_buf.len().min(2048)];
-        let mut h = LiteralHistogram {
-            data: [0; MAX_LIT],
-            total: sample.len() as u32,
-        };
+        let h = &mut self.lit_hists[1];
+        h.data.fill(0);
+        h.total = sample.len() as u32;
         count_literals_x4(sample, &mut h.data);
         refresh_cost_model::<C>(
             &mut self.cost_model,
             (&[], &[], &[]),
             (eff_wsize, true),
-            (&h, &h),
+            (&self.lit_hists[1], &self.lit_hists[1]),
         );
         if C::MULTI_CONTEXT && C::COST_MODEL_LEVEL >= 3 {
-            self.apply_ctx_cost_update(true, sample, (0, 0, 0, sample.len()), Some(&h), false);
+            self.apply_ctx_cost_update(true, sample, (0, 0, 0, sample.len()), None, true);
         }
     }
 
@@ -2098,7 +2122,7 @@ impl<C: MatchConfig> EncoderInternal<C> {
             &mut self.hb,
             data,
             (st.parse.anchor, st.mb_start, flush_end),
-            (use_mb_hists.then_some(&self.mb_lit_hist), st.ctx_cursor),
+            (use_mb_hists.then_some(&self.lit_hists[0]), st.ctx_cursor),
             use_simd,
         );
         st.parse.last_distances = self.md.dist_ring;
@@ -2121,7 +2145,8 @@ impl<C: MatchConfig> EncoderInternal<C> {
                 self.flush_open_mb(st, data, flush_end, true, bw, use_simd);
             }
             if st.need_ctx_mode {
-                let next_mode = choose_ctx_mode_for::<C>(&data[st.parse.pos..]);
+                let next_mode =
+                    choose_ctx_mode_for::<C>(&mut self.hb.ctx_rank, &data[st.parse.pos..]);
                 self.cost_model.ctx_mode = next_mode;
                 self.md.reset(next_mode, false);
                 st.parse.last_distances = self.md.dist_ring;
@@ -2145,14 +2170,14 @@ impl<C: MatchConfig> EncoderInternal<C> {
         (at_eof, reset_priors, uncomp): (bool, bool, bool),
         cmd_range: std::ops::Range<usize>,
     ) {
-        std::mem::swap(&mut self.mb_lit_hist, &mut self.slice_lit_hist);
+        self.lit_hists.swap(0, 1);
         st.mb_has_slice = true;
         if !at_eof {
             refresh_cost_model::<C>(
                 &mut self.cost_model,
                 self.md.cmd_slices(cmd_range),
                 (eff_wsize, reset_priors),
-                (&self.mb_lit_hist, &self.mb_lit_hist),
+                (&self.lit_hists[0], &self.lit_hists[0]),
             );
             self.sync_ctx_cost_table(st, data, None, s_end, uncomp);
         }
@@ -2182,14 +2207,14 @@ impl<C: MatchConfig> EncoderInternal<C> {
         let (new_tl, new_icd) = (self.md.total_literals as usize, self.md.total_icd as usize);
         let (s_len, slice_cmds) = (s_end - s_start, new_icd - snap.saved_icd);
         self.md
-            .slice_lit_hist(data, snap, s_end, st.parse.anchor, &mut self.slice_lit_hist);
+            .slice_lit_hist(data, snap, s_end, st.parse.anchor, &mut self.lit_hists[1]);
         let at_eof = mode == StreamOp::Finish && s_end >= data.len();
         let slice_uncomp = s_len >= 1024
             && should_emit_uncompressed(
                 s_len,
                 slice_cmds as u32,
-                self.slice_lit_hist.total,
-                &self.slice_lit_hist.data,
+                self.lit_hists[1].total,
+                &self.lit_hists[1].data,
             );
 
         if !st.mb_has_slice {
@@ -2208,12 +2233,12 @@ impl<C: MatchConfig> EncoderInternal<C> {
         let mb_uncomp = should_emit_uncompressed(
             s_start - st.mb_start,
             snap.saved_icd as u32,
-            self.mb_lit_hist.total,
-            &self.mb_lit_hist.data,
+            self.lit_hists[0].total,
+            &self.lit_hists[0].data,
         );
         let regime_flip = s_len >= 1024 && (mb_uncomp != slice_uncomp);
         let jsd_gain = if !mb_uncomp && !slice_uncomp && s_len >= 8192 {
-            jsd_bit_gain(&self.mb_lit_hist, &self.slice_lit_hist)
+            jsd_bit_gain(&self.lit_hists[0], &self.lit_hists[1])
         } else {
             0
         };
@@ -2238,12 +2263,12 @@ impl<C: MatchConfig> EncoderInternal<C> {
                 &mut self.hb,
                 data,
                 (snap.saved_anchor, st.mb_start, s_start),
-                (Some(&self.mb_lit_hist), st.ctx_cursor),
+                (Some(&self.lit_hists[0]), st.ctx_cursor),
                 use_simd,
             );
 
             let new_mode = if self.qcfg.ctx_block_split || slice_cmds == 0 {
-                choose_ctx_mode_for::<C>(&data[s_start..s_end])
+                choose_ctx_mode_for::<C>(&mut self.hb.ctx_rank, &data[s_start..s_end])
             } else {
                 old_mode
             };
@@ -2270,14 +2295,14 @@ impl<C: MatchConfig> EncoderInternal<C> {
                 0..slice_cmds,
             );
         } else {
-            self.mb_lit_hist.merge_from(&self.slice_lit_hist);
+            let [mb_h, slice_h] = self.lit_hists.first_chunk_mut::<2>().unwrap();
+            mb_h.merge_from(slice_h);
             if !at_eof {
                 let local_regime = self.qcfg.ctx_block_split
-                    && self.slice_lit_hist.total >= 2048
+                    && self.lit_hists[1].total >= 2048
                     && jsd_gain > split_cost_bits;
-                let hists = [&self.mb_lit_hist, &self.slice_lit_hist];
-                let lv1_src = hists[usize::from(self.slice_lit_hist.total >= 256)];
-                let active_lit = hists[usize::from(local_regime)];
+                let lv1_src = &self.lit_hists[usize::from(self.lit_hists[1].total >= 256)];
+                let active_lit = &self.lit_hists[usize::from(local_regime)];
                 refresh_cost_model::<C>(
                     &mut self.cost_model,
                     self.md.cmd_slices(snap.saved_icd..new_icd),
@@ -2402,6 +2427,7 @@ const fn max_two_pass_output_size(input_len: usize) -> usize {
 type OptDict<'a> = Option<&'a PreparedDictionary>;
 
 trait EncoderImpl: Send + Sync {
+    fn set_wbits(&mut self, wbits: usize);
     fn checked_max_output_size(&self, input_len: usize) -> Option<usize>;
     fn compress_into(&mut self, data: &[u8], dict: OptDict<'_>, bw: &mut BitWriter<'_>);
 }
@@ -2421,6 +2447,11 @@ fn select_tier<T: Copy>(
 }
 
 impl EncoderImpl for (OnePassEncoder, [(u8, u8); 3]) {
+    fn set_wbits(&mut self, wbits: usize) {
+        self.0.set_wbits(wbits);
+        self.1 = q0_tiers(wbits > STD_MAX_WBITS);
+    }
+
     fn checked_max_output_size(&self, input_len: usize) -> Option<usize> {
         fast_twopass_checked_max_output_size_for(input_len, ONEPASS_CHUNK_SIZE)
     }
@@ -2433,6 +2464,10 @@ impl EncoderImpl for (OnePassEncoder, [(u8, u8); 3]) {
 }
 
 impl EncoderImpl for (FastTwoPassEncoder, [(u8, u8, u8); 3]) {
+    fn set_wbits(&mut self, wbits: usize) {
+        self.0.set_wbits(wbits);
+    }
+
     fn checked_max_output_size(&self, input_len: usize) -> Option<usize> {
         fast_twopass_checked_max_output_size_for(input_len, FAST_TWOPASS_CHUNK_SIZE)
     }
@@ -2446,6 +2481,11 @@ impl EncoderImpl for (FastTwoPassEncoder, [(u8, u8, u8); 3]) {
 }
 
 impl<C: MatchConfig> EncoderImpl for EncoderInternal<C> {
+    fn set_wbits(&mut self, wbits: usize) {
+        self.wbits = wbits;
+        self.large_window = wbits > STD_MAX_WBITS;
+    }
+
     fn checked_max_output_size(&self, input_len: usize) -> Option<usize> {
         checked_max_two_pass_output_size(input_len)
     }
@@ -2476,6 +2516,10 @@ impl<C: MatchConfig> EncoderImpl for EncoderInternal<C> {
 }
 
 impl EncoderImpl for Q11Encoder {
+    fn set_wbits(&mut self, wbits: usize) {
+        Q11Encoder::set_wbits(self, wbits);
+    }
+
     fn checked_max_output_size(&self, input_len: usize) -> Option<usize> {
         input_len.checked_mul(2)?.checked_add(1024 + 64)
     }
@@ -2727,6 +2771,26 @@ impl Encoder {
         }
     }
 
+    /// Reconfigures the LZ77 sliding window (`lgwin` clamped to `10..=30`) for subsequent
+    /// [`Self::compress`] and [`Self::compress_with_dict`] calls while retaining allocated scratch
+    /// buffers and advancing hash-table virtual positions without re-zeroing across standard windows.
+    pub fn set_lgwin(&mut self, lgwin: u32) {
+        let wbits = (lgwin as usize).clamp(MIN_WBITS, LARGE_MAX_WBITS);
+        self.inner.set_wbits(wbits);
+    }
+
+    /// Shrinks or frees internal output scratch (`bwbuf`) if its capacity exceeds
+    /// `max_retained_bytes` (`0` releases the internal output buffer completely).
+    pub fn trim_scratch(&mut self, max_retained_bytes: usize) {
+        if self.bwbuf.capacity() > max_retained_bytes {
+            self.bwbuf = if max_retained_bytes == 0 {
+                Vec::new()
+            } else {
+                Vec::with_capacity(max_retained_bytes)
+            };
+        }
+    }
+
     /// Conservative upper bound on the scratch / output buffer size needed for one-shot
     /// compression of `input_len` bytes (saturating to `usize::MAX` on overflow).
     ///
@@ -2757,7 +2821,13 @@ impl Encoder {
                 Some(bw.finalize())
             }
             out_buf => {
-                if self.bwbuf.len() < max_req {
+                const BWBUF_RETAIN_FLOOR: usize = 1 << 20;
+                let retain_cap = max_req.max(BWBUF_RETAIN_FLOOR).saturating_mul(4);
+                if self.bwbuf.capacity() > retain_cap {
+                    let mut shrunk = Vec::with_capacity(max_req.max(BWBUF_RETAIN_FLOOR));
+                    shrunk.resize(max_req, MaybeUninit::uninit());
+                    self.bwbuf = shrunk;
+                } else if self.bwbuf.len() < max_req {
                     self.bwbuf.resize(max_req, MaybeUninit::uninit());
                 }
                 let mut bw = BitWriter::new_uninit(&mut self.bwbuf[..max_req]);
@@ -3480,8 +3550,10 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
             false,
         );
         md.dist_ring = INITIAL_LAST_DISTANCES;
-        let (npostfix, ndirect) =
-            md.select_distance_params(FlushCfg::from_qcfg::<ArchQ56>(QualityCfg::Q6, false));
+        let (npostfix, ndirect) = md.select_distance_params(
+            FlushCfg::from_qcfg::<ArchQ56>(QualityCfg::Q6, false),
+            &mut Vec::new(),
+        );
         assert!(npostfix == 2 && (ndirect >> npostfix) < 16);
         assert_roundtrip_matrix(&aligned_bin, &[6, 7, 8, 9], &[22, 28]);
 
@@ -4136,5 +4208,104 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
             comp_7to3.len(),
             nodict_q3.len()
         );
+    }
+    #[test]
+    fn test_set_lgwin_reuse_and_bwbuf_trim() {
+        let mut periodic = Vec::with_capacity(miri_or(1200, 4096));
+        let unit = b"UniquePrefixToken0123456789_ABCDEFGHIJKLMNOPQRSTUVWXYZ_";
+        periodic.extend_from_slice(unit);
+        periodic.resize(miri_or(1060, 2048), b'.');
+        periodic.extend_from_slice(unit);
+        periodic.resize(miri_or(1200, 4096), b'-');
+        let lgwins = miri_or(&[10u32, 24][..], &[10, 14, 18, 22, 24, 26, 12, 22][..]);
+        let qs = miri_or(&[0u32, 5][..], &[0, 1, 2, 4, 5, 6, 8, 9, 10, 11][..]);
+        for &q in qs {
+            let mut enc = Encoder::with_lgwin(q, 24);
+            for &lw in lgwins {
+                enc.set_lgwin(lw);
+                let c = enc.compress(&periodic, None).unwrap();
+                assert_eq!(decompress_brotli(c), periodic);
+            }
+            if q >= 4 {
+                enc.set_lgwin(10);
+                let small_win_len = enc.compress(&periodic, None).unwrap().len();
+                enc.set_lgwin(24);
+                let big_win_len = enc.compress(&periodic, None).unwrap().len();
+                assert!(
+                    big_win_len < small_win_len,
+                    "q={q}: expected lgwin=24 ({big_win_len}) < lgwin=10 ({small_win_len})"
+                );
+            }
+        }
+
+        if !cfg!(miri) {
+            let mut enc = Encoder::with_lgwin(5, 22);
+            let big = vec![b'S'; 6 << 20];
+            assert_eq!(decompress_brotli(enc.compress(&big, None).unwrap()), big);
+            assert!(enc.bwbuf.capacity() >= (6 << 20));
+            let small = b"small post-spike payload! ".repeat(40);
+            assert_eq!(
+                decompress_brotli(enc.compress(&small, None).unwrap()),
+                small
+            );
+            assert!(
+                enc.bwbuf.capacity() <= (4 << 20),
+                "expected auto-shrunk bwbuf, got cap={}",
+                enc.bwbuf.capacity()
+            );
+            enc.trim_scratch(0);
+            assert_eq!(enc.bwbuf.capacity(), 0);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_fiber_stack_64k_all_qualities() {
+        let stack_bytes = if cfg!(debug_assertions) {
+            128 * 1024
+        } else {
+            64 * 1024
+        };
+        let handle = std::thread::Builder::new()
+            .name("fiber_64k".into())
+            .stack_size(stack_bytes)
+            .spawn(|| {
+                let sample =
+                    build_multi_regime(14 * 1024, 28 * 1024, 42 * 1024, false, |b, lim| {
+                        while b.len() < lim {
+                            let i = b.len();
+                            b.extend_from_slice(&[
+                                (i as u8).wrapping_mul(37),
+                                ((i >> 3) as u8) ^ 0x5A,
+                                b'A' + ((i % 26) as u8),
+                                0x80 | ((i & 0x3F) as u8),
+                            ]);
+                        }
+                    });
+                let dict_raw = &sample[..512];
+                for q in 0..=12u32 {
+                    let mut enc = Encoder::with_threads(q, 22, 1);
+                    assert_eq!(
+                        decompress_brotli(enc.compress(&sample, None).unwrap()),
+                        sample
+                    );
+                    enc.set_lgwin(26);
+                    let prep = PreparedDictionary::with_lgwin(dict_raw, q, 26);
+                    assert_eq!(
+                        decompress_brotli_with_dict(
+                            enc.compress_with_dict(&sample, &prep, None).unwrap(),
+                            dict_raw
+                        ),
+                        sample
+                    );
+                }
+                for q in [0u32, 1, 5, 9, 10] {
+                    let mut sw = crate::StreamingWriter::with_threads(Vec::new(), q, 22, 1);
+                    std::io::Write::write_all(&mut sw, &sample).unwrap();
+                    assert_eq!(decompress_brotli(&sw.finish().unwrap()), sample);
+                }
+            })
+            .unwrap();
+        handle.join().unwrap();
     }
 }

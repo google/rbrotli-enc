@@ -183,6 +183,15 @@ impl Q11Encoder {
         }
     }
 
+    pub(crate) fn set_wbits(&mut self, wbits: usize) {
+        let large_window = wbits > STD_MAX_WBITS;
+        if self.effort >= 11 && !large_window {
+            crate::static_dict::warm_dict121();
+        }
+        self.wbits = wbits;
+        self.large_window = large_window;
+    }
+
     #[inline]
     pub(crate) fn max_output_size(&self, input_len: usize) -> usize {
         input_len.saturating_mul(2).saturating_add(1024 + 64)
@@ -249,33 +258,42 @@ fn classify_chunk(env: ChunkEnv<'_>, large_window: bool) -> PreChunkKind {
     }
     let (slice, span) = (env.slice(), chunk_len - 2048);
     let wins: [&[u8]; 8] = std::array::from_fn(|w| &slice[(w * span) / 7..][..2048]);
-    let (mut table4, mut hits_4b) = ([u64::MAX; 512], 0u32);
-    for win in wins {
-        for s in win.windows(4) {
-            let w4 = u32::from_le_bytes(s.try_into().unwrap());
-            let slot = &mut table4[(w4.wrapping_mul(HASH_MUL32) >> 23) as usize];
-            if std::mem::replace(slot, w4 as u64) == w4 as u64 {
-                hits_4b += 1;
-                if hits_4b > 4 {
-                    return PreChunkKind::Normal;
+    let mut scratch = hugepage_buffer::HugePageBuf::<u64>::new_zeroed(4096);
+    let mut hits_4b = 0u32;
+    {
+        let table4 = &mut scratch[..512];
+        table4.fill(u64::MAX);
+        for win in wins {
+            for s in win.windows(4) {
+                let w4 = u32::from_le_bytes(s.try_into().unwrap());
+                let slot = &mut table4[(w4.wrapping_mul(HASH_MUL32) >> 23) as usize];
+                if std::mem::replace(slot, w4 as u64) == w4 as u64 {
+                    hits_4b += 1;
+                    if hits_4b > 4 {
+                        return PreChunkKind::Normal;
+                    }
                 }
             }
         }
     }
 
-    let (mut hist, mut table2, mut hits_2b) = ([0u32; 256], [u64::MAX; 1024], 0u32);
-    for (w, win) in wins.into_iter().enumerate() {
-        for &b in win {
-            hist[b as usize] += 1;
-        }
-        for (p, s) in win.windows(2).enumerate() {
-            let w2 = u16::from_le_bytes([s[0], s[1]]) as u64;
-            let cur_pos = (w * 8192 + p) as u64;
-            let slot = &mut table2[((w2.wrapping_mul(0x9E37)) >> 6) as usize & 1023];
-            if (*slot >> 32) == w2 && cur_pos - (*slot & 0xFFFF_FFFF) <= 64 {
-                hits_2b += 1;
+    let (mut hist, mut hits_2b) = ([0u32; 256], 0u32);
+    {
+        let table2 = &mut scratch[..1024];
+        table2.fill(u64::MAX);
+        for (w, win) in wins.into_iter().enumerate() {
+            for &b in win {
+                hist[b as usize] += 1;
             }
-            *slot = (w2 << 32) | cur_pos;
+            for (p, s) in win.windows(2).enumerate() {
+                let w2 = u16::from_le_bytes([s[0], s[1]]) as u64;
+                let cur_pos = (w * 8192 + p) as u64;
+                let slot = &mut table2[((w2.wrapping_mul(0x9E37)) >> 6) as usize & 1023];
+                if (*slot >> 32) == w2 && cur_pos - (*slot & 0xFFFF_FFFF) <= 64 {
+                    hits_2b += 1;
+                }
+                *slot = (w2 << 32) | cur_pos;
+            }
         }
     }
 
@@ -304,7 +322,8 @@ fn classify_chunk(env: ChunkEnv<'_>, large_window: bool) -> PreChunkKind {
                 (w8.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 52) as usize,
             )
         };
-        let mut head_tbl = [0u64; 4096];
+        let head_tbl = &mut scratch[..4096];
+        head_tbl.fill(0);
         for s in slice[..2055].windows(8) {
             let (tag, h) = hash8(s);
             head_tbl[h] = tag;

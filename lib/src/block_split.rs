@@ -31,6 +31,7 @@ use crate::metablock::{
     block_count_to_sym_and_bits, header_count_bit_cost, step_block_type_mtf, ContextMode,
     OptimalCommand, NUM_BLOCK_LEN_SYMBOLS,
 };
+use hugepage_buffer::HugePageBuf;
 
 #[derive(Clone, Debug)]
 pub(crate) struct BlockSplit {
@@ -360,7 +361,7 @@ fn lloyd_refine_flat(
     hbuf: &mut [HuffmanCodeEntry],
     mut on_step: impl FnMut(&[u32], &[u8], &mut [HuffmanCodeEntry]),
 ) -> (Vec<u32>, Vec<u32>, Vec<u8>) {
-    let mut nz_buf = [(0u16, 0u32); MAX_HUFFMAN_ALPHABET];
+    let mut nz_buf = vec![(0u16, 0u32); alpha];
     for _ in 0..rounds {
         if cl_t.len() < 2 {
             break;
@@ -520,14 +521,28 @@ fn split_symbol_stream(syms: &[u16], spec: SplitSpec, hbuf: &mut [HuffmanCodeEnt
 }
 
 #[inline]
-fn rank_pos_ctx_modes(data: &[u8], pos: &[u32]) -> [(ContextMode, u64); 4] {
+fn rank_pos_ctx_modes_with(
+    scratch: &mut context::CtxRankScratch,
+    data: &[u8],
+    pos: &[u32],
+) -> [(ContextMode, u64); 4] {
     if pos.len() < 32 {
         context::ALL_CONTEXT_MODES.map(|m| (m, u64::MAX))
     } else {
-        context::rank_sampled_ctx_modes::<8>(&context::ALL_CONTEXT_MODES, data, pos.len(), |i| {
-            pos[i] as usize
-        })
+        context::rank_sampled_ctx_modes_with::<8>(
+            scratch,
+            &context::ALL_CONTEXT_MODES,
+            data,
+            pos.len(),
+            |i| pos[i] as usize,
+        )
     }
+}
+
+#[inline]
+fn rank_pos_ctx_modes(data: &[u8], pos: &[u32]) -> [(ContextMode, u64); 4] {
+    let mut scratch = context::CtxRankScratch::new();
+    rank_pos_ctx_modes_with(&mut scratch, data, pos)
 }
 
 #[inline]
@@ -768,7 +783,8 @@ pub(crate) fn select_distance_params_from_samples(
     if raw_seen < 48 || samples.len() < 24 {
         return (0, 0);
     }
-    let mut counts = [[0u32; MAX_HUFFMAN_ALPHABET]; 2];
+    let mut counts_buf = HugePageBuf::<[[u32; MAX_HUFFMAN_ALPHABET]; 2]>::new_zeroed(1);
+    let counts = &mut counts_buf[0];
     #[rustfmt::skip]
     const CANDIDATES: [(u8, u8); 15] = [
         (0, 0), (0, 4), (0, 8), (0, 12), (0, 15),
@@ -784,7 +800,7 @@ pub(crate) fn select_distance_params_from_samples(
             i += 1;
         }
     };
-    let base_cost = prescreen_dist_params(samples, raw_seen, large_window, true, 0, 0, &mut counts);
+    let base_cost = prescreen_dist_params(samples, raw_seen, large_window, true, 0, 0, counts);
     let (mut best_cost, mut best_pair) = (base_cost, (0u8, 0u8));
     for &(np, nd) in &CANDIDATES[1..] {
         if large_window
@@ -794,7 +810,7 @@ pub(crate) fn select_distance_params_from_samples(
         {
             continue;
         }
-        let c = prescreen_dist_params(samples, raw_seen, large_window, true, np, nd, &mut counts);
+        let c = prescreen_dist_params(samples, raw_seen, large_window, true, np, nd, counts);
         if c < best_cost {
             (best_cost, best_pair) = (c, (np, nd));
         }
@@ -829,7 +845,8 @@ fn select_optimal_distance_params(
     if raw_dists.len() < 16 {
         return (0, 0);
     }
-    let mut counts = [[0u32; MAX_HUFFMAN_ALPHABET]; 2];
+    let mut counts_buf = HugePageBuf::<[[u32; MAX_HUFFMAN_ALPHABET]; 2]>::new_zeroed(1);
+    let counts = &mut counts_buf[0];
     let (mut cands, mut n_cands) = ([(0u64, 0u8, 0u8); 64], 0usize);
     let (max_np, k_step) = if effort >= 11 || has_dict {
         (3u8, 1usize)
@@ -846,7 +863,7 @@ fn select_optimal_distance_params(
                 false,
                 np,
                 nd,
-                &mut counts,
+                counts,
             );
             let mut j = n_cands;
             while j > 0 && cands[j - 1].0 > score {
@@ -1062,8 +1079,9 @@ fn encode_lit_split(
     let mut ranked_by_bt = Vec::with_capacity(if effort >= 10 { num_bt } else { 0 });
     let mut ctx_flat = vec![0u32; num_bt * 64 * MAX_LIT];
     let mut ctx_tots = vec![0u32; num_bt * 64];
+    let mut rank_scratch = context::CtxRankScratch::new();
     for (bt, pos) in pos_by_bt.iter().enumerate() {
-        let ranked = rank_pos_ctx_modes(lits.data, pos);
+        let ranked = rank_pos_ctx_modes_with(&mut rank_scratch, lits.data, pos);
         if effort >= 10 {
             ranked_by_bt.push(ranked);
         }

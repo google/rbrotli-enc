@@ -532,7 +532,8 @@ fn halves(v: __m256i) -> [__m128i; 2] {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[inline]
+#[cfg_attr(not(debug_assertions), inline)]
+#[cfg_attr(debug_assertions, inline(never))]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
 pub(crate) fn insert_copy_len_to_sym_and_bits_simd<const TWO_DIST_CTX: bool>(
     insert: &[u32; 8],
@@ -946,7 +947,8 @@ pub(crate) fn match_short_dist_code(d: u32, ring: [u32; 4]) -> Option<u8> {
 /// Unpacks 16 interleaved `(even, odd)` `HuffmanCodeEntry::to_u32()` lanes and packs them into
 /// 4 bounded `(nbits, bits)` quadwords (`16 -> 32 -> 64` AVX2 variable shifts).
 #[cfg(target_arch = "x86_64")]
-#[inline]
+#[cfg_attr(not(debug_assertions), inline)]
+#[cfg_attr(debug_assertions, inline(never))]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
 pub(crate) fn pack_even_odd_16_avx2(
     even: [u32; 8],
@@ -994,7 +996,8 @@ pub(crate) fn pack_even_odd_16_avx2(
 }
 
 #[cfg(target_arch = "aarch64")]
-#[inline]
+#[cfg_attr(not(debug_assertions), inline)]
+#[cfg_attr(debug_assertions, inline(never))]
 #[target_feature(enable = "neon")]
 pub(crate) fn pack_even_odd_16_neon(
     even: [u32; 8],
@@ -1267,7 +1270,8 @@ macro_rules! emit_literals_body {
 
 #[cfg(target_arch = "x86_64")]
 #[simd_entry]
-#[inline]
+#[cfg_attr(not(debug_assertions), inline)]
+#[cfg_attr(debug_assertions, inline(never))]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
 pub(crate) fn emit_literals_avx2(
     slice: &[u8],
@@ -1280,7 +1284,8 @@ pub(crate) fn emit_literals_avx2(
 
 #[cfg(target_arch = "aarch64")]
 #[simd_entry]
-#[inline]
+#[cfg_attr(not(debug_assertions), inline)]
+#[cfg_attr(debug_assertions, inline(never))]
 #[target_feature(enable = "neon")]
 pub(crate) fn emit_literals_neon(
     slice: &[u8],
@@ -1340,7 +1345,8 @@ pub(crate) fn emit_cmd_no_lits(
     }
 }
 
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_cmd_and_lits<const DETACH: bool, const N: usize, S: SimdBackend>(
     simd: S,

@@ -45,6 +45,7 @@ use bounded_utils::{
 };
 #[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::*;
+use hugepage_buffer::HugePageBuf;
 use lsb_bitwriter::{BitStreamCursor, BitWriter};
 #[cfg(target_arch = "aarch64")]
 use safe_unaligned_simd::aarch64::vld1q_u8;
@@ -55,6 +56,7 @@ use simd_tokens::{simd_entry, SimdToken};
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 use std::sync::OnceLock;
+use zerocopy::FromZeroes;
 
 /// Maximum metablock size emitted by [`OnePassEncoder`] (`128 KiB`, adaptively split to `64 KiB`
 /// on intra-chunk literal distribution shifts).
@@ -221,17 +223,18 @@ const fn header_dist_alphabet(lw: bool) -> usize {
     }
 }
 
-fn seed_iac_floor_counts() -> [u32; MAX_IAC] {
-    IAC_STATIC_LENS.map(|l| u32::from(l != 0))
+fn seed_iac_floor_counts_into(out: &mut [u32; MAX_IAC]) {
+    for (dst, &l) in out.iter_mut().zip(&IAC_STATIC_LENS) {
+        *dst = u32::from(l != 0);
+    }
 }
 
-fn seed_dist_floor_counts(lw: bool) -> [u32; LARGE_DIST_ALPHABET_SIZE] {
+fn seed_dist_floor_counts_into(lw: bool, out: &mut [u32; LARGE_DIST_ALPHABET_SIZE]) {
     // Symbols 2 and 3 (`ring[2]`, `ring[3]`) are never emitted by the 2-register `(d0, d1)` cache.
-    let mut c = [0u32; LARGE_DIST_ALPHABET_SIZE];
-    c[..valid_dist_syms(lw)].fill(1);
-    c[2] = 0;
-    c[3] = 0;
-    c
+    out.fill(0);
+    out[..valid_dist_syms(lw)].fill(1);
+    out[2] = 0;
+    out[3] = 0;
 }
 
 #[inline]
@@ -285,21 +288,24 @@ fn write_baked((bytes, mut rem): (&[u8], usize), bw: &mut BitWriter) {
     }
 }
 
-struct IcdTables {
+#[derive(Clone, Copy, FromZeroes)]
+#[repr(C)]
+struct IcdLuts {
     iac_lut: [HuffmanCodeEntry; MAX_IAC],
     iac_fast: [[u32; 256]; 2],
     dist_lut: DistLut,
     dist_fast: [u32; 513],
+}
+
+struct IcdTables {
+    luts: HugePageBuf<IcdLuts>,
     baked_tail: BakedBits,
 }
 
 impl IcdTables {
     fn empty() -> Self {
         Self {
-            iac_lut: [HuffmanCodeEntry { bits: 0, len: 0 }; MAX_IAC],
-            iac_fast: [[0u32; 256]; 2],
-            dist_lut: [HuffmanCodeEntry { bits: 0, len: 0 }; LARGE_DIST_ALPHABET_SIZE],
-            dist_fast: [0u32; 513],
+            luts: HugePageBuf::new_zeroed(1),
             baked_tail: (Box::new([]), 0),
         }
     }
@@ -309,26 +315,27 @@ impl IcdTables {
             debug_assert!(nb < 64 && b < (1 << 24));
             ((b as u32) << 8) | (nb as u32)
         };
+        let luts = &mut self.luts[0];
         for ins in 0..16u32 {
             for copy in 4..18u32 {
                 let idx = ((ins as usize) << 4) | ((copy - 2) as usize);
                 let (raw_sym, eb_len, eb) = encode_iac_bounded(ins, copy, false);
                 let (rs, eb_len) = (raw_sym.get() as usize, eb_len.get());
-                self.iac_fast[0][idx] = pf(pack_huff_extra(self.iac_lut[rs], eb_len, eb));
+                luts.iac_fast[0][idx] = pf(pack_huff_extra(luts.iac_lut[rs], eb_len, eb));
                 if ins < 10 {
-                    self.iac_fast[1][idx] = pf(pack_huff_extra(self.iac_lut[rs - 128], eb_len, eb));
+                    luts.iac_fast[1][idx] = pf(pack_huff_extra(luts.iac_lut[rs - 128], eb_len, eb));
                 }
             }
         }
-        for (d, slot) in self.dist_fast.iter_mut().enumerate().skip(1) {
+        for (d, slot) in luts.dist_fast.iter_mut().enumerate().skip(1) {
             let (sym, eb_len, eb) = distance_to_sym_bounded(d as u32);
             *slot = pf(pack_huff_extra(
-                self.dist_lut[sym.get() as usize],
+                luts.dist_lut[sym.get() as usize],
                 eb_len.get(),
                 eb as u64,
             ));
         }
-        let (iac_lut, dist_lut) = (&self.iac_lut, &self.dist_lut[..header_dist_alphabet(lw)]);
+        let (iac_lut, dist_lut) = (&luts.iac_lut, &luts.dist_lut[..header_dist_alphabet(lw)]);
         self.baked_tail = bake_bits(|bw| {
             HuffmanCode::from_lut(iac_lut).write(bw);
             HuffmanCode::from_lut(dist_lut).write(bw);
@@ -343,23 +350,29 @@ impl IcdTables {
     }
 
     fn fill_from_counts(&mut self, iac_counts: &[u32; MAX_IAC], dist_counts: &[u32], lw: bool) {
-        let _ = HuffmanCode::from_counts(iac_counts, 15, &mut self.iac_lut);
+        let luts = &mut self.luts[0];
+        let _ = HuffmanCode::from_counts(iac_counts, 15, &mut luts.iac_lut);
         let n_valid = valid_dist_syms(lw);
-        self.dist_lut[n_valid..].fill(HuffmanCodeEntry::default());
+        luts.dist_lut[n_valid..].fill(HuffmanCodeEntry::default());
         let _ =
-            HuffmanCode::from_counts(&dist_counts[..n_valid], 15, &mut self.dist_lut[..n_valid]);
+            HuffmanCode::from_counts(&dist_counts[..n_valid], 15, &mut luts.dist_lut[..n_valid]);
         self.populate_fast(lw);
     }
 
     fn from_static_lens(iac_lens: &[u8; MAX_IAC], dist_lens: &[u8], lw: bool) -> Self {
         let mut out = Self::empty();
-        out.iac_lut = build_lut::<MAX_IAC>(iac_lens);
-        out.dist_lut = build_lut::<LARGE_DIST_ALPHABET_SIZE>(&dist_lens[..valid_dist_syms(lw)]);
+        {
+            let luts = &mut out.luts[0];
+            build_lut_into(iac_lens, &mut luts.iac_lut);
+            build_lut_into(&dist_lens[..valid_dist_syms(lw)], &mut luts.dist_lut);
+        }
         out.populate_fast(lw);
         out
     }
 }
 
+#[derive(Clone, Copy, FromZeroes)]
+#[repr(C)]
 struct RollingHist {
     iac: [u32; MAX_IAC],
     dist: [u32; LARGE_DIST_ALPHABET_SIZE],
@@ -367,12 +380,10 @@ struct RollingHist {
 }
 
 impl RollingHist {
-    fn seeded(lw: bool) -> Self {
-        Self {
-            iac: seed_iac_floor_counts(),
-            dist: seed_dist_floor_counts(lw),
-            cmds: 0,
-        }
+    fn seed_into(&mut self, lw: bool) {
+        seed_iac_floor_counts_into(&mut self.iac);
+        seed_dist_floor_counts_into(lw, &mut self.dist);
+        self.cmds = 0;
     }
 }
 
@@ -382,26 +393,26 @@ struct FixedBank {
     fixed_headers: [[BakedBits; 2]; 3],
 }
 
-static FIXED_BANK: OnceLock<FixedBank> = OnceLock::new();
-
-fn build_lut<const N: usize>(lens: &[u8]) -> [HuffmanCodeEntry; N] {
-    let mut entries = [HuffmanCodeEntry::default(); N];
+fn build_lut_into(lens: &[u8], entries: &mut [HuffmanCodeEntry]) {
+    entries.fill(HuffmanCodeEntry::default());
     for (dst, &l) in entries.iter_mut().zip(lens) {
         dst.len = l as u16;
     }
-    compute_bits_from_lengths(&mut entries);
-    entries
+    compute_bits_from_lengths(entries);
 }
 
 #[inline]
 fn fixed_bank() -> &'static FixedBank {
+    static FIXED_BANK: OnceLock<Box<FixedBank>> = OnceLock::new();
     FIXED_BANK.get_or_init(|| {
-        let lit_luts = [
+        let mut lit_luts = [[HuffmanCodeEntry::default(); 256]; 3];
+        for (dst, src) in lit_luts.iter_mut().zip([
             &LIT_LEN_WEB_CODE[..],
             &LIT_LEN_PROSE_UTF8[..],
             &LIT_LEN_FLAT8[..],
-        ]
-        .map(build_lut::<256>);
+        ]) {
+            build_lut_into(src, dst);
+        }
         let icd = [
             IcdTables::from_static_lens(&IAC_STATIC_LENS, &DIST_STATIC_LENS_STD, false),
             IcdTables::from_static_lens(&IAC_STATIC_LENS, &DIST_STATIC_LENS_LW, true),
@@ -411,11 +422,11 @@ fn fixed_bank() -> &'static FixedBank {
                 bake_bits(|bw| icd[di].write_header(&HuffmanCode::from_lut(&lit_luts[p]), bw))
             })
         });
-        FixedBank {
+        Box::new(FixedBank {
             lit_luts,
             icd,
             fixed_headers,
-        }
+        })
     })
 }
 
@@ -517,7 +528,7 @@ fn pack_tracked_iac(
             h.cmds += u32::from(inc_cmd);
         }
     }
-    pack_huff_extra_bounded(*icd.iac_lut.bget(sym_idx), eb_len.get(), eb)
+    pack_huff_extra_bounded(*icd.luts[0].iac_lut.bget(sym_idx), eb_len.get(), eb)
 }
 
 #[inline(always)]
@@ -533,7 +544,7 @@ fn encode_iac_fast(
     if !track && ins_len < 16 && copy_len < 18 {
         let imp = d == d0 && ins_len < 10;
         let idx = ((ins_len as usize) << 4) | (copy_len as usize - 2);
-        let p = *icd.iac_fast[usize::from(imp)].bget_masked(idx);
+        let p = *icd.luts[0].iac_fast[usize::from(imp)].bget_masked(idx);
         return (bound64_from_u63((p & 0xFF) as usize), (p >> 8) as u64, imp);
     }
     let imp = d == d0 && can_use_implicit_d0(ins_len, copy_len);
@@ -556,6 +567,7 @@ fn encode_dist_fast(
     icd: &IcdTables,
     hist: &mut Option<&mut RollingHist>,
 ) -> (BoundedUsize<64>, u64) {
+    let luts = &icd.luts[0];
     if let Some(sc) = match_short_dist_d01(d, d0, d1) {
         let sc_idx: BoundedUsize<15> = sc.into();
         if track {
@@ -563,12 +575,12 @@ fn encode_dist_fast(
                 *h.dist.bget_mut(sc_idx) += 1;
             }
         }
-        let dh = *icd.dist_lut.bget(sc_idx);
+        let dh = *luts.dist_lut.bget(sc_idx);
         return (bound64_from_u63(dh.len as usize), dh.bits as u64);
     }
     if !track {
         if let Some(d_idx) = BoundedUsize::<512>::new(d as usize) {
-            let p = *icd.dist_fast.bget(d_idx);
+            let p = *luts.dist_fast.bget(d_idx);
             return (bound64_from_u63((p & 0xFF) as usize), (p >> 8) as u64);
         }
     }
@@ -579,7 +591,7 @@ fn encode_dist_fast(
             *h.dist.bget_mut(sym_idx) += 1;
         }
     }
-    pack_huff_extra_bounded(*icd.dist_lut.bget(sym_idx), eb_len.get(), eb as u64)
+    pack_huff_extra_bounded(*luts.dist_lut.bget(sym_idx), eb_len.get(), eb as u64)
 }
 
 #[inline(always)]
@@ -662,7 +674,8 @@ fn hash_single_p64(is_q0: bool, mls: u8, word64: u64, log: u32) -> (u64, u32, u3
 
 type PendingD0<'a> = (BoundedPrefixCursor<'a, u8, 16>, &'a [u8; 16], u64);
 
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 fn extend_from_8_cursor<S: SimdBackend>(
     simd: S,
     prefix: &[u8],
@@ -680,7 +693,8 @@ fn extend_from_8_cursor<S: SimdBackend>(
     }
 }
 
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 fn extend_from_diff_cursor<S: SimdBackend>(
     simd: S,
     prefix: &[u8],
@@ -696,7 +710,8 @@ fn extend_from_diff_cursor<S: SimdBackend>(
     }
 }
 
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 fn dict_prefix_match_len<const MIN_LEN: usize, S: SimdBackend>(
     simd: S,
     dict: &[u8],
@@ -742,7 +757,8 @@ fn dict_prefix_match_len<const MIN_LEN: usize, S: SimdBackend>(
     Some(common_prefix_len(d_slice, &prefix[pos..], MAX_COPY_LEN))
 }
 
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 fn probe_raw_dict4<const FIRST_ONLY: bool, S: SimdBackend>(
     simd: S,
     d_idx: &RawDictIndex,
@@ -785,7 +801,8 @@ fn probe_raw_dict4<const FIRST_ONLY: bool, S: SimdBackend>(
     (best_d, best_l)
 }
 
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 #[allow(clippy::too_many_arguments)]
 fn refine_trawl_d0_ldm<S: SimdBackend>(
     simd: S,
@@ -1002,7 +1019,8 @@ impl<'a, 'b, 'c> FastSinkInit for OnePassInit<'a, 'b, 'c> {
 }
 
 impl FastEmitSink for DirectHuffSink<'_, '_, '_> {
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    #[cfg_attr(debug_assertions, inline(never))]
     fn emit_lz_match<S: SimdBackend>(
         &mut self,
         simd: S,
@@ -1045,7 +1063,8 @@ impl FastEmitSink for DirectHuffSink<'_, '_, '_> {
         );
     }
 
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    #[cfg_attr(debug_assertions, inline(never))]
     fn emit_trailing_lits<S: SimdBackend>(
         &mut self,
         simd: S,
@@ -1075,7 +1094,8 @@ impl FastEmitSink for DirectHuffSink<'_, '_, '_> {
     }
 }
 
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 #[allow(clippy::too_many_arguments)]
 fn finish_fast_match_and_probe_d0<'a, const MODE_PB: u8, const IS_Q0: bool>(
     ts: &mut TableSlices1<'_>,
@@ -1119,7 +1139,8 @@ fn finish_fast_match_and_probe_d0<'a, const MODE_PB: u8, const IS_Q0: bool>(
     None
 }
 
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 fn eval_8b_match<S: SimdBackend>(
     simd: S,
     hd: bool,
@@ -1166,7 +1187,8 @@ fn d_hit_eq(d_ev: u32, d0: u32, w: u64) -> bool {
     d_ev == d0 || (w as u32) != (w as u8 as u32).wrapping_mul(0x0101_0101)
 }
 
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 fn eval_short4_match<S: SimdBackend, const IS_Q0: bool>(
     simd: S,
     (lw, hd): (bool, bool),
@@ -1958,6 +1980,7 @@ fn drive_fast_chunks(
 pub(crate) struct OnePassEncoder {
     ht: HashTable,
     icd_buf: Option<Box<IcdTables>>,
+    rolling_buf: HugePageBuf<RollingHist>,
     icd_adapted: bool,
     icd_age: u32,
     wbits: usize,
@@ -1972,6 +1995,7 @@ impl OnePassEncoder {
         Self {
             ht: HashTable::new(),
             icd_buf: None,
+            rolling_buf: HugePageBuf::new(),
             icd_adapted: false,
             icd_age: 0,
             wbits,
@@ -1979,6 +2003,14 @@ impl OnePassEncoder {
             lw: wbits > STD_MAX_WBITS,
             mls: 5,
         }
+    }
+
+    pub(crate) fn set_wbits(&mut self, wbits: usize) {
+        self.wbits = wbits;
+        self.pos_bits = onepass_pos_bits(wbits);
+        self.lw = wbits > STD_MAX_WBITS;
+        self.icd_adapted = false;
+        self.icd_age = 0;
     }
 
     pub(crate) fn configure(&mut self, mls: u8, log: u32) {
@@ -2054,6 +2086,112 @@ impl OnePassEncoder {
         )
     }
 
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    #[cfg_attr(debug_assertions, inline(never))]
+    #[allow(clippy::too_many_arguments)]
+    fn build_dyn_lit_lut_and_header(
+        &self,
+        simd: OptSimd,
+        hd: bool,
+        span: &mut ChunkSpan<'_>,
+        is_final: &mut bool,
+        bw: &mut BitWriter,
+        header_icd: &IcdTables,
+        dyn_lut: &mut [HuffmanCodeEntry; 256],
+    ) -> Option<bool> {
+        let mut raw_chunk = &span.prefix[span.start..];
+        let mut chunk_len = raw_chunk.len();
+        let (mut counts, max_len) = ([0u32; 256], if chunk_len <= 16_384 { 15 } else { 14 });
+        let mut raw_sample = [0u32; 256];
+        let sample_n: u64;
+        if chunk_len <= 2_048 {
+            sample_n = chunk_len as u64;
+            crate::compress::count_literals_x4(raw_chunk, &mut raw_sample);
+            let sum_sq: u64 = raw_sample.iter().map(|&c| (c as u64) * (c as u64)).sum();
+            if !hd
+                && 256 * sum_sq <= sample_n * sample_n + 88 * sample_n
+                && !self.has_sampled_match(*span)
+            {
+                return None;
+            }
+            for (dst, &c) in counts.iter_mut().zip(&raw_sample) {
+                if c != 0 {
+                    *dst = c + c.min(8);
+                }
+            }
+        } else {
+            const SPLIT_HALF: usize = 65_536;
+            const BSIZE: usize = 64;
+            let (mut b0_cnt, mut b1_cnt) = ([0u16; 256], [0u16; 256]);
+            let (blocks, shift) = if chunk_len > SPLIT_HALF + 2_048 {
+                sample_strided_64b(&raw_chunk[..SPLIT_HALF], 16, &mut b0_cnt, &mut b1_cnt);
+                raw_sample = std::array::from_fn(|k| (b0_cnt[k] + b1_cnt[k]) as u32);
+                sample_strided_64b(&raw_chunk[SPLIT_HALF..], 16, &mut b0_cnt, &mut b1_cnt);
+                let mut l1_diff = 0u32;
+                for k in 0..256 {
+                    let tot = (b0_cnt[k] + b1_cnt[k]) as u32;
+                    l1_diff += raw_sample[k].abs_diff(tot - raw_sample[k]);
+                }
+                if l1_diff > 640 {
+                    span.prefix = &span.prefix[..span.start + SPLIT_HALF];
+                    raw_chunk = &span.prefix[span.start..];
+                    chunk_len = SPLIT_HALF;
+                    *is_final = false;
+                    (16usize, 4u32)
+                } else {
+                    raw_sample = std::array::from_fn(|k| (b0_cnt[k] + b1_cnt[k]) as u32);
+                    (32usize, 5u32)
+                }
+            } else {
+                let (blks, sh) = if chunk_len <= 16_384 {
+                    (16usize, 4u32)
+                } else {
+                    (32usize, 5u32)
+                };
+                sample_strided_64b(raw_chunk, blks, &mut b0_cnt, &mut b1_cnt);
+                raw_sample = std::array::from_fn(|k| (b0_cnt[k] + b1_cnt[k]) as u32);
+                (blks, sh)
+            };
+            sample_n = (blocks * BSIZE) as u64;
+            let sum_sq: u32 = raw_sample.iter().map(|&c| c * c).sum();
+            let max_sum_sq: u32 = if blocks == 16 { 5_440 } else { 19_200 };
+            if !hd && sum_sq <= max_sum_sq && !self.has_sampled_match(*span) {
+                return None;
+            }
+            let present_rows = if chunk_len > 32_768 {
+                0xFFFF
+            } else {
+                let mut init_mask = 0u16;
+                for (r, row) in raw_sample.as_chunks::<16>().0.iter().enumerate() {
+                    init_mask |= u16::from(row.iter().any(|&c| c != 0)) << r;
+                }
+                compute_present_rows(raw_chunk, init_mask, simd)
+            };
+            for r in 0..16 {
+                if ((present_rows >> r) & 1) != 0 {
+                    let src = &raw_sample[r << 4..(r << 4) + 16];
+                    let prior = if src.iter().filter(|&&c| c != 0).count() >= 4 {
+                        4
+                    } else {
+                        1
+                    };
+                    for (dst, &s) in counts[r << 4..(r << 4) + 16].iter_mut().zip(src) {
+                        *dst = (s << shift) + prior + (s.min(8) << shift);
+                    }
+                }
+            }
+        }
+        let (_, huff) = HuffmanCode::from_counts(&counts, max_len, dyn_lut);
+        let high_ent_lits = if !hd {
+            huff.payload_bit_cost(&raw_sample) * 100 >= sample_n * 795
+        } else {
+            false
+        };
+        write_compressed_metablock_prefix(chunk_len, *is_final, bw);
+        header_icd.write_header(&huff, bw);
+        Some(high_ent_lits)
+    }
+
     #[allow(clippy::too_many_arguments)]
     #[inline(never)]
     fn encode_one_chunk(
@@ -2076,7 +2214,7 @@ impl OnePassEncoder {
         let lw = self.lw;
         let di = usize::from(lw);
         let mut dyn_lut = [HuffmanCodeEntry::default(); 256];
-        let (cp, saved_bits, saved_ring);
+        let (cp, saved_bits, saved_ring) = (bw.checkpoint(), bw.total_bits(), *ring);
         let mut high_ent_lits = false;
         let adapted_icd = self
             .icd_adapted
@@ -2085,99 +2223,26 @@ impl OnePassEncoder {
 
         let lit_lut: &[HuffmanCodeEntry; 256] = if chunk_len < ONEPASS_PRESET_MAX_LEN {
             let pidx = classify_lit_preset(raw_chunk);
-            (cp, saved_bits, saved_ring) = (bw.checkpoint(), bw.total_bits(), *ring);
             write_compressed_metablock_prefix(chunk_len, is_final, bw);
             let hdr = &bank.fixed_headers[pidx][di];
             write_baked((&hdr.0, hdr.1), bw);
             &bank.lit_luts[pidx]
         } else {
-            let (mut counts, max_len) = ([0u32; 256], if chunk_len <= 16_384 { 15 } else { 14 });
-            let mut raw_sample = [0u32; 256];
-            let sample_n: u64;
-            if chunk_len <= 2_048 {
-                sample_n = chunk_len as u64;
-                crate::compress::count_literals_x4(raw_chunk, &mut raw_sample);
-                let sum_sq: u64 = raw_sample.iter().map(|&c| (c as u64) * (c as u64)).sum();
-                if !hd
-                    && 256 * sum_sq <= sample_n * sample_n + 88 * sample_n
-                    && !self.has_sampled_match(span)
-                {
-                    return self.emit_uncompressed_chunk(span, is_final, bw);
-                }
-                for (d, &c) in counts.iter_mut().zip(&raw_sample) {
-                    if c != 0 {
-                        *d = c + c.min(8);
-                    }
-                }
-            } else {
-                const SPLIT_HALF: usize = 65_536;
-                const BSIZE: usize = 64;
-                let (mut b0_cnt, mut b1_cnt) = ([0u16; 256], [0u16; 256]);
-                let (blocks, shift) = if chunk_len > SPLIT_HALF + 2_048 {
-                    sample_strided_64b(&raw_chunk[..SPLIT_HALF], 16, &mut b0_cnt, &mut b1_cnt);
-                    raw_sample = std::array::from_fn(|k| (b0_cnt[k] + b1_cnt[k]) as u32);
-                    sample_strided_64b(&raw_chunk[SPLIT_HALF..], 16, &mut b0_cnt, &mut b1_cnt);
-                    let mut l1_diff = 0u32;
-                    for k in 0..256 {
-                        let tot = (b0_cnt[k] + b1_cnt[k]) as u32;
-                        l1_diff += raw_sample[k].abs_diff(tot - raw_sample[k]);
-                    }
-                    if l1_diff > 640 {
-                        span.prefix = &span.prefix[..span.start + SPLIT_HALF];
-                        raw_chunk = &span.prefix[span.start..];
-                        chunk_len = SPLIT_HALF;
-                        is_final = false;
-                        (16usize, 4u32)
-                    } else {
-                        raw_sample = std::array::from_fn(|k| (b0_cnt[k] + b1_cnt[k]) as u32);
-                        (32usize, 5u32)
-                    }
-                } else {
-                    let (blks, sh) = if chunk_len <= 16_384 {
-                        (16usize, 4u32)
-                    } else {
-                        (32usize, 5u32)
-                    };
-                    sample_strided_64b(raw_chunk, blks, &mut b0_cnt, &mut b1_cnt);
-                    raw_sample = std::array::from_fn(|k| (b0_cnt[k] + b1_cnt[k]) as u32);
-                    (blks, sh)
-                };
-                sample_n = (blocks * BSIZE) as u64;
-                let sum_sq: u32 = raw_sample.iter().map(|&c| c * c).sum();
-                let max_sum_sq: u32 = if blocks == 16 { 5_440 } else { 19_200 };
-                if !hd && sum_sq <= max_sum_sq && !self.has_sampled_match(span) {
-                    return self.emit_uncompressed_chunk(span, is_final, bw);
-                }
-                let present_rows = if chunk_len > 32_768 {
-                    0xFFFF
-                } else {
-                    let mut init_mask = 0u16;
-                    for (r, row) in raw_sample.as_chunks::<16>().0.iter().enumerate() {
-                        init_mask |= u16::from(row.iter().any(|&c| c != 0)) << r;
-                    }
-                    compute_present_rows(raw_chunk, init_mask, simd)
-                };
-                for r in 0..16 {
-                    if ((present_rows >> r) & 1) != 0 {
-                        let src = &raw_sample[r << 4..(r << 4) + 16];
-                        let prior = if src.iter().filter(|&&c| c != 0).count() >= 4 {
-                            4
-                        } else {
-                            1
-                        };
-                        for (d, &s) in counts[r << 4..(r << 4) + 16].iter_mut().zip(src) {
-                            *d = (s << shift) + prior + (s.min(8) << shift);
-                        }
-                    }
-                }
-            }
-            let (_, huff) = HuffmanCode::from_counts(&counts, max_len, &mut dyn_lut);
-            if !hd {
-                high_ent_lits = huff.payload_bit_cost(&raw_sample) * 100 >= sample_n * 795;
-            }
-            (cp, saved_bits, saved_ring) = (bw.checkpoint(), bw.total_bits(), *ring);
-            write_compressed_metablock_prefix(chunk_len, is_final, bw);
-            adapted_icd.unwrap_or(&bank.icd[di]).write_header(&huff, bw);
+            let header_icd = adapted_icd.unwrap_or(&bank.icd[di]);
+            let Some(he) = self.build_dyn_lit_lut_and_header(
+                simd,
+                hd,
+                &mut span,
+                &mut is_final,
+                bw,
+                header_icd,
+                &mut dyn_lut,
+            ) else {
+                return self.emit_uncompressed_chunk(span, is_final, bw);
+            };
+            high_ent_lits = he;
+            raw_chunk = &span.prefix[span.start..];
+            chunk_len = raw_chunk.len();
             &dyn_lut
         };
 
@@ -2188,7 +2253,6 @@ impl OnePassEncoder {
         };
         let need_adapt = (self.icd_age & 7) == 3;
         let track = rem_after >= 65_536 && chunk_len >= 32_768 && need_adapt;
-        let mut rolling = track.then(|| RollingHist::seeded(lw));
         let active_icd: &IcdTables =
             match adapted_icd.filter(|_| chunk_len >= ONEPASS_PRESET_MAX_LEN) {
                 Some(t) => t,
@@ -2199,12 +2263,19 @@ impl OnePassEncoder {
         let vpos_base = self.ht.next_vpos.wrapping_sub(span.start);
         let mls = self.mls;
         let abort_uncomp = {
+            let rolling = if track {
+                let buf = self.rolling_buf.resize_or_grow_zeroed(1);
+                buf[0].seed_into(lw);
+                Some(&mut buf[0])
+            } else {
+                None
+            };
             let ts = self.ht.slices1_mut();
             let init = OnePassInit {
                 bw,
                 lit_lut,
                 icd: active_icd,
-                hist: rolling.as_mut(),
+                hist: rolling,
                 high_ent_lits,
             };
             #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -2286,7 +2357,11 @@ impl OnePassEncoder {
             write_uncompressed_metablock(raw_chunk, bw);
             true
         } else {
-            if let Some(h) = rolling.filter(|h| h.cmds >= 48) {
+            if let Some(h) = track
+                .then(|| self.rolling_buf.first())
+                .flatten()
+                .filter(|h| h.cmds >= 48)
+            {
                 self.icd_buf
                     .get_or_insert_with(|| Box::new(IcdTables::empty()))
                     .fill_from_counts(&h.iac, &h.dist, lw);
@@ -2333,11 +2408,22 @@ fn encode_dist_sym_fast(
     distance_to_sym_bounded(d)
 }
 
+#[derive(Clone, Copy, FromZeroes)]
+#[repr(C)]
 struct Pass1Stats {
     iac_counts: [u32; MAX_IAC],
     dist_counts: [u32; LARGE_DIST_ALPHABET_SIZE],
     total_lits: usize,
-    has_dist: bool,
+    has_dist: u8,
+}
+
+#[derive(Clone, Copy, FromZeroes)]
+#[repr(C)]
+pub(crate) struct TwoPassScratch {
+    st: Pass1Stats,
+    lit_lut: [HuffmanCodeEntry; 256],
+    iac_lut: [HuffmanCodeEntry; MAX_IAC],
+    dist_lut: DistLut,
 }
 
 struct FastCmdBufSink<'a> {
@@ -2379,7 +2465,7 @@ impl FastCmdBufSink<'_> {
         let (dist_sym, dist_eb_len, dist_eb) = match opt_dist {
             Some((ds, deb_l, deb)) => {
                 *self.st.dist_counts.bget_mut(ds.into()) += 1;
-                self.st.has_dist = true;
+                self.st.has_dist = 1;
                 (ds.widen::<LARGE_DIST_ALPHABET_SIZE>(), deb_l, deb)
             }
             None => (NO_DIST_SYM, BoundedU8::constant::<0>(), 0),
@@ -2398,7 +2484,8 @@ impl FastCmdBufSink<'_> {
 }
 
 impl FastEmitSink for FastCmdBufSink<'_> {
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    #[cfg_attr(debug_assertions, inline(never))]
     fn emit_lz_match<S: SimdBackend>(
         &mut self,
         _simd: S,
@@ -2425,7 +2512,8 @@ impl FastEmitSink for FastCmdBufSink<'_> {
         self.push_cmd(anchor, mpos - anchor, iac, opt_dist);
     }
 
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    #[cfg_attr(debug_assertions, inline(never))]
     fn emit_sd_match(&mut self, anchor: usize, hit_pos: usize, sd_base_len: u32, match_dist: u32) {
         let ins = hit_pos - anchor;
         self.push_cmd(
@@ -2436,7 +2524,8 @@ impl FastEmitSink for FastCmdBufSink<'_> {
         );
     }
 
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    #[cfg_attr(debug_assertions, inline(never))]
     fn emit_trailing_lits<S: SimdBackend>(
         &mut self,
         _simd: S,
@@ -2561,6 +2650,7 @@ pub(crate) struct FastTwoPassEncoder {
     ht: HashTable,
     cmds: Vec<FastCmd>,
     ldm_spans: Vec<FastLdmSpan>,
+    scratch: HugePageBuf<TwoPassScratch>,
     wbits: usize,
     chunk_size: usize,
     mode: u8,
@@ -2575,12 +2665,18 @@ impl FastTwoPassEncoder {
             ht: HashTable::new(),
             cmds: Vec::new(),
             ldm_spans: Vec::new(),
+            scratch: HugePageBuf::new(),
             wbits,
             chunk_size,
             mode,
             lw: wbits > STD_MAX_WBITS,
             mls: 4,
         }
+    }
+
+    pub(crate) fn set_wbits(&mut self, wbits: usize) {
+        self.wbits = wbits;
+        self.lw = wbits > STD_MAX_WBITS;
     }
 
     pub(crate) fn configure_with_pos_bits(&mut self, pos_bits: u8, mls: u8, log: u32, slog: u32) {
@@ -2750,7 +2846,12 @@ fn count_fast_cmd_lits(
 
 #[inline(never)]
 fn encode_twopass_chunk(
-    (ht, cmds_buf, ldm_spans): (&mut HashTable, &mut Vec<FastCmd>, &mut Vec<FastLdmSpan>),
+    (ht, cmds_buf, ldm_spans, scratch): (
+        &mut HashTable,
+        &mut Vec<FastCmd>,
+        &mut Vec<FastLdmSpan>,
+        &mut HugePageBuf<TwoPassScratch>,
+    ),
     (mode, lw, mls, hd, is_final): (u8, bool, u8, bool, bool),
     span: ChunkSpan<'_>,
     ring: &mut [u32; 2],
@@ -2789,19 +2890,19 @@ fn encode_twopass_chunk(
     if cmds_buf.capacity() < min_cap {
         cmds_buf.reserve(min_cap);
     }
-    let mut st = Pass1Stats {
-        iac_counts: [0u32; MAX_IAC],
-        dist_counts: [0u32; LARGE_DIST_ALPHABET_SIZE],
-        total_lits: 0,
-        has_dist: false,
-    };
+    let scr = &mut scratch.resize_or_grow_zeroed(1)[0];
+    let (d_valid, d_alpha) = (valid_dist_syms(lw), header_dist_alphabet(lw));
+    scr.st.iac_counts.fill(0);
+    scr.st.dist_counts[..d_valid].fill(0);
+    scr.st.total_lits = 0;
+    scr.st.has_dist = 0;
     let chunk_sd =
         mode >= 2 && span.start < FAST_TWOPASS_SD_MAX_POS.saturating_sub(span.stream_base);
     let (vpos_base, pos_bits) = (ht.next_vpos.wrapping_sub(span.start), ht.pos_bits);
     {
         let (ts, init, ldm) = (
             ht.slices1_mut(),
-            (&mut *cmds_buf, &mut st, span.start),
+            (&mut *cmds_buf, &mut scr.st, span.start),
             &ldm_spans[..],
         );
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -2877,16 +2978,16 @@ fn encode_twopass_chunk(
     let cmds = &cmds_buf[..];
 
     let mut lit_counts = [0u32; 256];
-    if st.total_lits == 0 {
+    if scr.st.total_lits == 0 {
         lit_counts[0] = 1;
     } else {
-        count_fast_cmd_lits(raw_chunk, st.total_lits, cmds, &mut lit_counts, simd);
+        count_fast_cmd_lits(raw_chunk, scr.st.total_lits, cmds, &mut lit_counts, simd);
     }
 
     if should_emit_uncompressed(
         chunk_len,
         cmds.len() as u32,
-        st.total_lits as u32,
+        scr.st.total_lits as u32,
         &lit_counts,
     ) {
         *ring = saved_ring;
@@ -2894,21 +2995,21 @@ fn encode_twopass_chunk(
         return true;
     }
 
-    if !st.has_dist {
-        st.dist_counts[0] = 1;
+    if scr.st.has_dist == 0 {
+        scr.st.dist_counts[0] = 1;
     }
-    let mut lit_lut = [HuffmanCodeEntry::default(); 256];
-    let mut iac_lut = [HuffmanCodeEntry::default(); MAX_IAC];
-    let mut dist_lut: DistLut = [HuffmanCodeEntry::default(); LARGE_DIST_ALPHABET_SIZE];
-    let (_, lit_huff) = HuffmanCode::from_counts(&lit_counts, 15, &mut lit_lut);
-    let (_, iac_huff) = HuffmanCode::from_counts(&st.iac_counts, 15, &mut iac_lut);
-    let (d_valid, d_alpha) = (valid_dist_syms(lw), header_dist_alphabet(lw));
-    let singleton =
-        HuffmanCode::from_counts(&st.dist_counts[..d_valid], 15, &mut dist_lut[..d_valid])
-            .1
-            .singleton;
+    let (_, lit_huff) = HuffmanCode::from_counts(&lit_counts, 15, &mut scr.lit_lut);
+    let (_, iac_huff) = HuffmanCode::from_counts(&scr.st.iac_counts, 15, &mut scr.iac_lut);
+    scr.dist_lut[d_valid..d_alpha].fill(HuffmanCodeEntry::default());
+    let singleton = HuffmanCode::from_counts(
+        &scr.st.dist_counts[..d_valid],
+        15,
+        &mut scr.dist_lut[..d_valid],
+    )
+    .1
+    .singleton;
     let dist_huff = HuffmanCode {
-        code: &dist_lut[..d_alpha],
+        code: &scr.dist_lut[..d_alpha],
         singleton,
     };
 
@@ -2925,10 +3026,10 @@ fn encode_twopass_chunk(
         Some(tok) => twopass_p2_avx2(
             raw_chunk,
             cmds,
-            &lit_lut,
+            &scr.lit_lut,
             lit_singleton,
-            &iac_lut,
-            &dist_lut,
+            &scr.iac_lut,
+            &scr.dist_lut,
             bw,
             tok,
             tok,
@@ -2937,10 +3038,10 @@ fn encode_twopass_chunk(
         Some(tok) => twopass_p2_neon(
             raw_chunk,
             cmds,
-            &lit_lut,
+            &scr.lit_lut,
             lit_singleton,
-            &iac_lut,
-            &dist_lut,
+            &scr.iac_lut,
+            &scr.dist_lut,
             bw,
             tok,
             tok,
@@ -2948,10 +3049,10 @@ fn encode_twopass_chunk(
         _ => twopass_p2_scalar(
             raw_chunk,
             cmds,
-            &lit_lut,
+            &scr.lit_lut,
             lit_singleton,
-            &iac_lut,
-            &dist_lut,
+            &scr.iac_lut,
+            &scr.dist_lut,
             bw,
         ),
     }
@@ -3041,7 +3142,12 @@ impl ChunkStreamEncoder for FastTwoPassEncoder {
             |span, bw| {
                 let chunk_end = span.prefix.len();
                 let uncomp = encode_twopass_chunk(
-                    (&mut self.ht, &mut self.cmds, &mut self.ldm_spans),
+                    (
+                        &mut self.ht,
+                        &mut self.cmds,
+                        &mut self.ldm_spans,
+                        &mut self.scratch,
+                    ),
                     (self.mode, self.lw, self.mls, hd, is_eof && chunk_end == end),
                     span,
                     ring,
@@ -3157,8 +3263,8 @@ mod tests {
                     let (mut rbw, mut fbw) = (BitWriter::new(&mut rb), BitWriter::new(&mut fb));
                     let (lc, ic, dc) = (
                         [huff(&bank.lit_luts[p])],
-                        [huff(&bank.icd[di].iac_lut)],
-                        [huff(&bank.icd[di].dist_lut[..d_alpha])],
+                        [huff(&bank.icd[di].luts[0].iac_lut)],
+                        [huff(&bank.icd[di].luts[0].dist_lut[..d_alpha])],
                     );
                     metablock::Header {
                         islast: is_final,
@@ -3470,7 +3576,12 @@ mod tests {
                 write_uncompressed_metablock(&sparse[HIST_START..HI_START], &mut bw);
                 let mut ring = INITIAL_RING01;
                 let uncomp = encode_twopass_chunk(
-                    (&mut enc.ht, &mut enc.cmds, &mut enc.ldm_spans),
+                    (
+                        &mut enc.ht,
+                        &mut enc.cmds,
+                        &mut enc.ldm_spans,
+                        &mut enc.scratch,
+                    ),
                     (mode, true, mls, false, true),
                     hi_span,
                     &mut ring,

@@ -294,7 +294,7 @@ struct PreparedDictTables {
     heads: Box<[u8]>,
     ht4_near: Box<[u32]>,
     ht4_tags: Box<[u16]>,
-    ht3: Option<Box<[u32; HT3_SIZE]>>,
+    ht3: Box<[u32]>,
     end_vpos: usize,
 }
 
@@ -467,7 +467,8 @@ impl RawDictIndex {
         self.ht4.probe(p32, max_rem)
     }
 
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    #[cfg_attr(debug_assertions, inline(never))]
     pub(crate) fn search4_mask<S: SimdBackend>(
         &self,
         simd: S,
@@ -670,7 +671,8 @@ impl Dict5Index {
         self.ht4.probe(p32, max_rem)
     }
 
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    #[cfg_attr(debug_assertions, inline(never))]
     pub(crate) fn search8_chunk_mask<S: SimdBackend>(simd: S, chunk: &[u32; 8], tag8: u32) -> u32 {
         dispatch_simd!(
             simd,
@@ -843,7 +845,7 @@ impl PreparedDictionary {
             heads: ht.heads[..].into(),
             ht4_near: ht.ht4_near[..].into(),
             ht4_tags: ht.ht4_tags[..].into(),
-            ht3: ht.ht3,
+            ht3: ht.ht3[..].into(),
             end_vpos: dv + d_len,
         }
     }
@@ -880,7 +882,7 @@ pub(crate) fn log2_u64_q5(x: u64) -> i32 {
     (k << 5) + frac
 }
 
-#[derive(Clone, FromZeroes)]
+#[derive(Clone, Copy, FromZeroes)]
 pub(crate) struct CmdCostStats {
     pub copy_counts: [u32; 24],
     pub imp_d0_counts: [u32; 16],
@@ -925,15 +927,31 @@ pub(crate) struct SliceCostModel {
     pub(crate) copy_cmd_cost: [u16; 24],
     /// Implicit-`d0` command cost by `copy_code` (`0..16`) in `Q5`, including `COPY_EXTRA * 32`.
     pub(crate) implicit_d0_cmd_cost: [u16; 16],
-    /// Distance symbol + extra bits cost in `Q5` for `[dist_ctx][dist_sym]`.
-    pub(crate) dist_cost: [[u16; LARGE_DIST_ALPHABET_SIZE]; 2],
+    /// Distance symbol + extra bits cost in `Q5` for `[dist_ctx][dist_sym]`, heap-backed.
+    pub(crate) dist_cost: HugePageBuf<[[u16; LARGE_DIST_ALPHABET_SIZE]; 2]>,
     pub(crate) ctx_mode: ContextMode,
-    pub(crate) cmd_stats: Option<Box<CmdCostStats>>,
-    pub(crate) ctx_lit_cost: Option<Box<[[u8; 256]; 64]>>,
+    pub(crate) cmd_stats: HugePageBuf<CmdCostStats>,
+    pub(crate) ctx_lit_cost: HugePageBuf<[[u8; 256]; 64]>,
 }
 
 impl SliceCostModel {
     pub(crate) fn new_for_config<C: MatchConfig>() -> Self {
+        let mut dist_cost = HugePageBuf::<[[u16; LARGE_DIST_ALPHABET_SIZE]; 2]>::new_zeroed(1);
+        dist_cost[0].as_flattened_mut().fill(192);
+        let cmd_stats = if C::COST_MODEL_LEVEL >= 2 {
+            let mut s = HugePageBuf::<CmdCostStats>::new_zeroed(1);
+            s[0].reset_priors();
+            s
+        } else {
+            HugePageBuf::new()
+        };
+        let ctx_lit_cost = if C::COST_MODEL_LEVEL >= 3 {
+            let mut c = HugePageBuf::<[[u8; 256]; 64]>::new_zeroed(1);
+            c[0].as_flattened_mut().fill(88);
+            c
+        } else {
+            HugePageBuf::new()
+        };
         let mut m = SliceCostModel {
             lit_mult: STATIC_LIT_MULT,
             explicit_cmd_off: STATIC_CMD_OFF,
@@ -945,14 +963,10 @@ impl SliceCostModel {
             lit_cost: [88u8; 256],
             copy_cmd_cost: [192u16; 24],
             implicit_d0_cmd_cost: [224u16; 16],
-            dist_cost: [[192u16; LARGE_DIST_ALPHABET_SIZE]; 2],
+            dist_cost,
             ctx_mode: ContextMode::Signed,
-            cmd_stats: (C::COST_MODEL_LEVEL >= 2).then(|| {
-                let mut s = Box::new(CmdCostStats::new_zeroed());
-                s.reset_priors();
-                s
-            }),
-            ctx_lit_cost: (C::COST_MODEL_LEVEL >= 3).then(|| Box::new([[88u8; 256]; 64])),
+            cmd_stats,
+            ctx_lit_cost,
         };
         if C::COST_MODEL_LEVEL >= 2 {
             m.rebuild_cmd_and_dist_tables::<C>();
@@ -1011,7 +1025,7 @@ impl SliceCostModel {
         if self.ctx_mode != crate::metablock::ContextMode::UTF8 {
             return;
         }
-        let Some(ctx_tbl) = self.ctx_lit_cost.as_deref_mut() else {
+        let Some(ctx_tbl) = self.ctx_lit_cost.first_mut() else {
             return;
         };
         let dm = marg_tot.max(1) as u64;
@@ -1037,7 +1051,7 @@ impl SliceCostModel {
     }
 
     pub(crate) fn rebuild_cmd_and_dist_tables<C: MatchConfig>(&mut self) {
-        let Some(stats) = self.cmd_stats.as_ref() else {
+        let Some(stats) = self.cmd_stats.first() else {
             return;
         };
         let log_iac = log2_u64_q5((stats.copy_tot + stats.imp_tot).max(1) as u64);
@@ -1049,11 +1063,15 @@ impl SliceCostModel {
         };
         fill(&stats.copy_counts, &mut self.copy_cmd_cost, 92, 48);
         fill(&stats.imp_d0_counts, &mut self.implicit_d0_cmd_cost, 76, 64);
-        for ctx in 0..usize::from(C::TWO_DIST_CTX) + 1 {
-            let (log_dt, dc, out) = (
+        let dist_cost = &mut self.dist_cost[0];
+        for (ctx, out) in dist_cost
+            .iter_mut()
+            .enumerate()
+            .take(usize::from(C::TWO_DIST_CTX) + 1)
+        {
+            let (log_dt, dc) = (
                 log2_u64_q5(stats.dist_tot[ctx].max(1) as u64),
                 &stats.dist_counts[ctx],
-                &mut self.dist_cost[ctx],
             );
             for (sym, (&cnt, slot)) in dc.iter().zip(out).enumerate() {
                 let eb = ((sym as u32).saturating_sub(14) >> 1) << 5;
@@ -1063,15 +1081,15 @@ impl SliceCostModel {
         }
         self.explicit_cmd_off = (self.copy_cmd_cost[2] as i32 + 128).clamp(288, 448);
         self.implicit_d0_off = self.implicit_d0_cmd_cost[2] as i32;
-        self.d1_off = (self.copy_cmd_cost[2] + self.dist_cost[0][1]) as i32;
-        self.near_rep_off = (self.copy_cmd_cost[2] + self.dist_cost[0][4]) as i32;
+        self.d1_off = (self.copy_cmd_cost[2] + dist_cost[0][1]) as i32;
+        self.near_rep_off = (self.copy_cmd_cost[2] + dist_cost[0][4]) as i32;
     }
 
     pub(crate) fn record_slice_commands<C: MatchConfig>(
         &mut self,
         (ins, copy, dist): (&[u32], &[u32], &[u32]),
     ) {
-        let Some(stats) = self.cmd_stats.as_deref_mut() else {
+        let Some(stats) = self.cmd_stats.first_mut() else {
             return;
         };
         let n = ins.len();
@@ -1201,7 +1219,8 @@ fn tags_shift_match_portable(slot: &mut [u16], tag: u16) -> u32 {
 
 #[cfg(target_arch = "x86_64")]
 #[simd_entry]
-#[inline]
+#[cfg_attr(not(debug_assertions), inline)]
+#[cfg_attr(debug_assertions, inline(never))]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
 fn tags_insert_avx2<const WAYS: usize>(slot: &mut [u16; WAYS], tag: u16, _tok: impl SimdToken) {
     let vt = _mm_set1_epi16(tag as i16);
@@ -1385,7 +1404,8 @@ fn tags_match_ring_neon<const WAYS: usize>(
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 fn shift_tagged_search<const WAYS: usize, S: SimdBackend>(
     simd: S,
     tags: &mut [u16; WAYS],
@@ -1447,7 +1467,8 @@ fn ring_finish_search(
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 fn ring_search<const WAYS: usize, S: SimdBackend>(
     simd: S,
     head: &mut u8,
@@ -1517,7 +1538,8 @@ pub(crate) fn buckets_search_and_insert_portable(
 
 #[cfg(target_arch = "x86_64")]
 #[simd_entry]
-#[inline]
+#[cfg_attr(not(debug_assertions), inline)]
+#[cfg_attr(debug_assertions, inline(never))]
 #[target_feature(enable = "avx2,bmi1,bmi2,lzcnt")]
 pub(crate) fn buckets_insert_avx2<const WAYS: usize>(
     slot: &mut [u32; WAYS],
@@ -1698,7 +1720,8 @@ pub(crate) fn buckets_search_and_insert_neon<const WAYS: usize>(
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 fn buckets_insert<const WAYS: usize, S: SimdBackend>(slot: &mut [u32; WAYS], simd: S, target: u32) {
     if const { WAYS == 1 } {
         slot[0] = target;
@@ -1713,7 +1736,8 @@ fn buckets_insert<const WAYS: usize, S: SimdBackend>(slot: &mut [u32; WAYS], sim
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64", test))]
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 fn buckets_search_and_insert_masked<const WAYS: usize, S: SimdBackend>(
     slot: &mut [u32; WAYS],
     simd: S,
@@ -1841,7 +1865,8 @@ fn eq2_mask32(a0: &[u8; 32], a1: &[u8; 32], b0: u8, b1: u8, _tok: impl SimdToken
 }
 
 /// Returns the smallest `d` in `1..=max_d2.min(pos).min(64)` with `data[pos-d..pos-d+2] == data[pos..pos+2]`, or `u32::MAX`.
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 pub(crate) fn find_closest_2b<S: SimdBackend>(
     simd: S,
     data: &[u8],
@@ -1899,7 +1924,8 @@ fn diff_mask16(a: &[u8; 16], b: &[u8; 16], _tok: impl SimdToken) -> u32 {
     movemask_u8x16_neon(vmvnq_u8(vceqq_u8(vld1q_u8(a), vld1q_u8(b))))
 }
 
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 fn common_prefix_slices_from<const START: usize, S: SimdBackend>(
     simd: S,
     s1: &[u8],
@@ -2108,7 +2134,8 @@ fn extend_match_backward_slow(
     pos - ext
 }
 
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 pub(crate) fn extend_match_backward(
     has_dict: bool,
     data: &[u8],
@@ -2747,7 +2774,7 @@ fn explicit_cmd_dist_q5(
 ) -> i32 {
     let dist_ctx = usize::from(two_dist_ctx && copy_len > 4);
     (*model.copy_cmd_cost.bget(cc)
-        + *model.dist_cost[dist_ctx].bget(fast_dist_sym(dist, use_cache, ld))) as i32
+        + *model.dist_cost[0][dist_ctx].bget(fast_dist_sym(dist, use_cache, ld))) as i32
 }
 
 #[inline(always)]
@@ -2836,7 +2863,7 @@ impl<'a> ProbeCtx<'a> {
         let n = (len as usize).min(8);
         let mut w = self.word64;
         let sum_q4: i32 = match (lvl >= 3 && m.ctx_mode == ContextMode::UTF8)
-            .then_some(m.ctx_lit_cost.as_deref())
+            .then(|| m.ctx_lit_cost.first())
             .flatten()
         {
             Some(ctx_tbl) => {
@@ -2905,7 +2932,8 @@ impl<'a> ProbeCtx<'a> {
         lit_q5 - cmd_q5
     }
 
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    #[cfg_attr(debug_assertions, inline(never))]
     fn cross_dict_len(&self, dist: usize, best_len: u32) -> u32 {
         let (data, dict, pos) = (self.env.data, self.env.active_dict, self.pos);
         if dist <= pos {
@@ -2940,7 +2968,8 @@ impl<'a> ProbeCtx<'a> {
         0
     }
 
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    #[cfg_attr(debug_assertions, inline(never))]
     fn cross_dict_rem_at_cursor<S: SimdBackend>(
         &self,
         simd: S,
@@ -3004,7 +3033,8 @@ impl<'a> ProbeCtx<'a> {
         }
     }
 
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    #[cfg_attr(debug_assertions, inline(never))]
     fn cross_len(&self, has_dict: bool, dist: usize, best_len: u32) -> u32 {
         let (data, pos) = (self.env.data, self.pos);
         if dist == 0 || (!has_dict && dist > pos) {
@@ -3019,7 +3049,8 @@ impl<'a> ProbeCtx<'a> {
         self.cross_dict_len(dist, best_len)
     }
 
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    #[cfg_attr(debug_assertions, inline(never))]
     fn in_win_tail8<S: SimdBackend>(
         &self,
         simd: S,
@@ -3040,7 +3071,8 @@ impl<'a> ProbeCtx<'a> {
         }
     }
 
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    #[cfg_attr(debug_assertions, inline(never))]
     fn lookback_len<S: SimdBackend>(
         &self,
         simd: S,
@@ -3070,7 +3102,8 @@ impl<'a> ProbeCtx<'a> {
         }
     }
 
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    #[cfg_attr(debug_assertions, inline(never))]
     fn scan_main_candidates<S: SimdBackend, C: MatchConfig>(
         &self,
         simd: S,
@@ -3108,7 +3141,8 @@ impl<'a> ProbeCtx<'a> {
         improved
     }
 
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    #[cfg_attr(debug_assertions, inline(never))]
     #[allow(clippy::too_many_arguments)]
     fn scan_raw_dict_candidates<S: SimdBackend, C: MatchConfig>(
         &self,
@@ -3146,7 +3180,8 @@ impl<'a> ProbeCtx<'a> {
         improved
     }
 
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    #[cfg_attr(debug_assertions, inline(never))]
     #[allow(clippy::too_many_arguments)]
     fn scan_dict_candidates<S: SimdBackend, C: MatchConfig>(
         &self,
@@ -3199,7 +3234,8 @@ impl<'a> ProbeCtx<'a> {
         improved
     }
 
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    #[cfg_attr(debug_assertions, inline(never))]
     fn lookup_fast_sd(
         &self,
         sd_tbl: &static_dict::FastDictTable,
@@ -3228,7 +3264,8 @@ impl<'a> ProbeCtx<'a> {
         )
     }
 
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    #[cfg_attr(debug_assertions, inline(never))]
     fn finish_sd(&self, acfg: ArchCfg, best: &mut BestMatch, mut sm: static_dict::StaticDictMatch) {
         let (m, bl, ol) = (self.env.model, sm.base_len as u32, sm.out_len as u32);
         if acfg.lvl >= 2 {
@@ -3241,7 +3278,8 @@ impl<'a> ProbeCtx<'a> {
         }
     }
 
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    #[cfg_attr(debug_assertions, inline(never))]
     fn probe_sd<S: SimdBackend>(
         &self,
         simd: S,
@@ -3284,7 +3322,8 @@ impl<'a> ProbeCtx<'a> {
     }
 }
 
-#[inline(always)]
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
 fn probe_periodic_2b_stride<C: MatchConfig>(ctx: &ProbeCtx<'_>, best: &mut BestMatch) {
     let (data, pos, unm, cbs) = (
         ctx.env.data,
@@ -3492,7 +3531,8 @@ trait InteriorOps<S: SimdBackend> {
     }
     fn insert_ht4(&mut self, simd: S, p32: u32, vpos: u32);
 
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    #[cfg_attr(debug_assertions, inline(never))]
     fn insert_positions(
         &mut self,
         simd: S,
@@ -3649,7 +3689,8 @@ impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize, S: SimdBacken
         }
     }
 
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    #[cfg_attr(debug_assertions, inline(never))]
     fn insert_main(&mut self, simd: S, p64: u64, vpos: u32, sec_hash: u32) {
         if const { POS_BITS == 31 } {
             if const { WAYS >= 32 } {
@@ -3683,7 +3724,8 @@ impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize, S: SimdBacken
         }
     }
 
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    #[cfg_attr(debug_assertions, inline(never))]
     fn search_main(
         &mut self,
         simd: S,
@@ -3748,7 +3790,8 @@ impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize, S: SimdBacken
         }
     }
 
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    #[cfg_attr(debug_assertions, inline(never))]
     fn search_ht4(
         &mut self,
         simd: S,
@@ -3784,7 +3827,8 @@ impl<const POS_BITS: u8, const WAYS: usize, const HT4_WAYS: usize, S: SimdBacken
         }
     }
 
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    #[cfg_attr(debug_assertions, inline(never))]
     fn insert_ht4(&mut self, simd: S, p32: u32, vpos: u32) {
         let sec = p32 << (self.ht4_near.log() & 31);
         if const { POS_BITS == 31 } {
@@ -3986,7 +4030,7 @@ pub(crate) struct HashTable {
     pub(crate) heads: DirtyBuf<u8>,
     pub(crate) ht4_near: DirtyBuf<u32>,
     pub(crate) ht4_tags: DirtyBuf<u16>,
-    pub(crate) ht3: Option<Box<[u32; HT3_SIZE]>>,
+    pub(crate) ht3: HugePageBuf<u32>,
     pub(crate) ldm: Option<FastLdmTable>,
     pub(crate) log: u32,
     pub(crate) ht4_log: u32,
@@ -4001,7 +4045,7 @@ pub(crate) struct HashTable {
 impl InteriorOps<Scalar> for HashTable {
     #[inline(always)]
     fn step_ht3(&mut self, _: Scalar, word64: u64, vpos: u32) -> u32 {
-        let Some(t3) = self.ht3.as_deref_mut() else {
+        let Some(t3) = self.ht3.first_chunk_mut::<HT3_SIZE>() else {
             return 0;
         };
         std::mem::replace(t3.bget_mut(compute_hash3(word64)), vpos)
@@ -4016,7 +4060,8 @@ impl InteriorOps<Scalar> for HashTable {
     ) {
     }
 
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    #[cfg_attr(debug_assertions, inline(never))]
     fn insert_main(&mut self, _: Scalar, p64: u64, vpos: u32, sec_hash: u32) {
         let idx = (p64 >> ((64 - self.log) & 63)) as usize;
         scalar_insert_row(
@@ -4028,7 +4073,8 @@ impl InteriorOps<Scalar> for HashTable {
         );
     }
 
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    #[cfg_attr(debug_assertions, inline(never))]
     fn search_main(
         &mut self,
         _: Scalar,
@@ -4049,7 +4095,8 @@ impl InteriorOps<Scalar> for HashTable {
         )
     }
 
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    #[cfg_attr(debug_assertions, inline(never))]
     fn search_ht4(
         &mut self,
         _: Scalar,
@@ -4072,7 +4119,8 @@ impl InteriorOps<Scalar> for HashTable {
         )
     }
 
-    #[inline(always)]
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    #[cfg_attr(debug_assertions, inline(never))]
     fn insert_ht4(&mut self, _: Scalar, p32: u32, vpos: u32) {
         let (idx, sec) = (
             (p32 >> ((32 - self.ht4_log) & 31)) as usize,
@@ -4096,7 +4144,7 @@ impl HashTable {
             heads: DirtyBuf::new(),
             ht4_near: DirtyBuf::new(),
             ht4_tags: DirtyBuf::new(),
-            ht3: None,
+            ht3: HugePageBuf::new(),
             ldm: None,
             log: 0,
             ht4_log: 0,
@@ -4116,15 +4164,20 @@ impl HashTable {
         ht
     }
 
+    pub(crate) fn ensure_ht3(&mut self) -> &mut [u32; HT3_SIZE] {
+        self.ht3
+            .resize_or_grow_zeroed(HT3_SIZE)
+            .first_chunk_mut::<HT3_SIZE>()
+            .unwrap()
+    }
+
     fn clear_dirty_buffers(&mut self) {
         self.table.clear_dirty();
         self.tags.clear_dirty();
         self.heads.clear_dirty();
         self.ht4_near.clear_dirty();
         self.ht4_tags.clear_dirty();
-        if let Some(t3) = self.ht3.as_deref_mut() {
-            t3.fill(0);
-        }
+        self.ht3.fill(0);
         if let Some(ldm) = self.ldm.as_mut() {
             ldm.clear();
         }
@@ -4239,7 +4292,7 @@ impl HashTable {
             (None, None, None)
         };
         let ht3 = if use_3b {
-            Some(self.ht3.as_deref_mut()?)
+            Some(self.ht3.first_chunk_mut::<HT3_SIZE>()?)
         } else {
             None
         };
@@ -4331,7 +4384,7 @@ impl HashTable {
             }
         }
         if seed_ht3 && d_len >= 3 {
-            let t3 = self.ht3.get_or_insert_with(|| Box::new([0u32; HT3_SIZE]));
+            let t3 = self.ensure_ht3();
             for off in d_len.saturating_sub(HT3_MAX_DIST as usize)..=d_len - 3 {
                 *t3.bget_mut(compute_hash3(load_word64_padded(&ad[off..]))) = (dv + off) as u32;
             }
@@ -4413,11 +4466,10 @@ impl HashTable {
             self.heads.overwrite_from(&snap.heads);
             self.ht4_near.overwrite_from(&snap.ht4_near);
             self.ht4_tags.overwrite_from(&snap.ht4_tags);
-            if let Some(s_ht3) = snap.ht3.as_deref() {
-                let t3 = self.ht3.get_or_insert_with(|| Box::new([0u32; HT3_SIZE]));
-                t3.copy_from_slice(s_ht3);
-            } else if let Some(t3) = self.ht3.as_deref_mut() {
-                t3.fill(0);
+            if !snap.ht3.is_empty() {
+                self.ensure_ht3().copy_from_slice(&snap.ht3);
+            } else {
+                self.ht3.fill(0);
             }
             self.dirty = true;
             (self.next_vpos, self.max_vpos_used) = (snap.end_vpos, snap.end_vpos);
@@ -4454,9 +4506,7 @@ impl HashTable {
                         shift_back_u32(self.ht4_near.dirty_mut(), pm, s32);
                     }
                 }
-                if let Some(t3) = self.ht3.as_deref_mut() {
-                    t3.iter_mut().for_each(|s| *s = s.saturating_sub(s32));
-                }
+                self.ht3.iter_mut().for_each(|s| *s = s.saturating_sub(s32));
                 if let Some(ldm) = self.ldm.as_mut() {
                     ldm.shift_back(s32);
                 }
@@ -4465,6 +4515,76 @@ impl HashTable {
             }
         }
     }
+}
+
+#[cfg_attr(not(debug_assertions), inline(always))]
+#[cfg_attr(debug_assertions, inline(never))]
+#[allow(clippy::too_many_arguments)]
+fn probe_rep_slot<C: MatchConfig, S: SimdBackend>(
+    simd: S,
+    pctx: &ProbeCtx<'_>,
+    at_pos: BoundedPrefixCursor<'_, u8, 16>,
+    word64: u64,
+    (k, rep_dist): (usize, u32),
+    (hl, allow_sub4, has_dict, unm_zero): (bool, bool, bool, bool),
+    (max_valid_dist, nice_len, acfg): (usize, u32, ArchCfg),
+    best: &mut BestMatch,
+    best_is_rep: &mut bool,
+) -> bool {
+    let pos = pctx.pos;
+    let sub_min = if (k <= 1 && C::USE_3B_TABLE) || (has_dict && (rep_dist as usize) > pos) {
+        2
+    } else {
+        3
+    };
+    if !(k == 0 && pos == pctx.anchor && !hl)
+        && rep_dist != 0
+        && (rep_dist as usize) <= max_valid_dist
+    {
+        let (du, rep_bl) = (
+            rep_dist as usize,
+            if C::FAST_MATCHING { best.len } else { 0 },
+        );
+        let mlen = if let Some(c16) = at_pos.lookback(du) {
+            let d32 = u32::from_le_bytes(*c16.first_chunk::<4>().unwrap()) ^ (word64 as u32);
+            if d32 != 0 {
+                if allow_sub4 {
+                    d32.trailing_zeros() >> 3
+                } else {
+                    0
+                }
+            } else {
+                let d_hi = u32::from_le_bytes(*c16[4..8].first_chunk::<4>().unwrap())
+                    ^ ((word64 >> 32) as u32);
+                if d_hi != 0 {
+                    4 + (d_hi.trailing_zeros() >> 3)
+                } else {
+                    pctx.in_win_tail8(simd, at_pos, c16, du, rep_bl)
+                }
+            }
+        } else if has_dict && du > pos {
+            pctx.cross_dict_rem_at_cursor(
+                simd,
+                at_pos,
+                du - pos,
+                rep_bl,
+                if allow_sub4 { 2 } else { 4 },
+            )
+        } else {
+            0
+        };
+        if mlen >= 4 {
+            if best.try_lz(mlen, mlen, rep_dist, pctx, acfg) {
+                *best_is_rep = true;
+                if mlen >= nice_len {
+                    return true;
+                }
+            }
+        } else if allow_sub4 && mlen >= sub_min {
+            best.try_sub4::<C>(mlen, sub_min, unm_zero, rep_dist, pctx, acfg);
+        }
+    }
+    false
 }
 
 macro_rules! def_parse_slice_interior {
@@ -4678,63 +4798,19 @@ def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| 
             'rep: {
                 macro_rules! probe_rep {
                     ($k:literal) => {{
-                        let rep_dist = last_distances[$k];
-                        let sub_min = if ($k <= 1 && C::USE_3B_TABLE)
-                            || (has_dict && (rep_dist as usize) > pos)
-                        {
-                            2
-                        } else {
-                            3
-                        };
-                        if !($k == 0 && pos == anchor && !hl)
-                            && rep_dist != 0
-                            && (rep_dist as usize) <= max_valid_dist
-                        {
-                            let (du, rep_bl) = (
-                                rep_dist as usize,
-                                if C::FAST_MATCHING { best.len } else { 0 },
-                            );
-                            let mlen = if let Some(c16) = at_pos.lookback(du) {
-                                let d32 = u32::from_le_bytes(*c16.first_chunk::<4>().unwrap())
-                                    ^ (word64 as u32);
-                                if d32 != 0 {
-                                    if allow_sub4 {
-                                        d32.trailing_zeros() >> 3
-                                    } else {
-                                        0
-                                    }
-                                } else {
-                                    let d_hi =
-                                        u32::from_le_bytes(*c16[4..8].first_chunk::<4>().unwrap())
-                                            ^ ((word64 >> 32) as u32);
-                                    if d_hi != 0 {
-                                        4 + (d_hi.trailing_zeros() >> 3)
-                                    } else {
-                                        pctx.in_win_tail8(simd, at_pos, c16, du, rep_bl)
-                                    }
-                                }
-                            } else if has_dict && du > pos {
-                                pctx.cross_dict_rem_at_cursor(
-                                    simd,
-                                    at_pos,
-                                    du - pos,
-                                    rep_bl,
-                                    if allow_sub4 { 2 } else { 4 },
-                                )
-                            } else {
-                                0
-                            };
-                            if mlen >= 4 {
-                                if best.try_lz(mlen, mlen, rep_dist, &pctx, acfg) {
-                                    best_is_rep = true;
-                                    if mlen >= nice_len {
-                                        mask = 0;
-                                        break 'rep;
-                                    }
-                                }
-                            } else if allow_sub4 && mlen >= sub_min {
-                                best.try_sub4::<C>(mlen, sub_min, unm == 0, rep_dist, &pctx, acfg);
-                            }
+                        if probe_rep_slot::<C, _>(
+                            simd,
+                            &pctx,
+                            at_pos,
+                            word64,
+                            ($k, last_distances[$k]),
+                            (hl, allow_sub4, has_dict, unm == 0),
+                            (max_valid_dist, nice_len, acfg),
+                            &mut best,
+                            &mut best_is_rep,
+                        ) {
+                            mask = 0;
+                            break 'rep;
                         }
                     }};
                 }
@@ -5304,7 +5380,7 @@ impl HashTable {
         );
         self.ensure_ht4_near();
         if const { C::USE_3B_TABLE } {
-            let _ = self.ht3.get_or_insert_with(|| Box::new([0u32; HT3_SIZE]));
+            let _ = self.ensure_ht3();
         }
         let (interior_end, vpos_base) = (
             target_end.min(data_len.saturating_sub(INTERIOR_MARGIN)),

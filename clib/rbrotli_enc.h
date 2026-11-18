@@ -147,6 +147,27 @@ size_t RBrotliEncMaxRequiredSize(const RBrotliEncoder *encoder, size_t in_size);
 void RBrotliEncFreeEncoder(RBrotliEncoder *encoder);
 
 /**
+ * Reconfigures the LZ77 sliding window (`lgwin` clamped to `10..=30`, `0` selects `24`) for
+ * subsequent [`RBrotliEncCompress`] / [`RBrotliEncCompressWithDict`] calls while retaining
+ * allocated buffers and advancing hash-table virtual positions without re-zeroing across
+ * standard windows.
+ *
+ * # Safety
+ * If non-null, `encoder` must be a live `RBrotliEncMakeEncoder*` pointer with exclusive access.
+ */
+void RBrotliEncSetLgwin(RBrotliEncoder *encoder, uint32_t lgwin);
+
+/**
+ * Shrinks or frees `encoder`'s internal output buffer when its capacity exceeds
+ * `max_retained_bytes` (`0` releases it completely), invalidating any prior `*out_data == NULL`
+ * pointer returned by `encoder`.
+ *
+ * # Safety
+ * If non-null, `encoder` must be a live `RBrotliEncMakeEncoder*` pointer with exclusive access.
+ */
+void RBrotliEncTrimScratch(RBrotliEncoder *encoder, size_t max_retained_bytes);
+
+/**
  * Creates a new streaming encoder for `quality` (`lgwin = 24`, 1 thread).
  */
 RBrotliStreamingEncoder *RBrotliEncMakeStreamingEncoder(uint32_t quality);

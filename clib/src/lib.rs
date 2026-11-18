@@ -309,6 +309,39 @@ pub unsafe extern "C" fn RBrotliEncFreeEncoder(encoder: *mut RBrotliEncoder) {
     unsafe { free_boxed(encoder) };
 }
 
+/// Reconfigures the LZ77 sliding window (`lgwin` clamped to `10..=30`, `0` selects `24`) for
+/// subsequent [`RBrotliEncCompress`] / [`RBrotliEncCompressWithDict`] calls while retaining
+/// allocated buffers and advancing hash-table virtual positions without re-zeroing across
+/// standard windows.
+///
+/// # Safety
+/// If non-null, `encoder` must be a live `RBrotliEncMakeEncoder*` pointer with exclusive access.
+#[no_mangle]
+pub unsafe extern "C" fn RBrotliEncSetLgwin(encoder: *mut RBrotliEncoder, lgwin: u32) {
+    let lgwin = if lgwin == 0 { 24 } else { lgwin };
+    // SAFETY: caller guarantees exclusive `encoder` validity when non-null.
+    if let Some(enc) = unsafe { ptr_mut(encoder) } {
+        enc.0.set_lgwin(lgwin);
+    }
+}
+
+/// Shrinks or frees `encoder`'s internal output buffer when its capacity exceeds
+/// `max_retained_bytes` (`0` releases it completely), invalidating any prior `*out_data == NULL`
+/// pointer returned by `encoder`.
+///
+/// # Safety
+/// If non-null, `encoder` must be a live `RBrotliEncMakeEncoder*` pointer with exclusive access.
+#[no_mangle]
+pub unsafe extern "C" fn RBrotliEncTrimScratch(
+    encoder: *mut RBrotliEncoder,
+    max_retained_bytes: usize,
+) {
+    // SAFETY: caller guarantees exclusive `encoder` validity when non-null.
+    if let Some(enc) = unsafe { ptr_mut(encoder) } {
+        enc.0.trim_scratch(max_retained_bytes);
+    }
+}
+
 /// Creates a new streaming encoder for `quality` (`lgwin = 24`, 1 thread).
 #[no_mangle]
 pub extern "C" fn RBrotliEncMakeStreamingEncoder(quality: u32) -> *mut RBrotliStreamingEncoder {
@@ -921,9 +954,57 @@ mod test {
             .join()
             .unwrap();
 
+            // 8. Null guards and `RBrotliEncSetLgwin` / `RBrotliEncTrimScratch` roundtrip reuse.
+            let prose = b"Information about international government policy and university research! Information about international government policy!";
+            RBrotliEncSetLgwin(ptr::null_mut(), 22);
+            RBrotliEncTrimScratch(ptr::null_mut(), 0);
+            RBrotliEncSetLgwin(enc, 10);
+            assert!(compress_len(enc, ptr::null(), &rep) < rep.len());
+            RBrotliEncSetLgwin(enc, 0);
+            assert!(compress_len(enc, ptr::null(), prose) < prose.len());
+            RBrotliEncSetLgwin(enc, 26);
+            assert!(compress_len(enc, ptr::null(), prose) < prose.len());
+            RBrotliEncTrimScratch(enc, 64);
+            assert!(compress_len(enc, ptr::null(), &rep) < rep.len());
+            RBrotliEncTrimScratch(enc, 0);
+            assert!(compress_len(enc, ptr::null(), &rep) < rep.len());
+
             RBrotliEncFreeDictionary(dict0);
             RBrotliEncFreeStreamingEncoder(stream);
             RBrotliEncFreeEncoder(enc);
         }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_c_ffi_64k_fiber_stack() {
+        let stack_bytes = if cfg!(debug_assertions) {
+            128 * 1024
+        } else {
+            64 * 1024
+        };
+        std::thread::Builder::new()
+            .name("ffi_fiber_64k".into())
+            .stack_size(stack_bytes)
+            .spawn(|| {
+                let payload = b"Fiber 64KiB stack C FFI payload with UTF-8 prose! ".repeat(800);
+                for q in [0u32, 1, 5, 9, 11] {
+                    let enc = RBrotliEncMakeEncoderWithParams(q, 22, 1);
+                    assert!(!enc.is_null());
+                    // SAFETY: `enc` and `payload` are valid; all out pointers are initialized.
+                    unsafe {
+                        let c1 = compress_len(enc, ptr::null(), &payload);
+                        assert!(c1 < payload.len());
+                        RBrotliEncSetLgwin(enc, 24);
+                        let c2 = compress_len(enc, ptr::null(), &payload);
+                        assert!(c2 < payload.len());
+                        RBrotliEncTrimScratch(enc, 0);
+                        RBrotliEncFreeEncoder(enc);
+                    }
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }
