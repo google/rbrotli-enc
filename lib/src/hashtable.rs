@@ -935,24 +935,8 @@ pub(crate) struct SliceCostModel {
 }
 
 impl SliceCostModel {
-    pub(crate) fn new_for_config<C: MatchConfig>() -> Self {
-        let mut dist_cost = HugePageBuf::<[[u16; LARGE_DIST_ALPHABET_SIZE]; 2]>::new_zeroed(1);
-        dist_cost[0].as_flattened_mut().fill(192);
-        let cmd_stats = if C::COST_MODEL_LEVEL >= 2 {
-            let mut s = HugePageBuf::<CmdCostStats>::new_zeroed(1);
-            s[0].reset_priors();
-            s
-        } else {
-            HugePageBuf::new()
-        };
-        let ctx_lit_cost = if C::COST_MODEL_LEVEL >= 3 {
-            let mut c = HugePageBuf::<[[u8; 256]; 64]>::new_zeroed(1);
-            c[0].as_flattened_mut().fill(88);
-            c
-        } else {
-            HugePageBuf::new()
-        };
-        let mut m = SliceCostModel {
+    pub(crate) fn new_empty() -> Self {
+        Self {
             lit_mult: STATIC_LIT_MULT,
             explicit_cmd_off: STATIC_CMD_OFF,
             implicit_d0_off: 216,
@@ -963,15 +947,35 @@ impl SliceCostModel {
             lit_cost: [88u8; 256],
             copy_cmd_cost: [192u16; 24],
             implicit_d0_cmd_cost: [224u16; 16],
-            dist_cost,
+            dist_cost: HugePageBuf::new(),
             ctx_mode: ContextMode::Signed,
-            cmd_stats,
-            ctx_lit_cost,
-        };
-        if C::COST_MODEL_LEVEL >= 2 {
-            m.rebuild_cmd_and_dist_tables::<C>();
+            cmd_stats: HugePageBuf::new(),
+            ctx_lit_cost: HugePageBuf::new(),
         }
-        m
+    }
+
+    pub(crate) fn ensure_for_config<C: MatchConfig>(&mut self) {
+        if self.dist_cost.is_empty() {
+            self.dist_cost.resize_or_grow_zeroed(1);
+            self.dist_cost[0].as_flattened_mut().fill(192);
+        }
+        if C::COST_MODEL_LEVEL >= 2 && self.cmd_stats.is_empty() {
+            self.cmd_stats.resize_or_grow_zeroed(1)[0].reset_priors();
+        }
+        if C::COST_MODEL_LEVEL >= 3 && self.ctx_lit_cost.is_empty() {
+            self.ctx_lit_cost
+                .resize_or_grow_zeroed(1)
+                .as_flattened_mut()
+                .fill([88; 256]);
+        }
+        if C::COST_MODEL_LEVEL >= 2 {
+            self.rebuild_cmd_and_dist_tables::<C>();
+        } else {
+            self.explicit_cmd_off = STATIC_CMD_OFF;
+            self.implicit_d0_off = 216;
+            self.d1_off = 304;
+            self.near_rep_off = 352;
+        }
     }
 
     #[inline]
@@ -4201,8 +4205,7 @@ impl HashTable {
         assert!(matches!(ways, 1 | 4 | 8 | 16 | 32) && matches!(ht4_ways, 1 | 4));
         if self.dirty
             && (self.pos_bits != pos_bits
-                || self.ht4_ways != ht4_ways
-                || (pos_bits == 31 && self.ways != ways))
+                || (pos_bits == 31 && (self.ways != ways || self.ht4_ways != ht4_ways)))
         {
             self.clear_dirty_buffers();
         }
@@ -5075,16 +5078,24 @@ def_parse_slice_interior!(|ht, simd: S, large_window, has_dict, env, state, md| 
 
         if pos < sd_pos_limit {
             if const { C::COST_MODEL_LEVEL <= 1 } {
-                if !hl && best.len <= 4 && unm < 4096 {
-                    if let Some(sd_tbl) = fast_sd {
-                        if let Some(sm) = pctx.lookup_fast_sd(
-                            sd_tbl,
-                            p32,
-                            d_full_len,
-                            large_window,
-                            at_pos.sub_array::<4, 8>(),
-                        ) {
-                            pctx.finish_sd(acfg, &mut best, sm);
+                if !hl && best.len <= 4 {
+                    if const { C::MULTI_CONTEXT }
+                        && !has_dict
+                        && data.len() <= 8_192
+                        && pos.saturating_add(stream_base) < 2_048
+                    {
+                        pctx.probe_sd(simd, acfg, &mut best, true, large_window, false);
+                    } else if unm < 4096 {
+                        if let Some(sd_tbl) = fast_sd {
+                            if let Some(sm) = pctx.lookup_fast_sd(
+                                sd_tbl,
+                                p32,
+                                d_full_len,
+                                large_window,
+                                at_pos.sub_array::<4, 8>(),
+                            ) {
+                                pctx.finish_sd(acfg, &mut best, sm);
+                            }
                         }
                     }
                 }

@@ -192,6 +192,14 @@ impl Q11Encoder {
         self.large_window = large_window;
     }
 
+    pub(crate) fn set_quality(&mut self, quality: u32) {
+        let effort = quality.clamp(10, 12) as u8;
+        if effort >= 11 && !self.large_window {
+            crate::static_dict::warm_dict121();
+        }
+        self.effort = effort;
+    }
+
     #[inline]
     pub(crate) fn max_output_size(&self, input_len: usize) -> usize {
         input_len.saturating_mul(2).saturating_add(1024 + 64)

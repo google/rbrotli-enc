@@ -284,6 +284,65 @@ pub unsafe extern "C" fn RBrotliEncCompressWithDict(
     .is_some()
 }
 
+/// Compresses `len` bytes at `data` in one shot using a reusable thread-local encoder configured
+/// for `(quality, lgwin)` and optional `dict` (`NULL` = no dictionary; `lgwin == 0` selects `24`).
+///
+/// Writes into caller-provided `out_data` with entry capacity `*out_len` and stores the
+/// compressed byte count into `*out_len`. Returns `false` on invalid arguments or if `*out_len`
+/// is smaller than the compressed output.
+///
+/// # Safety
+/// - If non-null, `dict` must be a live `RBrotliEncMakeDictionary` pointer with shared read access.
+/// - If `len > 0`, `data` must point to `len` initialized readable bytes for this call.
+/// - `out_len` must be non-null, aligned, writable, initialized with the byte capacity `*out_len`
+///   of `out_data`, and must not alias `dict` or `data`.
+/// - `out_data` must be non-null and point to `*out_len` writable bytes that do not alias `dict`,
+///   `data`, or `out_len`.
+#[no_mangle]
+pub unsafe extern "C" fn RBrotliEncCompressOneShot(
+    quality: u32,
+    lgwin: u32,
+    dict: *const RBrotliDictionary,
+    data: *const u8,
+    len: usize,
+    out_data: *mut MaybeUninit<u8>,
+    out_len: *mut usize,
+) -> bool {
+    (|| {
+        if out_data.is_null()
+            || out_len.is_null()
+            || !out_len.is_aligned()
+            || (!dict.is_null() && !dict.is_aligned())
+        {
+            return None;
+        }
+        let lgwin = if lgwin == 0 { 24 } else { lgwin };
+        // SAFETY: caller guarantees initialized `data` of `len` bytes when `len > 0`.
+        let slice = unsafe { raw_slice(data, len)? };
+        // SAFETY: `out_len` is non-null, aligned, and initialized with `out_data` capacity.
+        let cap = unsafe { out_len.read() };
+        // SAFETY: `out_data` is non-null and caller guarantees `cap` writable bytes.
+        let out_buf = unsafe { raw_mut_slice(out_data, cap)? };
+        // SAFETY: caller guarantees shared validity of non-null `dict` for this call.
+        let dict_opt = unsafe { dict.as_ref() };
+        let written =
+            rbrotli_enc_lib::Encoder::compress_into_tls(quality, lgwin, slice, dict_opt, out_buf)?
+                .len();
+        // SAFETY: `out_len` is non-null, aligned, and valid for writes.
+        unsafe { out_len.write(written) };
+        Some(())
+    })()
+    .is_some()
+}
+
+/// Upper bound on compressed byte count for `in_size` input bytes at `quality` (saturates to
+/// `SIZE_MAX` on overflow; one-shot compression returns `false` when this bound exceeds
+/// `SSIZE_MAX`).
+#[no_mangle]
+pub extern "C" fn RBrotliEncMaxRequiredSizeForParams(quality: u32, in_size: usize) -> usize {
+    rbrotli_enc_lib::Encoder::max_required_size_for(quality, in_size)
+}
+
 /// Upper bound on compressed byte count for `in_size` input bytes (returns `0` if `encoder` is
 /// null, and saturates to `SIZE_MAX` on overflow; one-shot `RBrotliEncCompress*` returns `false`
 /// when this bound exceeds `SSIZE_MAX`).
@@ -307,6 +366,19 @@ pub unsafe extern "C" fn RBrotliEncMaxRequiredSize(
 pub unsafe extern "C" fn RBrotliEncFreeEncoder(encoder: *mut RBrotliEncoder) {
     // SAFETY: caller guarantees non-null `encoder` came from `RBrotliEncMakeEncoder*` and is freed once.
     unsafe { free_boxed(encoder) };
+}
+
+/// Reconfigures `quality` (`0..=12`) on `encoder` while retaining allocated hash tables, scratch
+/// buffers, and internal output storage across subsequent calls.
+///
+/// # Safety
+/// If non-null, `encoder` must be a live `RBrotliEncMakeEncoder*` pointer with exclusive access.
+#[no_mangle]
+pub unsafe extern "C" fn RBrotliEncSetQuality(encoder: *mut RBrotliEncoder, quality: u32) {
+    // SAFETY: caller guarantees exclusive `encoder` validity when non-null.
+    if let Some(enc) = unsafe { ptr_mut(encoder) } {
+        enc.0.set_quality(quality);
+    }
 }
 
 /// Reconfigures the LZ77 sliding window (`lgwin` clamped to `10..=30`, `0` selects `24`) for
@@ -954,16 +1026,149 @@ mod test {
             .join()
             .unwrap();
 
-            // 8. Null guards and `RBrotliEncSetLgwin` / `RBrotliEncTrimScratch` roundtrip reuse.
+            // 8. Null guards and `RBrotliEncSetLgwin` / `RBrotliEncSetQuality` /
+            // `RBrotliEncMaxRequiredSizeForParams` / `RBrotliEncCompressOneShot` / `RBrotliEncTrimScratch`.
             let prose = b"Information about international government policy and university research! Information about international government policy!";
+            RBrotliEncSetQuality(ptr::null_mut(), 5);
             RBrotliEncSetLgwin(ptr::null_mut(), 22);
             RBrotliEncTrimScratch(ptr::null_mut(), 0);
+            assert_eq!(
+                RBrotliEncMaxRequiredSizeForParams(5, 1024),
+                RBrotliEncMaxRequiredSize(enc, 1024)
+            );
+            assert_eq!(
+                RBrotliEncMaxRequiredSizeForParams(11, usize::MAX),
+                usize::MAX
+            );
             RBrotliEncSetLgwin(enc, 10);
             assert!(compress_len(enc, ptr::null(), &rep) < rep.len());
             RBrotliEncSetLgwin(enc, 0);
             assert!(compress_len(enc, ptr::null(), prose) < prose.len());
             RBrotliEncSetLgwin(enc, 26);
             assert!(compress_len(enc, ptr::null(), prose) < prose.len());
+            for &q_sw in miri_qs() {
+                RBrotliEncSetQuality(enc, q_sw);
+                assert_eq!(
+                    RBrotliEncMaxRequiredSizeForParams(q_sw, prose.len()),
+                    RBrotliEncMaxRequiredSize(enc, prose.len())
+                );
+                let mut out_ptr: *mut MaybeUninit<u8> = ptr::null_mut();
+                let mut out_len = 0usize;
+                assert!(RBrotliEncCompress(
+                    enc,
+                    prose.as_ptr(),
+                    prose.len(),
+                    &mut out_ptr,
+                    &mut out_len,
+                ));
+                let streamed = std::slice::from_raw_parts(out_ptr as *const u8, out_len).to_vec();
+                assert_eq!(decompress(&streamed, &[]), prose);
+
+                let cap = RBrotliEncMaxRequiredSizeForParams(q_sw, prose.len());
+                let mut tls_buf = vec![MaybeUninit::<u8>::uninit(); cap];
+                let mut tls_len = cap;
+                assert!(RBrotliEncCompressOneShot(
+                    q_sw,
+                    26,
+                    ptr::null(),
+                    prose.as_ptr(),
+                    prose.len(),
+                    tls_buf.as_mut_ptr(),
+                    &mut tls_len,
+                ));
+                let tls_bytes = tls_buf[..tls_len]
+                    .iter()
+                    .map(|b| b.assume_init())
+                    .collect::<Vec<_>>();
+                assert_eq!(tls_bytes, streamed);
+            }
+            // One-shot TLS with dictionary, lgwin=0, empty input, and error guards.
+            let mut out = vec![
+                MaybeUninit::<u8>::uninit();
+                RBrotliEncMaxRequiredSizeForParams(9, prose.len().max(prefix.len()))
+            ];
+            let mut empty_len = out.len();
+            assert!(RBrotliEncCompressOneShot(
+                1,
+                0,
+                ptr::null(),
+                ptr::null(),
+                0,
+                out.as_mut_ptr(),
+                &mut empty_len,
+            ));
+            assert_eq!(
+                decompress(
+                    &out[..empty_len]
+                        .iter()
+                        .map(|b| b.assume_init())
+                        .collect::<Vec<_>>(),
+                    &[],
+                ),
+                b""
+            );
+            let mut d_len = out.len();
+            assert!(RBrotliEncCompressOneShot(
+                0,
+                0,
+                dict0,
+                prefix.as_ptr(),
+                prefix.len(),
+                out.as_mut_ptr(),
+                &mut d_len,
+            ));
+            let d_out = out[..d_len]
+                .iter()
+                .map(|b| b.assume_init())
+                .collect::<Vec<_>>();
+            assert_eq!(decompress(&d_out, &big_dict), prefix);
+            assert!(!RBrotliEncCompressOneShot(
+                5,
+                22,
+                ptr::null(),
+                prose.as_ptr(),
+                prose.len(),
+                ptr::null_mut(),
+                &mut d_len,
+            ));
+            assert!(!RBrotliEncCompressOneShot(
+                5,
+                22,
+                ptr::null(),
+                prose.as_ptr(),
+                prose.len(),
+                out.as_mut_ptr(),
+                ptr::null_mut(),
+            ));
+            assert!(!RBrotliEncCompressOneShot(
+                5,
+                22,
+                ptr::null(),
+                ptr::null(),
+                prose.len(),
+                out.as_mut_ptr(),
+                &mut d_len,
+            ));
+            let unaligned_dict = dict0.wrapping_byte_add(1);
+            assert!(!RBrotliEncCompressOneShot(
+                5,
+                22,
+                unaligned_dict,
+                prose.as_ptr(),
+                prose.len(),
+                out.as_mut_ptr(),
+                &mut d_len,
+            ));
+            let mut tiny_len = 1usize;
+            assert!(!RBrotliEncCompressOneShot(
+                5,
+                22,
+                ptr::null(),
+                prose.as_ptr(),
+                prose.len(),
+                out.as_mut_ptr(),
+                &mut tiny_len,
+            ));
             RBrotliEncTrimScratch(enc, 64);
             assert!(compress_len(enc, ptr::null(), &rep) < rep.len());
             RBrotliEncTrimScratch(enc, 0);
@@ -972,6 +1177,15 @@ mod test {
             RBrotliEncFreeDictionary(dict0);
             RBrotliEncFreeStreamingEncoder(stream);
             RBrotliEncFreeEncoder(enc);
+        }
+    }
+
+    #[inline]
+    const fn miri_qs() -> &'static [u32] {
+        if cfg!(miri) {
+            &[0, 5]
+        } else {
+            &[0, 1, 5, 9]
         }
     }
 
