@@ -13,12 +13,13 @@
 // limitations under the License.
 
 use crate::{
-    block_split::{select_distance_params_from_samples, try_plan_metablock, PlanOpts},
+    block_split::{select_distance_params_from_samples_with_scratch, try_plan_metablock, PlanOpts},
     constants::*,
     context::{self, LiteralHistogram},
     fast_onepass::{
-        compress_fast_with_simd, fast_twopass_checked_max_output_size_for, FastTwoPassEncoder,
-        OnePassEncoder, FAST_TWOPASS_CHUNK_SIZE, ONEPASS_CHUNK_SIZE,
+        compress_fast_with_simd, fast_twopass_checked_max_output_size_for, FastTwoPassCore,
+        FastTwoPassEncoder, OnePassCore, OnePassEncoder, FAST_TWOPASS_CHUNK_SIZE,
+        ONEPASS_CHUNK_SIZE,
     },
     hashtable::{
         ArchQ3, ArchQ35, ArchQ4, ArchQ56, ArchQ78, ArchQ9, HashTable, MatchConfig,
@@ -39,7 +40,7 @@ use crate::{
         DIST_MODE_STATIC_DICT,
     },
     q11::{Q11Encoder, Q11StreamBackend},
-    stream::{ChunkStreamBackend, ChunkStreamEncoder, StreamEngine, StreamOp},
+    stream::{ChunkStreamBackend, StreamEngine, StreamOp},
 };
 use bounded_utils::{BoundedArrayExt, BoundedPrefix, BoundedUsize, Pow2SliceMut};
 use hugepage_buffer::HugePageBuf;
@@ -105,6 +106,9 @@ struct HistogramBuffers {
     ctx_hists: Option<Box<CtxHists>>,
     ctx_rank: context::CtxRankScratch,
     dist_samples: Vec<(u8, u32)>,
+    cluster_scratch: context::ClusterScratch,
+    regime_wins: HugePageBuf<LiteralHistogram>,
+    multi_cmds: Vec<OptimalCommand>,
 }
 
 impl HistogramBuffers {
@@ -116,6 +120,9 @@ impl HistogramBuffers {
             ctx_hists: None,
             ctx_rank: context::CtxRankScratch::new(),
             dist_samples: Vec::new(),
+            cluster_scratch: context::ClusterScratch::default(),
+            regime_wins: HugePageBuf::new(),
+            multi_cmds: Vec::new(),
         }
     }
 
@@ -266,11 +273,16 @@ fn choose_ctx_mode_for<C: MatchConfig>(
     data: &[u8],
 ) -> ContextMode {
     if C::MULTI_CONTEXT {
-        context::choose_context_mode_modes_with(
-            scratch,
-            &data[..data.len().min(SLICE_SIZE)],
-            &[ContextMode::UTF8, ContextMode::Signed],
-        )
+        let sub = &data[..data.len().min(SLICE_SIZE)];
+        let modes = &[ContextMode::UTF8, ContextMode::Signed];
+        if sub.len() < 64 {
+            ContextMode::UTF8
+        } else if C::COST_MODEL_LEVEL <= 1 && data.len() <= SMALL_STREAM_MAX {
+            context::rank_sampled_ctx_modes_with::<2>(scratch, modes, sub, sub.len(), |pos| pos)[0]
+                .0
+        } else {
+            context::choose_context_mode_modes_with(scratch, sub, modes)
+        }
     } else {
         ContextMode::Signed
     }
@@ -382,6 +394,7 @@ struct FlushCfg {
     two_dist_ctx: bool,
     auto_dist_params: bool,
     two_step_lazy: bool,
+    cost_model_level: u8,
     max_lit_clusters: usize,
     large_window: bool,
 }
@@ -395,6 +408,7 @@ impl FlushCfg {
             two_dist_ctx: C::TWO_DIST_CTX,
             auto_dist_params: qcfg.max_lit_clusters >= 6,
             two_step_lazy: C::TWO_STEP_LAZY,
+            cost_model_level: C::COST_MODEL_LEVEL,
             max_lit_clusters: qcfg.max_lit_clusters as usize,
             large_window,
         }
@@ -409,8 +423,10 @@ struct MetablockData {
     distance: HugePageBuf<u32>,
     enc_icds: HugePageBuf<u64>,
     histogram_buf: HugePageBuf<HuffmanCodeEntry>,
-    lit_ctx: Option<HugePageBuf<u8>>,
-    static_out: Option<HugePageBuf<u8>>,
+    lit_ctx: HugePageBuf<u8>,
+    use_lit_ctx: bool,
+    static_out: HugePageBuf<u8>,
+    use_static_out: bool,
     max_mb: usize,
     icd_limit: usize,
     total_icd: u32,
@@ -494,15 +510,15 @@ impl MetablockData {
     fn with_sink<R>(&mut self, f: impl FnOnce(&mut MetablockSink<'_>) -> R) -> R {
         let mut sink = MetablockSink {
             literals: Pow2SliceMut::from_padded(&mut self.literals[..]).expect("lit_buf pow2+256"),
-            lit_ctx: self.lit_ctx.as_deref_mut(),
+            lit_ctx: self.use_lit_ctx.then_some(&mut self.lit_ctx[..]),
             insert_len: Pow2SliceMut::from_padded(&mut self.insert_len[..])
                 .expect("icd_buf pow2+8"),
             copy_len: Pow2SliceMut::from_padded(&mut self.copy_len[..]).expect("icd_buf pow2+8"),
             distance: Pow2SliceMut::from_padded(&mut self.distance[..]).expect("icd_buf pow2+8"),
             static_out: self
-                .static_out
-                .as_deref_mut()
-                .and_then(Pow2SliceMut::from_padded),
+                .use_static_out
+                .then(|| Pow2SliceMut::from_padded(&mut self.static_out[..]))
+                .flatten(),
             total_literals: self.total_literals,
             total_icd: self.total_icd,
             context_mode: self.context_mode,
@@ -524,8 +540,10 @@ impl MetablockData {
             distance: HugePageBuf::new(),
             enc_icds: HugePageBuf::new(),
             histogram_buf: HugePageBuf::new(),
-            lit_ctx: None,
-            static_out: None,
+            lit_ctx: HugePageBuf::new(),
+            use_lit_ctx: false,
+            static_out: HugePageBuf::new(),
+            use_static_out: false,
             max_mb: METABLOCK_SIZE,
             icd_limit: 0,
             total_icd: 0,
@@ -553,19 +571,13 @@ impl MetablockData {
         self.distance.resize_or_grow_zeroed(icd_buf);
         self.enc_icds.resize_or_grow_zeroed(icd_buf);
         self.histogram_buf.resize_or_grow_zeroed(HISTOGRAM_BUF_SIZE);
+        self.use_lit_ctx = multi_ctx;
         if multi_ctx {
-            self.lit_ctx
-                .get_or_insert_with(HugePageBuf::new)
-                .resize_or_grow_zeroed(lit_buf);
-        } else {
-            self.lit_ctx = None;
+            self.lit_ctx.resize_or_grow_zeroed(lit_buf);
         }
+        self.use_static_out = ctx_block_split;
         if ctx_block_split {
-            self.static_out
-                .get_or_insert_with(HugePageBuf::new)
-                .resize_or_grow_zeroed(icd_buf);
-        } else {
-            self.static_out = None;
+            self.static_out.resize_or_grow_zeroed(icd_buf);
         }
         self.max_mb = max_mb;
         self.icd_limit = icd_cap - 1;
@@ -573,10 +585,8 @@ impl MetablockData {
 
     #[inline(always)]
     fn cmd_out_len(&self, c: usize) -> u32 {
-        if (self.distance[c] & STATIC_DICT_DIST_FLAG) != 0 {
-            self.static_out
-                .as_deref()
-                .map_or(self.copy_len[c], |so| so[c] as u32)
+        if (self.distance[c] & STATIC_DICT_DIST_FLAG) != 0 && self.use_static_out {
+            self.static_out[c] as u32
         } else {
             self.copy_len[c]
         }
@@ -613,35 +623,36 @@ impl MetablockData {
         self.insert_len[0] -= pre_lits as u32;
         self.copy_len.copy_within(snap.saved_icd..new_icd, 0);
         self.distance.copy_within(snap.saved_icd..new_icd, 0);
-        if cfg.ctx_block_split {
-            if let Some(so) = self.static_out.as_deref_mut() {
-                so.copy_within(snap.saved_icd..new_icd, 0);
-            }
+        if cfg.ctx_block_split && self.use_static_out {
+            self.static_out.copy_within(snap.saved_icd..new_icd, 0);
         }
         (self.total_literals, self.iac_literals, self.total_icd) =
             (b_lits_len as u32, b_lits_len as u32, slice_cmds as u32);
-        if cfg.multi_context {
-            if let Some(mut lc) = self.lit_ctx.take() {
-                if same_mode {
-                    lc.copy_within(lit_off..new_tl, 0);
-                } else {
-                    let (mut tl, mut anchor) = (0usize, snap.s_start);
-                    for c in 0..slice_cmds {
-                        let n = self.insert_len[c] as usize;
-                        if n != 0 {
-                            fill_lit_contexts_at(
-                                self.context_mode,
-                                data,
-                                anchor,
-                                &mut lc[tl..tl + n],
-                            );
-                            tl += n;
-                        }
-                        anchor += n + self.cmd_out_len(c) as usize;
+        if cfg.multi_context && self.use_lit_ctx {
+            if same_mode {
+                self.lit_ctx.copy_within(lit_off..new_tl, 0);
+            } else {
+                let (mut tl, mut anchor) = (0usize, snap.s_start);
+                for c in 0..slice_cmds {
+                    let n = self.insert_len[c] as usize;
+                    if n != 0 {
+                        fill_lit_contexts_at(
+                            self.context_mode,
+                            data,
+                            anchor,
+                            &mut self.lit_ctx[tl..tl + n],
+                        );
+                        tl += n;
                     }
-                    debug_assert_eq!(tl, b_lits_len);
+                    let dist_c = self.distance[c];
+                    let out_len = if (dist_c & STATIC_DICT_DIST_FLAG) != 0 && self.use_static_out {
+                        self.static_out[c] as usize
+                    } else {
+                        self.copy_len[c] as usize
+                    };
+                    anchor += n + out_len;
                 }
-                self.lit_ctx = Some(lc);
+                debug_assert_eq!(tl, b_lits_len);
             }
         }
     }
@@ -677,7 +688,12 @@ impl MetablockData {
         out.total = (b_emitted.len() + b_tail.len()) as u32;
     }
 
-    fn select_distance_params(&self, cfg: FlushCfg, samples: &mut Vec<(u8, u32)>) -> (u8, u8) {
+    fn select_distance_params(
+        &self,
+        cfg: FlushCfg,
+        samples: &mut Vec<(u8, u32)>,
+        counts_scratch: &mut [[u32; MAX_HUFFMAN_ALPHABET]; 2],
+    ) -> (u8, u8) {
         samples.clear();
         if !cfg.auto_dist_params || self.total_icd < 128 {
             return (0, 0);
@@ -710,7 +726,13 @@ impl MetablockData {
             }
         }
 
-        select_distance_params_from_samples(samples, raw_seen, max_raw_d, cfg.large_window)
+        select_distance_params_from_samples_with_scratch(
+            samples,
+            raw_seen,
+            max_raw_d,
+            cfg.large_window,
+            counts_scratch,
+        )
     }
 
     #[inline(always)]
@@ -726,15 +748,13 @@ impl MetablockData {
         }
         let (tl, num_lits) = (self.total_literals as usize, end - start);
         self.literals[tl..tl + num_lits].copy_from_slice(&data[start..end]);
-        if multi_context {
-            if let Some(lc) = self.lit_ctx.as_deref_mut() {
-                context::compute_contexts_in_stream(
-                    self.context_mode,
-                    data,
-                    start,
-                    &mut lc[tl..tl + num_lits],
-                );
-            }
+        if multi_context && self.use_lit_ctx {
+            context::compute_contexts_in_stream(
+                self.context_mode,
+                data,
+                start,
+                &mut self.lit_ctx[tl..tl + num_lits],
+            );
         }
         self.total_literals = (tl + num_lits) as u32;
     }
@@ -994,12 +1014,13 @@ impl MetablockData {
         let Some(lit_sub) = self.literals.get(ls..ls + lb) else {
             return;
         };
-        let lc = match (MULTI_CTX, &self.lit_ctx) {
-            (true, Some(c)) => match c.get(ls..ls + lb) {
+        let lc = if MULTI_CTX && self.use_lit_ctx {
+            match self.lit_ctx.get(ls..ls + lb) {
                 Some(s) => Some(s),
                 None => return,
-            },
-            _ => None,
+            }
+        } else {
+            None
         };
         for (i, &lit) in lit_sub.iter().enumerate() {
             let c_off = match lc {
@@ -1071,10 +1092,9 @@ impl MetablockData {
     ) {
         let (Some(lit_sub), Some(ctx_sub)) = (
             self.literals.get(ls..ls + lb),
-            match &self.lit_ctx {
-                Some(c) => c.get(ls..ls + lb),
-                None => None,
-            },
+            self.use_lit_ctx
+                .then(|| self.lit_ctx.get(ls..ls + lb))
+                .flatten(),
         ) else {
             return;
         };
@@ -1142,9 +1162,10 @@ impl MetablockData {
                     return;
                 };
                 let lit_pfx8 = BoundedPrefix::<u8, 8>::new(&self.literals);
-                let lc_pfx = match (MULTI_CTX, &self.lit_ctx) {
-                    (true, Some(c)) => BoundedPrefix::<u8, 8>::new(c),
-                    _ => None,
+                let lc_pfx = if MULTI_CTX && self.use_lit_ctx {
+                    BoundedPrefix::<u8, 8>::new(&self.lit_ctx)
+                } else {
+                    None
                 };
                 let d128 = d.maybe_downgrade_128bit();
                 let mut cmap_base = [0usize; 64];
@@ -1360,7 +1381,12 @@ impl MetablockData {
         }
     }
 
-    fn has_multi_regime_signal(&self, mb_len: usize, thorough: bool) -> bool {
+    fn has_multi_regime_signal(
+        &self,
+        mb_len: usize,
+        thorough: bool,
+        regime_wins: &mut HugePageBuf<LiteralHistogram>,
+    ) -> bool {
         if mb_len < 32_768 {
             return false;
         }
@@ -1373,8 +1399,9 @@ impl MetablockData {
             } else {
                 (256 + (w_len / 12)) as i32
             };
-            let mut wins = HugePageBuf::<LiteralHistogram>::new_zeroed(n_win);
+            let wins = &mut regime_wins.resize_or_grow_zeroed(n_win)[..n_win];
             for (w, wh) in wins.iter_mut().enumerate() {
+                wh.data.fill(0);
                 let (s, e) = (w * w_len, if w + 1 == n_win { tl } else { (w + 1) * w_len });
                 count_literals_x4(&self.literals[s..e], &mut wh.data);
                 wh.total = (e - s) as u32;
@@ -1411,22 +1438,26 @@ impl MetablockData {
         false
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn try_overwrite_multi_block(
         &mut self,
         cfg: FlushCfg,
         bw: &mut BitWriter,
+        regime_wins: &mut HugePageBuf<LiteralHistogram>,
+        cmds: &mut Vec<OptimalCommand>,
         (cp, single_bits, saved_ring): (BitWriterCheckpoint, u64, [u32; 4]),
         (trailing_literals, npostfix, ndirect): (u32, u8, u8),
         (full_data, mb_start, mb_end): (&[u8], usize, usize),
     ) -> bool {
         if !cfg.ctx_block_split
-            || self.static_out.is_none()
-            || !self.has_multi_regime_signal(mb_end - mb_start, cfg.two_step_lazy)
+            || !self.use_static_out
+            || !self.has_multi_regime_signal(mb_end - mb_start, cfg.two_step_lazy, regime_wins)
         {
             return false;
         }
         let total_icd = self.total_icd as usize;
-        let mut cmds = Vec::with_capacity(total_icd);
+        cmds.clear();
+        cmds.reserve(total_icd);
         let (mut ring, mut anchor) = (saved_ring, mb_start);
         for c in 0..total_icd {
             let (insert_len, copy_len, raw_d) =
@@ -1462,7 +1493,7 @@ impl MetablockData {
             has_dict: false,
         };
         if let Some(plan) =
-            try_plan_metablock(full_data, mb_start, mb_end, &cmds, trailing_literals, opts)
+            try_plan_metablock(full_data, mb_start, mb_end, cmds, trailing_literals, opts)
         {
             if plan.exact_compressed_bits < single_bits
                 && !metablock::should_emit_uncompressed_plan(mb_end - mb_start, &plan)
@@ -1472,7 +1503,7 @@ impl MetablockData {
                     full_data,
                     mb_start,
                     mb_end,
-                    &cmds,
+                    cmds,
                     trailing_literals,
                     &plan,
                     false,
@@ -1490,13 +1521,23 @@ impl MetablockData {
         cfg: FlushCfg,
         histo_buf: &mut HistogramBuffers,
         ctx_counted: usize,
-    ) -> Option<(Vec<u32>, Vec<u32>, [u8; 64])> {
+    ) -> Option<[u8; 64]> {
         let tl = self.total_literals as usize;
-        if !cfg.multi_context || tl < 512 {
+        if !cfg.multi_context || !self.use_lit_ctx || tl < 512 {
             return None;
         }
-        let lc = self.lit_ctx.as_deref()?;
-        let hb_ctx = histo_buf.ctx_hists_mut();
+        let eff_max_clusters = if tl < 1_536 {
+            cfg.max_lit_clusters.min(2)
+        } else if tl < 4_096 {
+            cfg.max_lit_clusters.min(4)
+        } else {
+            cfg.max_lit_clusters
+        };
+        if eff_max_clusters < 2 {
+            return None;
+        }
+        let lc = &self.lit_ctx[..];
+        let hb_ctx = histo_buf.ctx_hists.get_or_insert_with(CtxHists::new);
         let start = if (1..=tl).contains(&ctx_counted) {
             ctx_counted
         } else {
@@ -1507,32 +1548,40 @@ impl MetablockData {
         debug_assert_eq!(hb_ctx.tots.iter().map(|&t| t as usize).sum::<usize>(), tl);
 
         let min_gain = if cfg.max_lit_clusters <= 4 { 256 } else { 224 };
-        let (cl_flat, cl_tots, cmap_vec) = context::cluster_flat_jsd(
+        let cs = &mut histo_buf.cluster_scratch;
+        context::cluster_flat_jsd_into(
+            cs,
             &hb_ctx.flat[..],
             &hb_ctx.tots,
             MAX_LIT,
-            cfg.max_lit_clusters,
+            eff_max_clusters,
             min_gain,
         );
-        if cl_tots.len() < 2 {
+        if cs.tots.len() < 2 {
             return None;
         }
-        if cfg.max_lit_clusters <= 6 {
+        if cfg.max_lit_clusters <= 6 || (cfg.cost_model_level <= 1 && tl < 4_096) {
             let lit_hist = &histo_buf.lit_hist[0];
             let single_bits = context::slice_entropy_fp16(&lit_hist.data, lit_hist.total) >> 16;
-            let multi_bits: u64 = cl_flat
+            let multi_bits: u64 = cs
+                .hists
                 .as_chunks::<MAX_LIT>()
                 .0
                 .iter()
-                .zip(&cl_tots)
+                .zip(&cs.tots)
                 .map(|(d, &t)| context::slice_entropy_fp16(d, t) >> 16)
                 .sum();
-            let extra_gate = (tl as u64) >> if cfg.max_lit_clusters <= 4 { 3 } else { 4 };
-            if single_bits < multi_bits + 160 + ((cl_tots.len() - 1) as u64) * 520 + extra_gate {
+            let threshold = if cfg.max_lit_clusters <= 6 {
+                let extra_gate = (tl as u64) >> if cfg.max_lit_clusters <= 4 { 3 } else { 4 };
+                160 + ((cs.tots.len() - 1) as u64) * 520 + extra_gate
+            } else {
+                128 + ((cs.tots.len() - 1) as u64) * 384
+            };
+            if single_bits < multi_bits + threshold {
                 return None;
             }
         }
-        Some((cl_flat, cl_tots, cmap_vec.try_into().unwrap()))
+        cs.cmap.as_slice().try_into().ok()
     }
 
     fn build_codes_and_write_header(
@@ -1540,14 +1589,15 @@ impl MetablockData {
         cfg: FlushCfg,
         (count, npostfix, ndirect): (usize, u8, u8),
         histo_buf: &mut HistogramBuffers,
-        clusters: Option<(&mut [u32], &[u32])>,
+        has_clusters: bool,
         cmap: &[u8; 64],
         bw: &mut BitWriter,
     ) -> u64 {
-        let (iac_hist, dist_hist, lit_hist) = (
+        let (iac_hist, dist_hist, lit_hist, cluster_scratch) = (
             &histo_buf.iac_hist[..IAC_HIST_BUF_SIZE],
             &mut histo_buf.dist_hist[..DIST_HIST_BUF_SIZE],
             &mut histo_buf.lit_hist[0],
+            &mut histo_buf.cluster_scratch,
         );
         let dist_alpha = dist_alphabet_size(npostfix, ndirect, cfg.large_window);
         let (iac_dist_buf, mut lit_buf) = self.histogram_buf.split_at_mut(LIT_BASE);
@@ -1571,8 +1621,13 @@ impl MetablockData {
         let use_two_dist = cfg.two_dist_ctx && {
             let (d0, d1_rest) = dist_hist.split_at_mut(MAX_HUFFMAN_ALPHABET);
             let (h0, h1) = (&mut d0[..dist_alpha], &d1_rest[..dist_alpha]);
-            let two =
-                context::histogram_distance_slice(h0, h0.iter().sum(), h1, h1.iter().sum()) > 48;
+            let two = if self.total_icd < 96 {
+                false
+            } else if self.total_icd < 256 {
+                context::excess_jsd_slice(h0, h0.iter().sum(), h1, h1.iter().sum()) > 80
+            } else {
+                context::histogram_distance_slice(h0, h0.iter().sum(), h1, h1.iter().sum()) > 48
+            };
             if !two {
                 context::add_hist_slice(h0, h1);
             }
@@ -1607,9 +1662,13 @@ impl MetablockData {
         let mut lit_codes_arr: [HuffmanCode<'_>; 16] =
             std::array::from_fn(|_| HuffmanCode::default());
         let single_tot = [lit_hist.total];
-        let (lit_rows, lit_tots) = match clusters {
-            Some((flat, tots)) => (flat.as_chunks_mut::<MAX_LIT>().0, tots),
-            None => (std::slice::from_mut(&mut lit_hist.data), &single_tot[..]),
+        let (lit_rows, lit_tots) = if has_clusters {
+            (
+                cluster_scratch.hists.as_chunks_mut::<MAX_LIT>().0,
+                cluster_scratch.tots.as_slice(),
+            )
+        } else {
+            (std::slice::from_mut(&mut lit_hist.data), &single_tot[..])
         };
         for (idx, (row, &tot)) in lit_rows.iter_mut().zip(lit_tots).enumerate() {
             if tot == 0 {
@@ -1678,11 +1737,18 @@ impl MetablockData {
             (self.dist_ring, self.total_literals - self.iac_literals);
         let (start_bits, cp) = (bw.total_bits(), bw.checkpoint());
 
-        let mut multi_ctx = self.prepare_lit_clusters(cfg, histo_buf, ctx_counted);
-        let (use_multi_ctx, cmap) = multi_ctx
-            .as_ref()
-            .map_or((false, [0u8; 64]), |(_, _, m)| (true, *m));
-        let (npostfix, ndirect) = self.select_distance_params(cfg, &mut histo_buf.dist_samples);
+        let cmap_opt = self.prepare_lit_clusters(cfg, histo_buf, ctx_counted);
+        let (use_multi_ctx, cmap) = cmap_opt.map_or((false, [0u8; 64]), |m| (true, m));
+        let (npostfix, ndirect) = {
+            let scratch_counts = histo_buf
+                .dist_hist
+                .resize_or_grow_zeroed(DIST_HIST_BUF_SIZE)[..2 * MAX_HUFFMAN_ALPHABET]
+                .as_chunks_mut::<MAX_HUFFMAN_ALPHABET>()
+                .0
+                .first_chunk_mut::<2>()
+                .unwrap();
+            self.select_distance_params(cfg, &mut histo_buf.dist_samples, scratch_counts)
+        };
         let dist_alpha = dist_alphabet_size(npostfix, ndirect, cfg.large_window);
         assert!(self.total_icd as usize + 8 <= self.insert_len.len());
         {
@@ -1719,9 +1785,7 @@ impl MetablockData {
             cfg,
             (block_data.len(), npostfix, ndirect),
             histo_buf,
-            multi_ctx
-                .as_mut()
-                .map(|(f, t, _)| (f.as_mut_slice(), t.as_slice())),
+            use_multi_ctx,
             &cmap,
             bw,
         );
@@ -1740,6 +1804,8 @@ impl MetablockData {
         if self.try_overwrite_multi_block(
             cfg,
             bw,
+            &mut histo_buf.regime_wins,
+            &mut histo_buf.multi_cmds,
             (cp, target_bits, saved_ring),
             (trailing_literals, npostfix, ndirect),
             (full_data, mb_start, mb_end),
@@ -1816,12 +1882,564 @@ struct SliceSnapshot {
     saved_anchor: usize,
 }
 
-struct EncoderInternal<C: MatchConfig> {
-    ht: HashTable,
+#[derive(Clone, Copy)]
+struct MidRunCfg {
+    qcfg: QualityCfg,
+    wbits: usize,
+    large_window: bool,
+    has_dict: bool,
+}
+
+struct MidState {
     md: MetablockData,
     hb: HistogramBuffers,
     cost_model: SliceCostModel,
     lit_hists: HugePageBuf<LiteralHistogram>,
+}
+
+impl MidState {
+    fn new() -> Self {
+        Self {
+            md: MetablockData::new(),
+            hb: HistogramBuffers::new(),
+            cost_model: SliceCostModel::new_empty(),
+            lit_hists: HugePageBuf::new_zeroed(2),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn configure_tier<C: MatchConfig>(
+        &mut self,
+        ht: &mut HashTable,
+        qcfg: QualityCfg,
+        (pos_bits, ways, ht4_ways, log, ht4_log): (u8, u8, u8, u32, u32),
+        max_mb: usize,
+        max_stream_len: Option<usize>,
+        has_dict: bool,
+    ) {
+        ht.configure_layout(pos_bits, ways, ht4_ways, log, ht4_log);
+        ht.ensure_ht4_near();
+        self.cost_model.ensure_for_config::<C>();
+        let suppress_mctx =
+            C::COST_MODEL_LEVEL <= 1 && !has_dict && max_stream_len.is_some_and(|n| n <= 2_048);
+        self.md.ensure_capacity(
+            max_mb,
+            max_stream_len,
+            C::MULTI_CONTEXT && !suppress_mctx,
+            qcfg.ctx_block_split,
+        );
+    }
+
+    #[inline(always)]
+    fn flush_cfg<C: MatchConfig>(
+        &self,
+        qcfg: QualityCfg,
+        large_window: bool,
+        has_dict: bool,
+    ) -> FlushCfg {
+        let mut cfg = FlushCfg::from_qcfg::<C>(qcfg, large_window);
+        if !self.md.use_lit_ctx {
+            cfg.multi_context = false;
+        }
+        if has_dict && qcfg.seed_ht_dict {
+            cfg.max_lit_clusters = cfg.max_lit_clusters.max(8);
+        }
+        cfg
+    }
+
+    fn apply_ctx_cost_update<C: MatchConfig>(
+        &mut self,
+        reset: bool,
+        data: &[u8],
+        (cur, end_tl, anchor, s_end): (usize, usize, usize, usize),
+        marg_override: Option<&LiteralHistogram>,
+        use_slice_hist: bool,
+    ) {
+        if !C::MULTI_CONTEXT || !self.md.use_lit_ctx {
+            return;
+        }
+        let hb_ctx = self.hb.ctx_hists_mut();
+        if reset {
+            hb_ctx.reset();
+        }
+        let lit_cur = cur.min(end_tl);
+        accum_ctx_lits(
+            hb_ctx,
+            &self.md.lit_ctx[lit_cur..end_tl],
+            &self.md.literals[lit_cur..end_tl],
+        );
+        let mut tail = anchor + cur.saturating_sub(end_tl);
+        let mut ctx_buf = [0u8; 4096];
+        while tail < s_end {
+            let chunk = (s_end - tail).min(ctx_buf.len());
+            fill_lit_contexts_at(self.md.context_mode, data, tail, &mut ctx_buf[..chunk]);
+            accum_ctx_lits(hb_ctx, &ctx_buf[..chunk], &data[tail..tail + chunk]);
+            tail += chunk;
+        }
+        let marg = marg_override.unwrap_or(&self.lit_hists[usize::from(use_slice_hist)]);
+        self.cost_model
+            .update_ctx_lit_table(hb_ctx, &marg.data, marg.total);
+    }
+
+    fn sync_ctx_cost_table<C: MatchConfig>(
+        &mut self,
+        st: &mut EncoderSliceState,
+        data: &[u8],
+        local_cur: Option<usize>,
+        s_end: usize,
+        uncomp: bool,
+    ) {
+        if !C::MULTI_CONTEXT || C::COST_MODEL_LEVEL < 3 || !self.md.use_lit_ctx {
+            return;
+        }
+        if uncomp {
+            st.ctx_cursor = 0;
+            return;
+        }
+        let (tl, cur) = (
+            self.md.total_literals as usize,
+            local_cur.unwrap_or(st.ctx_cursor),
+        );
+        self.apply_ctx_cost_update::<C>(
+            local_cur.is_some() || cur == 0,
+            data,
+            (cur, tl, st.parse.anchor, s_end),
+            None,
+            local_cur.is_some(),
+        );
+        st.ctx_cursor = local_cur.map_or(tl + (s_end - st.parse.anchor), |_| 0);
+    }
+
+    fn seed_stream_state<C: MatchConfig>(
+        &mut self,
+        ht: &mut HashTable,
+        qcfg: QualityCfg,
+        wbits: usize,
+        in_buf: &[u8],
+        expected_stream_len: usize,
+        dict: Option<&PreparedDictionary>,
+    ) {
+        let wsize = window_size(wbits);
+        let full_dict_len = match dict {
+            Some(d) => {
+                if qcfg.seed_ht_dict {
+                    let seed_ht4_win = if qcfg.max_insert_len == 0 {
+                        0
+                    } else if C::FAST_MATCHING {
+                        HT4_DICT_WINDOW
+                    } else {
+                        4 * HT4_DICT_WINDOW
+                    };
+                    ht.prepare_for_input_with_dict(
+                        wsize,
+                        expected_stream_len,
+                        d,
+                        seed_ht4_win,
+                        C::USE_3B_TABLE,
+                    );
+                } else {
+                    ht.prepare_for_input(wsize, expected_stream_len);
+                }
+                d.raw_len()
+            }
+            None => {
+                ht.prepare_for_input(wsize, expected_stream_len);
+                0
+            }
+        };
+        let eff_wsize = effective_window_size(wsize, in_buf.len(), full_dict_len);
+        let init_mode = if C::MULTI_CONTEXT && self.md.use_lit_ctx {
+            choose_ctx_mode_for::<C>(&mut self.hb.ctx_rank, in_buf)
+        } else {
+            ContextMode::Signed
+        };
+        self.cost_model.ctx_mode = init_mode;
+        self.md.reset(init_mode, true);
+        let sample = &in_buf[..in_buf.len().min(2048)];
+        let h = &mut self.lit_hists[1];
+        h.data.fill(0);
+        h.total = sample.len() as u32;
+        count_literals_x4(sample, &mut h.data);
+        refresh_cost_model::<C>(
+            &mut self.cost_model,
+            (&[], &[], &[]),
+            (eff_wsize, true),
+            (&self.lit_hists[1], &self.lit_hists[1]),
+        );
+        if C::MULTI_CONTEXT && C::COST_MODEL_LEVEL >= 3 {
+            self.apply_ctx_cost_update::<C>(true, sample, (0, 0, 0, sample.len()), None, true);
+        }
+    }
+
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn flush_open_mb<C: MatchConfig, D: SimdDescriptor>(
+        &mut self,
+        d: D,
+        rc: MidRunCfg,
+        st: &mut EncoderSliceState,
+        data: &[u8],
+        flush_end: usize,
+        use_mb_hists: bool,
+        bw: &mut BitWriter,
+    ) {
+        let fcfg = self.flush_cfg::<C>(rc.qcfg, rc.large_window, rc.has_dict);
+        let _ = self.md.flush_metablock_with_desc(
+            d,
+            fcfg,
+            bw,
+            &mut self.hb,
+            data,
+            (st.parse.anchor, st.mb_start, flush_end),
+            (use_mb_hists.then_some(&self.lit_hists[0]), st.ctx_cursor),
+        );
+        st.parse.last_distances = self.md.dist_ring;
+        (st.mb_start, st.parse.anchor, st.ctx_cursor) = (flush_end, flush_end, 0);
+        (st.mb_has_slice, st.need_ctx_mode) = (false, true);
+    }
+
+    #[inline]
+    fn prepare_next_slice<C: MatchConfig, D: SimdDescriptor>(
+        &mut self,
+        d: D,
+        rc: MidRunCfg,
+        st: &mut EncoderSliceState,
+        data: &[u8],
+        bw: &mut BitWriter,
+    ) -> SliceSnapshot {
+        let max_mb = self.md.max_mb;
+        if max_mb > SLICE_SIZE {
+            if st.mb_has_slice && st.parse.pos - st.mb_start > max_mb - SLICE_SIZE {
+                let flush_end = st.parse.pos;
+                self.flush_open_mb::<C, _>(d, rc, st, data, flush_end, true, bw);
+            }
+            if st.need_ctx_mode {
+                let next_mode = if self.md.use_lit_ctx {
+                    choose_ctx_mode_for::<C>(&mut self.hb.ctx_rank, &data[st.parse.pos..])
+                } else {
+                    ContextMode::Signed
+                };
+                self.cost_model.ctx_mode = next_mode;
+                self.md.reset(next_mode, false);
+                st.parse.last_distances = self.md.dist_ring;
+                st.need_ctx_mode = false;
+            }
+        }
+        SliceSnapshot {
+            s_start: st.parse.pos,
+            saved_tl: self.md.total_literals as usize,
+            saved_icd: self.md.total_icd as usize,
+            saved_anchor: st.parse.anchor,
+        }
+    }
+
+    #[inline]
+    fn adopt_slice<C: MatchConfig>(
+        &mut self,
+        st: &mut EncoderSliceState,
+        data: &[u8],
+        (s_end, eff_wsize): (usize, usize),
+        (at_eof, reset_priors, uncomp): (bool, bool, bool),
+        cmd_range: std::ops::Range<usize>,
+    ) {
+        self.lit_hists.swap(0, 1);
+        st.mb_has_slice = true;
+        if !at_eof {
+            refresh_cost_model::<C>(
+                &mut self.cost_model,
+                self.md.cmd_slices(cmd_range),
+                (eff_wsize, reset_priors),
+                (&self.lit_hists[0], &self.lit_hists[0]),
+            );
+            self.sync_ctx_cost_table::<C>(st, data, None, s_end, uncomp);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_parsed_slice<C: MatchConfig, D: SimdDescriptor>(
+        &mut self,
+        d: D,
+        rc: MidRunCfg,
+        st: &mut EncoderSliceState,
+        snap: SliceSnapshot,
+        data: &[u8],
+        eff_wsize: usize,
+        mode: StreamOp,
+        bw: &mut BitWriter,
+    ) {
+        let max_mb = self.md.max_mb;
+        if max_mb <= SLICE_SIZE
+            || (mode == StreamOp::Finish && !st.mb_has_slice && st.parse.pos >= data.len())
+        {
+            let end = st.parse.pos;
+            self.flush_open_mb::<C, _>(d, rc, st, data, end, false, bw);
+            return;
+        }
+
+        let (s_start, s_end) = (snap.s_start, st.parse.pos);
+        let (new_tl, new_icd) = (self.md.total_literals as usize, self.md.total_icd as usize);
+        let (s_len, slice_cmds) = (s_end - s_start, new_icd - snap.saved_icd);
+        self.md
+            .slice_lit_hist(data, snap, s_end, st.parse.anchor, &mut self.lit_hists[1]);
+        let at_eof = mode == StreamOp::Finish && s_end >= data.len();
+        let slice_uncomp = s_len >= 1024
+            && should_emit_uncompressed(
+                s_len,
+                slice_cmds as u32,
+                self.lit_hists[1].total,
+                &self.lit_hists[1].data,
+            );
+
+        if !st.mb_has_slice {
+            self.adopt_slice::<C>(
+                st,
+                data,
+                (s_end, eff_wsize),
+                (at_eof, false, slice_uncomp),
+                snap.saved_icd..new_icd,
+            );
+            return;
+        }
+
+        let split_cost_bits: u64 = if C::MULTI_CONTEXT && self.md.use_lit_ctx {
+            1152
+        } else {
+            1280
+        };
+        let force_size_split = s_end - st.mb_start > max_mb;
+        let mb_uncomp = should_emit_uncompressed(
+            s_start - st.mb_start,
+            snap.saved_icd as u32,
+            self.lit_hists[0].total,
+            &self.lit_hists[0].data,
+        );
+        let regime_flip = s_len >= 1024 && (mb_uncomp != slice_uncomp);
+        let jsd_gain = if !mb_uncomp && !slice_uncomp && s_len >= 8192 {
+            jsd_bit_gain(&self.lit_hists[0], &self.lit_hists[1])
+        } else {
+            0
+        };
+        let jsd_split = if rc.qcfg.ctx_block_split {
+            (s_start - st.mb_start) >= 262_144 && jsd_gain > 3 * split_cost_bits
+        } else {
+            jsd_gain > split_cost_bits
+        };
+
+        if force_size_split || regime_flip || jsd_split {
+            let old_mode = self.md.context_mode;
+            let (stl, sicd) = (snap.saved_tl as u32, snap.saved_icd as u32);
+            (
+                self.md.total_literals,
+                self.md.iac_literals,
+                self.md.total_icd,
+            ) = (stl, stl, sicd);
+            let fcfg = self.flush_cfg::<C>(rc.qcfg, rc.large_window, rc.has_dict);
+            let _ = self.md.flush_metablock_with_desc(
+                d,
+                fcfg,
+                bw,
+                &mut self.hb,
+                data,
+                (snap.saved_anchor, st.mb_start, s_start),
+                (Some(&self.lit_hists[0]), st.ctx_cursor),
+            );
+
+            let new_mode = if (rc.qcfg.ctx_block_split || slice_cmds == 0) && self.md.use_lit_ctx {
+                choose_ctx_mode_for::<C>(&mut self.hb.ctx_rank, &data[s_start..s_end])
+            } else {
+                old_mode
+            };
+            self.cost_model.ctx_mode = new_mode;
+            self.md.reset(new_mode, false);
+            self.md
+                .shift_slice_to_front(fcfg, data, snap, new_tl, new_icd, new_mode == old_mode);
+            if slice_cmds == 0 {
+                st.parse.anchor = s_start;
+            }
+            let mut r = self.md.dist_ring;
+            for &raw_d in &self.md.distance[..slice_cmds] {
+                if (raw_d & STATIC_DICT_DIST_FLAG) == 0 {
+                    push_last_distance(&mut r, raw_d);
+                }
+            }
+            st.parse.last_distances = r;
+            (st.mb_start, st.ctx_cursor) = (s_start, 0);
+            self.adopt_slice::<C>(
+                st,
+                data,
+                (s_end, eff_wsize),
+                (at_eof, true, slice_uncomp),
+                0..slice_cmds,
+            );
+        } else {
+            let [mb_h, slice_h] = self.lit_hists.first_chunk_mut::<2>().unwrap();
+            mb_h.merge_from(slice_h);
+            if !at_eof {
+                let local_regime = rc.qcfg.ctx_block_split
+                    && self.lit_hists[1].total >= 2048
+                    && jsd_gain > split_cost_bits;
+                let lv1_src = &self.lit_hists[usize::from(self.lit_hists[1].total >= 256)];
+                let active_lit = &self.lit_hists[usize::from(local_regime)];
+                refresh_cost_model::<C>(
+                    &mut self.cost_model,
+                    self.md.cmd_slices(snap.saved_icd..new_icd),
+                    (eff_wsize, false),
+                    (lv1_src, active_lit),
+                );
+                let local_cur =
+                    local_regime.then_some(snap.saved_tl + (s_start - snap.saved_anchor));
+                self.sync_ctx_cost_table::<C>(st, data, local_cur, s_end, slice_uncomp);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn advance_slices_with_desc<C: MatchConfig, D: SimdDescriptor>(
+        &mut self,
+        d: D,
+        ht: &mut HashTable,
+        mut rc: MidRunCfg,
+        st: &mut EncoderSliceState,
+        in_buf: &[u8],
+        dict: Option<&PreparedDictionary>,
+        mode: StreamOp,
+        bw: &mut BitWriter,
+    ) {
+        let dict = dict.filter(|d| !d.is_empty());
+        let has_dict = dict.is_some();
+        rc.has_dict = has_dict;
+        let wsize = window_size(rc.wbits);
+        let (active_dict, full_dict_len, raw_dict_idx, dict_idx): (
+            &[u8],
+            usize,
+            Option<&crate::hashtable::RawDictIndex>,
+            Option<&crate::hashtable::Dict5Index>,
+        ) = dict.map_or((&[], 0, None, None), |pd| {
+            (
+                pd.active_slice(wsize),
+                pd.raw_len(),
+                C::FAST_MATCHING.then(|| pd.raw_index()),
+                (!C::FAST_MATCHING && !rc.qcfg.ctx_block_split).then(|| pd.dict5_index()),
+            )
+        });
+        let eff_wsize = effective_window_size(wsize, in_buf.len(), full_dict_len);
+        let max_mb = self.md.max_mb;
+
+        while if mode == StreamOp::Process {
+            in_buf.len() >= st.parse.pos + SLICE_SIZE + 1024
+        } else {
+            st.parse.pos < in_buf.len()
+        } {
+            let snap = self.prepare_next_slice::<C, _>(d, rc, st, in_buf, bw);
+            let target_end = if max_mb <= SLICE_SIZE {
+                in_buf.len()
+            } else {
+                (st.parse.pos + SLICE_SIZE).min(in_buf.len())
+            };
+            let (md, cost_model) = (&mut self.md, &self.cost_model);
+            md.with_sink(|sink| {
+                ht.parse_slice_with_desc::<C, _>(
+                    d,
+                    rc.qcfg,
+                    rc.large_window,
+                    has_dict,
+                    (in_buf, target_end, wsize),
+                    (active_dict, full_dict_len, raw_dict_idx, dict_idx),
+                    &mut st.parse,
+                    sink,
+                    cost_model,
+                );
+            });
+            self.finish_parsed_slice::<C, _>(d, rc, st, snap, in_buf, eff_wsize, mode, bw);
+        }
+        if st.mb_has_slice {
+            let end = if mode != StreamOp::Process {
+                (st.mb_start < in_buf.len()).then_some(in_buf.len())
+            } else {
+                (st.parse.pos - st.mb_start > max_mb - SLICE_SIZE).then_some(st.parse.pos)
+            };
+            if let Some(flush_end) = end {
+                self.flush_open_mb::<C, _>(d, rc, st, in_buf, flush_end, true, bw);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compress_one_shot_with_desc<C: MatchConfig, D: SimdDescriptor>(
+        &mut self,
+        d: D,
+        ht: &mut HashTable,
+        rc: MidRunCfg,
+        data: &[u8],
+        dict: Option<&PreparedDictionary>,
+        bw: &mut BitWriter,
+    ) {
+        write_window_bits(rc.wbits, rc.large_window, bw);
+        if !data.is_empty() {
+            let dict = dict.filter(|d| !d.is_empty());
+            self.seed_stream_state::<C>(ht, rc.qcfg, rc.wbits, data, data.len(), dict);
+            let mut st = EncoderSliceState::default();
+            self.advance_slices_with_desc::<C, _>(
+                d,
+                ht,
+                rc,
+                &mut st,
+                data,
+                dict,
+                StreamOp::Finish,
+                bw,
+            );
+        }
+        write_empty_last_metablock(bw);
+    }
+
+    fn compress_one_shot<C: MatchConfig>(
+        &mut self,
+        ht: &mut HashTable,
+        (qcfg, wbits, tiers): (QualityCfg, usize, [TierParams; 3]),
+        data: &[u8],
+        dict: OptDict<'_>,
+        bw: &mut BitWriter<'_>,
+    ) {
+        let large_window = wbits > STD_MAX_WBITS;
+        let dict = dict.filter(|d| !d.is_empty());
+        let has_dict = dict.is_some();
+        if !data.is_empty() {
+            let (eff_len, TierParams(ways, ht4_ways, log, ht4_log, mb_kib)) = select_tier(
+                wbits,
+                data.len(),
+                qcfg.seed_ht_dict.then_some(dict).flatten(),
+                tiers,
+            );
+            let pos_bits = if large_window && eff_len > COMPACT_LW_STREAM_MAX {
+                31
+            } else {
+                25
+            };
+            self.configure_tier::<C>(
+                ht,
+                qcfg,
+                (pos_bits, ways, ht4_ways, log as u32, ht4_log as u32),
+                (mb_kib as usize) * 1024,
+                Some(data.len()),
+                has_dict,
+            );
+        }
+        let rc = MidRunCfg {
+            qcfg,
+            wbits,
+            large_window,
+            has_dict,
+        };
+        with_simd_256!(true, |d| {
+            self.compress_one_shot_with_desc::<C, _>(d, ht, rc, data, dict, bw);
+        });
+    }
+}
+
+struct EncoderInternal<C: MatchConfig> {
+    ht: HashTable,
+    mid: MidState,
     qcfg: QualityCfg,
     wbits: usize,
     large_window: bool,
@@ -1836,10 +2454,7 @@ impl<C: MatchConfig> EncoderInternal<C> {
     fn new(wbits: usize, qcfg: QualityCfg, large_window: bool, tiers: [TierParams; 3]) -> Self {
         Self {
             ht: HashTable::new(),
-            md: MetablockData::new(),
-            hb: HistogramBuffers::new(),
-            cost_model: SliceCostModel::new_for_config::<C>(),
-            lit_hists: HugePageBuf::new_zeroed(2),
+            mid: MidState::new(),
             qcfg,
             wbits,
             large_window,
@@ -1862,89 +2477,31 @@ impl<C: MatchConfig> EncoderInternal<C> {
         max_mb: usize,
         max_stream_len: Option<usize>,
     ) {
-        self.ht
-            .configure_layout(pos_bits, ways, ht4_ways, log, ht4_log);
-        self.ht.ensure_ht4_near();
-        self.md.ensure_capacity(
+        self.mid.configure_tier::<C>(
+            &mut self.ht,
+            self.qcfg,
+            (pos_bits, ways, ht4_ways, log, ht4_log),
             max_mb,
             max_stream_len,
-            C::MULTI_CONTEXT,
-            self.qcfg.ctx_block_split,
+            self.has_dict,
         );
     }
 
     #[inline(always)]
+    fn run_cfg(&self) -> MidRunCfg {
+        MidRunCfg {
+            qcfg: self.qcfg,
+            wbits: self.wbits,
+            large_window: self.large_window,
+            has_dict: self.has_dict,
+        }
+    }
+
+    #[cfg(test)]
+    #[inline(always)]
     fn flush_cfg(&self) -> FlushCfg {
-        let mut cfg = FlushCfg::from_qcfg::<C>(self.qcfg, self.large_window);
-        if self.has_dict && self.qcfg.seed_ht_dict {
-            cfg.max_lit_clusters = cfg.max_lit_clusters.max(8);
-        }
-        cfg
-    }
-
-    fn apply_ctx_cost_update(
-        &mut self,
-        reset: bool,
-        data: &[u8],
-        (cur, end_tl, anchor, s_end): (usize, usize, usize, usize),
-        marg_override: Option<&LiteralHistogram>,
-        use_slice_hist: bool,
-    ) {
-        if !C::MULTI_CONTEXT {
-            return;
-        }
-        let hb_ctx = self.hb.ctx_hists_mut();
-        if reset {
-            hb_ctx.reset();
-        }
-        let lit_cur = cur.min(end_tl);
-        if let Some(lc) = self.md.lit_ctx.as_deref() {
-            accum_ctx_lits(
-                hb_ctx,
-                &lc[lit_cur..end_tl],
-                &self.md.literals[lit_cur..end_tl],
-            );
-        }
-        let mut tail = anchor + cur.saturating_sub(end_tl);
-        let mut ctx_buf = [0u8; 4096];
-        while tail < s_end {
-            let chunk = (s_end - tail).min(ctx_buf.len());
-            fill_lit_contexts_at(self.md.context_mode, data, tail, &mut ctx_buf[..chunk]);
-            accum_ctx_lits(hb_ctx, &ctx_buf[..chunk], &data[tail..tail + chunk]);
-            tail += chunk;
-        }
-        let marg = marg_override.unwrap_or(&self.lit_hists[usize::from(use_slice_hist)]);
-        self.cost_model
-            .update_ctx_lit_table(hb_ctx, &marg.data, marg.total);
-    }
-
-    fn sync_ctx_cost_table(
-        &mut self,
-        st: &mut EncoderSliceState,
-        data: &[u8],
-        local_cur: Option<usize>,
-        s_end: usize,
-        uncomp: bool,
-    ) {
-        if !C::MULTI_CONTEXT || C::COST_MODEL_LEVEL < 3 {
-            return;
-        }
-        if uncomp {
-            st.ctx_cursor = 0;
-            return;
-        }
-        let (tl, cur) = (
-            self.md.total_literals as usize,
-            local_cur.unwrap_or(st.ctx_cursor),
-        );
-        self.apply_ctx_cost_update(
-            local_cur.is_some() || cur == 0,
-            data,
-            (cur, tl, st.parse.anchor, s_end),
-            None,
-            local_cur.is_some(),
-        );
-        st.ctx_cursor = local_cur.map_or(tl + (s_end - st.parse.anchor), |_| 0);
+        self.mid
+            .flush_cfg::<C>(self.qcfg, self.large_window, self.has_dict)
     }
 
     fn seed_stream_state(
@@ -1954,355 +2511,17 @@ impl<C: MatchConfig> EncoderInternal<C> {
         dict: Option<&PreparedDictionary>,
     ) {
         self.has_dict = dict.is_some();
-        let wsize = window_size(self.wbits);
-        let full_dict_len = match dict {
-            Some(d) => {
-                if self.qcfg.seed_ht_dict {
-                    let seed_ht4_win = if self.qcfg.max_insert_len == 0 {
-                        0
-                    } else if C::FAST_MATCHING {
-                        HT4_DICT_WINDOW
-                    } else {
-                        4 * HT4_DICT_WINDOW
-                    };
-                    self.ht.prepare_for_input_with_dict(
-                        wsize,
-                        expected_stream_len,
-                        d,
-                        seed_ht4_win,
-                        C::USE_3B_TABLE,
-                    );
-                } else {
-                    self.ht.prepare_for_input(wsize, expected_stream_len);
-                }
-                d.raw_len()
-            }
-            None => {
-                self.ht.prepare_for_input(wsize, expected_stream_len);
-                0
-            }
-        };
-        let eff_wsize = effective_window_size(wsize, in_buf.len(), full_dict_len);
-        let init_mode = choose_ctx_mode_for::<C>(&mut self.hb.ctx_rank, in_buf);
-        self.cost_model.ctx_mode = init_mode;
-        self.md.reset(init_mode, true);
-        let sample = &in_buf[..in_buf.len().min(2048)];
-        let h = &mut self.lit_hists[1];
-        h.data.fill(0);
-        h.total = sample.len() as u32;
-        count_literals_x4(sample, &mut h.data);
-        refresh_cost_model::<C>(
-            &mut self.cost_model,
-            (&[], &[], &[]),
-            (eff_wsize, true),
-            (&self.lit_hists[1], &self.lit_hists[1]),
+        self.mid.seed_stream_state::<C>(
+            &mut self.ht,
+            self.qcfg,
+            self.wbits,
+            in_buf,
+            expected_stream_len,
+            dict,
         );
-        if C::MULTI_CONTEXT && C::COST_MODEL_LEVEL >= 3 {
-            self.apply_ctx_cost_update(true, sample, (0, 0, 0, sample.len()), None, true);
-        }
     }
 
-    #[inline]
-    #[allow(clippy::too_many_arguments)]
-    fn flush_open_mb<D: SimdDescriptor>(
-        &mut self,
-        d: D,
-        st: &mut EncoderSliceState,
-        data: &[u8],
-        flush_end: usize,
-        use_mb_hists: bool,
-        bw: &mut BitWriter,
-    ) {
-        let fcfg = self.flush_cfg();
-        let _ = self.md.flush_metablock_with_desc(
-            d,
-            fcfg,
-            bw,
-            &mut self.hb,
-            data,
-            (st.parse.anchor, st.mb_start, flush_end),
-            (use_mb_hists.then_some(&self.lit_hists[0]), st.ctx_cursor),
-        );
-        st.parse.last_distances = self.md.dist_ring;
-        (st.mb_start, st.parse.anchor, st.ctx_cursor) = (flush_end, flush_end, 0);
-        (st.mb_has_slice, st.need_ctx_mode) = (false, true);
-    }
-
-    #[inline]
-    fn prepare_next_slice<D: SimdDescriptor>(
-        &mut self,
-        d: D,
-        st: &mut EncoderSliceState,
-        data: &[u8],
-        bw: &mut BitWriter,
-    ) -> SliceSnapshot {
-        let max_mb = self.md.max_mb;
-        if max_mb > SLICE_SIZE {
-            if st.mb_has_slice && st.parse.pos - st.mb_start > max_mb - SLICE_SIZE {
-                let flush_end = st.parse.pos;
-                self.flush_open_mb(d, st, data, flush_end, true, bw);
-            }
-            if st.need_ctx_mode {
-                let next_mode =
-                    choose_ctx_mode_for::<C>(&mut self.hb.ctx_rank, &data[st.parse.pos..]);
-                self.cost_model.ctx_mode = next_mode;
-                self.md.reset(next_mode, false);
-                st.parse.last_distances = self.md.dist_ring;
-                st.need_ctx_mode = false;
-            }
-        }
-        SliceSnapshot {
-            s_start: st.parse.pos,
-            saved_tl: self.md.total_literals as usize,
-            saved_icd: self.md.total_icd as usize,
-            saved_anchor: st.parse.anchor,
-        }
-    }
-
-    #[inline]
-    fn adopt_slice(
-        &mut self,
-        st: &mut EncoderSliceState,
-        data: &[u8],
-        (s_end, eff_wsize): (usize, usize),
-        (at_eof, reset_priors, uncomp): (bool, bool, bool),
-        cmd_range: std::ops::Range<usize>,
-    ) {
-        self.lit_hists.swap(0, 1);
-        st.mb_has_slice = true;
-        if !at_eof {
-            refresh_cost_model::<C>(
-                &mut self.cost_model,
-                self.md.cmd_slices(cmd_range),
-                (eff_wsize, reset_priors),
-                (&self.lit_hists[0], &self.lit_hists[0]),
-            );
-            self.sync_ctx_cost_table(st, data, None, s_end, uncomp);
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn finish_parsed_slice<D: SimdDescriptor>(
-        &mut self,
-        d: D,
-        st: &mut EncoderSliceState,
-        snap: SliceSnapshot,
-        data: &[u8],
-        eff_wsize: usize,
-        mode: StreamOp,
-        bw: &mut BitWriter,
-    ) {
-        let max_mb = self.md.max_mb;
-        if max_mb <= SLICE_SIZE
-            || (mode == StreamOp::Finish && !st.mb_has_slice && st.parse.pos >= data.len())
-        {
-            let end = st.parse.pos;
-            self.flush_open_mb(d, st, data, end, false, bw);
-            return;
-        }
-
-        let (s_start, s_end) = (snap.s_start, st.parse.pos);
-        let (new_tl, new_icd) = (self.md.total_literals as usize, self.md.total_icd as usize);
-        let (s_len, slice_cmds) = (s_end - s_start, new_icd - snap.saved_icd);
-        self.md
-            .slice_lit_hist(data, snap, s_end, st.parse.anchor, &mut self.lit_hists[1]);
-        let at_eof = mode == StreamOp::Finish && s_end >= data.len();
-        let slice_uncomp = s_len >= 1024
-            && should_emit_uncompressed(
-                s_len,
-                slice_cmds as u32,
-                self.lit_hists[1].total,
-                &self.lit_hists[1].data,
-            );
-
-        if !st.mb_has_slice {
-            self.adopt_slice(
-                st,
-                data,
-                (s_end, eff_wsize),
-                (at_eof, false, slice_uncomp),
-                snap.saved_icd..new_icd,
-            );
-            return;
-        }
-
-        let split_cost_bits: u64 = if C::MULTI_CONTEXT { 1152 } else { 1280 };
-        let force_size_split = s_end - st.mb_start > max_mb;
-        let mb_uncomp = should_emit_uncompressed(
-            s_start - st.mb_start,
-            snap.saved_icd as u32,
-            self.lit_hists[0].total,
-            &self.lit_hists[0].data,
-        );
-        let regime_flip = s_len >= 1024 && (mb_uncomp != slice_uncomp);
-        let jsd_gain = if !mb_uncomp && !slice_uncomp && s_len >= 8192 {
-            jsd_bit_gain(&self.lit_hists[0], &self.lit_hists[1])
-        } else {
-            0
-        };
-        let jsd_split = if self.qcfg.ctx_block_split {
-            (s_start - st.mb_start) >= 262_144 && jsd_gain > 3 * split_cost_bits
-        } else {
-            jsd_gain > split_cost_bits
-        };
-
-        if force_size_split || regime_flip || jsd_split {
-            let old_mode = self.md.context_mode;
-            let (stl, sicd) = (snap.saved_tl as u32, snap.saved_icd as u32);
-            (
-                self.md.total_literals,
-                self.md.iac_literals,
-                self.md.total_icd,
-            ) = (stl, stl, sicd);
-            let fcfg = self.flush_cfg();
-            let _ = self.md.flush_metablock_with_desc(
-                d,
-                fcfg,
-                bw,
-                &mut self.hb,
-                data,
-                (snap.saved_anchor, st.mb_start, s_start),
-                (Some(&self.lit_hists[0]), st.ctx_cursor),
-            );
-
-            let new_mode = if self.qcfg.ctx_block_split || slice_cmds == 0 {
-                choose_ctx_mode_for::<C>(&mut self.hb.ctx_rank, &data[s_start..s_end])
-            } else {
-                old_mode
-            };
-            self.cost_model.ctx_mode = new_mode;
-            self.md.reset(new_mode, false);
-            self.md
-                .shift_slice_to_front(fcfg, data, snap, new_tl, new_icd, new_mode == old_mode);
-            if slice_cmds == 0 {
-                st.parse.anchor = s_start;
-            }
-            let mut r = self.md.dist_ring;
-            for &raw_d in &self.md.distance[..slice_cmds] {
-                if (raw_d & STATIC_DICT_DIST_FLAG) == 0 {
-                    push_last_distance(&mut r, raw_d);
-                }
-            }
-            st.parse.last_distances = r;
-            (st.mb_start, st.ctx_cursor) = (s_start, 0);
-            self.adopt_slice(
-                st,
-                data,
-                (s_end, eff_wsize),
-                (at_eof, true, slice_uncomp),
-                0..slice_cmds,
-            );
-        } else {
-            let [mb_h, slice_h] = self.lit_hists.first_chunk_mut::<2>().unwrap();
-            mb_h.merge_from(slice_h);
-            if !at_eof {
-                let local_regime = self.qcfg.ctx_block_split
-                    && self.lit_hists[1].total >= 2048
-                    && jsd_gain > split_cost_bits;
-                let lv1_src = &self.lit_hists[usize::from(self.lit_hists[1].total >= 256)];
-                let active_lit = &self.lit_hists[usize::from(local_regime)];
-                refresh_cost_model::<C>(
-                    &mut self.cost_model,
-                    self.md.cmd_slices(snap.saved_icd..new_icd),
-                    (eff_wsize, false),
-                    (lv1_src, active_lit),
-                );
-                let local_cur =
-                    local_regime.then_some(snap.saved_tl + (s_start - snap.saved_anchor));
-                self.sync_ctx_cost_table(st, data, local_cur, s_end, slice_uncomp);
-            }
-        }
-    }
-
-    fn advance_slices_with_desc<D: SimdDescriptor>(
-        &mut self,
-        d: D,
-        st: &mut EncoderSliceState,
-        in_buf: &[u8],
-        dict: Option<&PreparedDictionary>,
-        mode: StreamOp,
-        bw: &mut BitWriter,
-    ) {
-        let dict = dict.filter(|d| !d.is_empty());
-        let has_dict = dict.is_some();
-        self.has_dict = has_dict;
-        let wsize = window_size(self.wbits);
-        let (active_dict, full_dict_len, raw_dict_idx, dict_idx): (
-            &[u8],
-            usize,
-            Option<&crate::hashtable::RawDictIndex>,
-            Option<&crate::hashtable::Dict5Index>,
-        ) = dict.map_or((&[], 0, None, None), |pd| {
-            (
-                pd.active_slice(wsize),
-                pd.raw_len(),
-                C::FAST_MATCHING.then(|| pd.raw_index()),
-                (!C::FAST_MATCHING && !self.qcfg.ctx_block_split).then(|| pd.dict5_index()),
-            )
-        });
-        let eff_wsize = effective_window_size(wsize, in_buf.len(), full_dict_len);
-        let max_mb = self.md.max_mb;
-
-        while if mode == StreamOp::Process {
-            in_buf.len() >= st.parse.pos + SLICE_SIZE + 1024
-        } else {
-            st.parse.pos < in_buf.len()
-        } {
-            let snap = self.prepare_next_slice(d, st, in_buf, bw);
-            let target_end = if max_mb <= SLICE_SIZE {
-                in_buf.len()
-            } else {
-                (st.parse.pos + SLICE_SIZE).min(in_buf.len())
-            };
-            let (ht, md, cost_model, qcfg, lw) = (
-                &mut self.ht,
-                &mut self.md,
-                &self.cost_model,
-                self.qcfg,
-                self.large_window,
-            );
-            md.with_sink(|sink| {
-                ht.parse_slice_with_desc::<C, _>(
-                    d,
-                    qcfg,
-                    lw,
-                    has_dict,
-                    (in_buf, target_end, wsize),
-                    (active_dict, full_dict_len, raw_dict_idx, dict_idx),
-                    &mut st.parse,
-                    sink,
-                    cost_model,
-                );
-            });
-            self.finish_parsed_slice(d, st, snap, in_buf, eff_wsize, mode, bw);
-        }
-        if st.mb_has_slice {
-            let end = if mode != StreamOp::Process {
-                (st.mb_start < in_buf.len()).then_some(in_buf.len())
-            } else {
-                (st.parse.pos - st.mb_start > max_mb - SLICE_SIZE).then_some(st.parse.pos)
-            };
-            if let Some(flush_end) = end {
-                self.flush_open_mb(d, st, in_buf, flush_end, true, bw);
-            }
-        }
-    }
-
-    #[inline(always)]
-    fn advance_slices(
-        &mut self,
-        st: &mut EncoderSliceState,
-        in_buf: &[u8],
-        dict: Option<&PreparedDictionary>,
-        mode: StreamOp,
-        bw: &mut BitWriter,
-        use_simd: bool,
-    ) {
-        with_simd_256!(use_simd, |d| {
-            self.advance_slices_with_desc(d, st, in_buf, dict, mode, bw);
-        });
-    }
-
+    #[cfg(test)]
     fn compress_one_shot_with_desc<D: SimdDescriptor>(
         &mut self,
         d: D,
@@ -2310,16 +2529,13 @@ impl<C: MatchConfig> EncoderInternal<C> {
         dict: Option<&PreparedDictionary>,
         bw: &mut BitWriter,
     ) {
-        write_window_bits(self.wbits, self.large_window, bw);
-        if !data.is_empty() {
-            let dict = dict.filter(|d| !d.is_empty());
-            self.seed_stream_state(data, data.len(), dict);
-            let mut st = EncoderSliceState::default();
-            self.advance_slices_with_desc(d, &mut st, data, dict, StreamOp::Finish, bw);
-        }
-        write_empty_last_metablock(bw);
+        let rc = self.run_cfg();
+        self.mid
+            .compress_one_shot_with_desc::<C, _>(d, &mut self.ht, rc, data, dict, bw);
+        self.has_dict = dict.filter(|d| !d.is_empty()).is_some();
     }
 
+    #[cfg(test)]
     #[inline(always)]
     fn compress_one_shot(
         &mut self,
@@ -2352,12 +2568,6 @@ const fn max_two_pass_output_size(input_len: usize) -> usize {
 
 type OptDict<'a> = Option<&'a PreparedDictionary>;
 
-trait EncoderImpl: Send + Sync {
-    fn set_wbits(&mut self, wbits: usize);
-    fn checked_max_output_size(&self, input_len: usize) -> Option<usize>;
-    fn compress_into(&mut self, data: &[u8], dict: OptDict<'_>, bw: &mut BitWriter<'_>);
-}
-
 #[inline(always)]
 fn select_tier<T: Copy>(
     wbits: usize,
@@ -2370,89 +2580,6 @@ fn select_tier<T: Copy>(
     });
     let idx = usize::from(eff_len > SMALL_STREAM_MAX) + usize::from(eff_len > MEDIUM_STREAM_MAX);
     (eff_len, tiers[idx])
-}
-
-impl EncoderImpl for (OnePassEncoder, [(u8, u8); 3]) {
-    fn set_wbits(&mut self, wbits: usize) {
-        self.0.set_wbits(wbits);
-        self.1 = q0_tiers(wbits > STD_MAX_WBITS);
-    }
-
-    fn checked_max_output_size(&self, input_len: usize) -> Option<usize> {
-        fast_twopass_checked_max_output_size_for(input_len, ONEPASS_CHUNK_SIZE)
-    }
-
-    fn compress_into(&mut self, data: &[u8], dict: OptDict<'_>, bw: &mut BitWriter<'_>) {
-        let (_, (mls, log)) = select_tier(self.0.wbits(), data.len(), None, self.1);
-        self.0.configure(mls, log as u32);
-        compress_fast_with_simd(&mut self.0, data, dict, bw, true);
-    }
-}
-
-impl EncoderImpl for (FastTwoPassEncoder, [(u8, u8, u8); 3]) {
-    fn set_wbits(&mut self, wbits: usize) {
-        self.0.set_wbits(wbits);
-    }
-
-    fn checked_max_output_size(&self, input_len: usize) -> Option<usize> {
-        fast_twopass_checked_max_output_size_for(input_len, FAST_TWOPASS_CHUNK_SIZE)
-    }
-
-    fn compress_into(&mut self, data: &[u8], dict: OptDict<'_>, bw: &mut BitWriter<'_>) {
-        let (eff_len, (mls, log, slog)) = select_tier(self.0.wbits(), data.len(), None, self.1);
-        self.0
-            .configure_tiered(eff_len, mls, log as u32, slog as u32);
-        compress_fast_with_simd(&mut self.0, data, dict, bw, true);
-    }
-}
-
-impl<C: MatchConfig> EncoderImpl for EncoderInternal<C> {
-    fn set_wbits(&mut self, wbits: usize) {
-        self.wbits = wbits;
-        self.large_window = wbits > STD_MAX_WBITS;
-    }
-
-    fn checked_max_output_size(&self, input_len: usize) -> Option<usize> {
-        checked_max_two_pass_output_size(input_len)
-    }
-
-    fn compress_into(&mut self, data: &[u8], dict: OptDict<'_>, bw: &mut BitWriter<'_>) {
-        let (eff_len, TierParams(ways, ht4_ways, log, ht4_log, mb_kib)) = select_tier(
-            self.wbits,
-            data.len(),
-            self.qcfg.seed_ht_dict.then_some(dict).flatten(),
-            self.tiers,
-        );
-        let pos_bits = if self.large_window && eff_len > COMPACT_LW_STREAM_MAX {
-            31
-        } else {
-            25
-        };
-        self.configure_tier(
-            pos_bits,
-            ways,
-            ht4_ways,
-            log as u32,
-            ht4_log as u32,
-            (mb_kib as usize) * 1024,
-            Some(data.len()),
-        );
-        self.compress_one_shot(data, dict, bw, true);
-    }
-}
-
-impl EncoderImpl for Q11Encoder {
-    fn set_wbits(&mut self, wbits: usize) {
-        Q11Encoder::set_wbits(self, wbits);
-    }
-
-    fn checked_max_output_size(&self, input_len: usize) -> Option<usize> {
-        input_len.checked_mul(2)?.checked_add(1024 + 64)
-    }
-
-    fn compress_into(&mut self, data: &[u8], dict: OptDict<'_>, bw: &mut BitWriter<'_>) {
-        Q11Encoder::compress_into(self, data, dict, bw);
-    }
 }
 
 impl<C: MatchConfig> StreamEngine for EncoderInternal<C> {
@@ -2494,7 +2621,9 @@ impl<C: MatchConfig> StreamEngine for EncoderInternal<C> {
         bw: &mut BitWriter<'_>,
     ) -> bool {
         if self.stream_st.mb_start < in_buf.len() {
+            let non_empty_dict = dict.filter(|d| !d.is_empty());
             if !self.stream_init {
+                self.has_dict = non_empty_dict.is_some();
                 let TierParams(ways, ht4_ways, log, ht4_log, mb_kib) = self.tiers[2];
                 let max_len = (op == StreamOp::Finish).then_some(in_buf.len());
                 let pos_bits = if self.large_window { 31 } else { 25 };
@@ -2507,13 +2636,25 @@ impl<C: MatchConfig> StreamEngine for EncoderInternal<C> {
                     (mb_kib as usize) * 1024,
                     max_len,
                 );
-                let non_empty_dict = dict.filter(|d| !d.is_empty());
                 self.seed_stream_state(in_buf, window_size(self.wbits), non_empty_dict);
                 self.stream_st = EncoderSliceState::default();
                 self.stream_init = true;
             }
+            let rc = self.run_cfg();
             let mut st = std::mem::take(&mut self.stream_st);
-            self.advance_slices(&mut st, in_buf, dict, op, bw, true);
+            with_simd_256!(true, |d| {
+                self.mid.advance_slices_with_desc::<C, _>(
+                    d,
+                    &mut self.ht,
+                    rc,
+                    &mut st,
+                    in_buf,
+                    dict,
+                    op,
+                    bw,
+                );
+            });
+            self.has_dict = non_empty_dict.is_some();
             self.stream_st = st;
         }
         false
@@ -2652,10 +2793,89 @@ pub(crate) fn build_stream_engine(
     }
 }
 
+thread_local! {
+    static TLS_ENCODER: std::cell::RefCell<Option<Box<Encoder>>> = const { std::cell::RefCell::new(None) };
+}
+
 type OptOut<'a> = Option<&'a mut [MaybeUninit<u8>]>;
 
+struct EncoderCore {
+    quality: u32,
+    wbits: usize,
+    num_threads: usize,
+    ht: HashTable,
+    q0: Option<OnePassCore>,
+    q1: Option<FastTwoPassCore>,
+    mid: Option<Box<MidState>>,
+    q11: Option<Box<Q11Encoder>>,
+}
+
+impl EncoderCore {
+    fn compress_with_bw(&mut self, data: &[u8], dict: OptDict<'_>, bw: &mut BitWriter<'_>) {
+        let (quality, wbits) = (self.quality, self.wbits);
+        let lw = wbits > STD_MAX_WBITS;
+        match quality {
+            0 => {
+                let q0 = self.q0.get_or_insert_with(|| OnePassCore::new(wbits));
+                q0.set_wbits(wbits);
+                let (_, (mls, log)) = select_tier(wbits, data.len(), None, q0_tiers(lw));
+                q0.configure(&mut self.ht, mls, log as u32);
+                compress_fast_with_simd(&mut (&mut self.ht, q0), data, dict, bw, true);
+            }
+            1 => {
+                let q1 = self
+                    .q1
+                    .get_or_insert_with(|| FastTwoPassCore::new(1, wbits, FAST_TWOPASS_CHUNK_SIZE));
+                q1.set_wbits(wbits);
+                let (eff_len, (mls, log, slog)) = select_tier(wbits, data.len(), None, Q1_TIERS);
+                q1.configure_tiered(&mut self.ht, eff_len, mls, log as u32, slog as u32);
+                compress_fast_with_simd(&mut (&mut self.ht, q1), data, dict, bw, true);
+            }
+            2..=9 => {
+                let mid = self.mid.get_or_insert_with(|| Box::new(MidState::new()));
+                macro_rules! run_mid {
+                    ($C:ty, $qcfg:expr, $tier_idx:expr) => {
+                        mid.compress_one_shot::<$C>(
+                            &mut self.ht,
+                            ($qcfg, wbits, TWO_PASS_TIERS[$tier_idx]),
+                            data,
+                            dict,
+                            bw,
+                        )
+                    };
+                }
+                match quality {
+                    2 => run_mid!(ArchQ3, QualityCfg::Q2, 0),
+                    3 => run_mid!(ArchQ35, QualityCfg::Q3, 1),
+                    4 => run_mid!(ArchQ4, QualityCfg::Q4, 2),
+                    5 | 6 => run_mid!(
+                        ArchQ56,
+                        Q5_TO_8_CFGS[quality as usize - 5],
+                        quality as usize - 2
+                    ),
+                    7 | 8 => run_mid!(
+                        ArchQ78,
+                        Q5_TO_8_CFGS[quality as usize - 5],
+                        quality as usize - 2
+                    ),
+                    _ => run_mid!(ArchQ9, QualityCfg::Q9, 7),
+                }
+            }
+            _ => {
+                let num_threads = self.num_threads;
+                let q11 = self
+                    .q11
+                    .get_or_insert_with(|| Box::new(Q11Encoder::new(quality, wbits, num_threads)));
+                q11.set_wbits(wbits);
+                q11.set_quality(quality);
+                q11.compress_into(data, dict, bw);
+            }
+        }
+    }
+}
+
 pub struct Encoder {
-    inner: Box<dyn EncoderImpl>,
+    core: EncoderCore,
     bwbuf: Vec<MaybeUninit<u8>>,
 }
 
@@ -2677,23 +2897,42 @@ impl Encoder {
     /// Creates an encoder configured for `(quality, lgwin, num_threads)`.
     pub fn with_threads(quality: u32, lgwin: u32, num_threads: usize) -> Encoder {
         let wbits = (lgwin as usize).clamp(MIN_WBITS, LARGE_MAX_WBITS);
-        let lw = wbits > STD_MAX_WBITS;
-        let inner: Box<dyn EncoderImpl> = match quality {
-            0 => Box::new((OnePassEncoder::new(wbits), q0_tiers(lw))),
-            1 => Box::new((
-                FastTwoPassEncoder::new(1, wbits, FAST_TWOPASS_CHUNK_SIZE),
-                Q1_TIERS,
-            )),
-            _ => box_two_pass!(
+        Encoder {
+            core: EncoderCore {
                 quality,
                 wbits,
-                lw,
-                Box::new(Q11Encoder::new(quality, wbits, num_threads))
-            ),
-        };
-        Encoder {
-            inner,
+                num_threads,
+                ht: HashTable::new(),
+                q0: (quality == 0).then(|| OnePassCore::new(wbits)),
+                q1: (quality == 1).then(|| FastTwoPassCore::new(1, wbits, FAST_TWOPASS_CHUNK_SIZE)),
+                mid: (2..=9)
+                    .contains(&quality)
+                    .then(|| Box::new(MidState::new())),
+                q11: (quality >= 10)
+                    .then(|| Box::new(Q11Encoder::new(quality, wbits, num_threads))),
+            },
             bwbuf: Vec::new(),
+        }
+    }
+
+    /// Reconfigures the compression `quality` (`0..=12`) while retaining hash tables,
+    /// scratch buffers, and output storage across calls.
+    pub fn set_quality(&mut self, quality: u32) {
+        self.core.quality = quality;
+        if quality >= 10 {
+            match self.core.q11.as_deref_mut() {
+                Some(q11) => {
+                    q11.set_wbits(self.core.wbits);
+                    q11.set_quality(quality);
+                }
+                None => {
+                    self.core.q11 = Some(Box::new(Q11Encoder::new(
+                        quality,
+                        self.core.wbits,
+                        self.core.num_threads,
+                    )));
+                }
+            }
         }
     }
 
@@ -2702,19 +2941,40 @@ impl Encoder {
     /// buffers and advancing hash-table virtual positions without re-zeroing across standard windows.
     pub fn set_lgwin(&mut self, lgwin: u32) {
         let wbits = (lgwin as usize).clamp(MIN_WBITS, LARGE_MAX_WBITS);
-        self.inner.set_wbits(wbits);
+        self.core.wbits = wbits;
+        if let Some(q0) = self.core.q0.as_mut() {
+            q0.set_wbits(wbits);
+        }
+        if let Some(q1) = self.core.q1.as_mut() {
+            q1.set_wbits(wbits);
+        }
+        if let Some(q11) = self.core.q11.as_deref_mut() {
+            q11.set_wbits(wbits);
+        }
     }
 
-    /// Shrinks or frees internal output scratch (`bwbuf`) if its capacity exceeds
-    /// `max_retained_bytes` (`0` releases the internal output buffer completely).
+    /// Frees internal output scratch (`bwbuf`) if its capacity exceeds `max_retained_bytes`.
     pub fn trim_scratch(&mut self, max_retained_bytes: usize) {
         if self.bwbuf.capacity() > max_retained_bytes {
-            self.bwbuf = if max_retained_bytes == 0 {
-                Vec::new()
-            } else {
-                Vec::with_capacity(max_retained_bytes)
-            };
+            self.bwbuf = Vec::new();
         }
+    }
+
+    /// Conservative upper bound on the scratch / output buffer size needed for one-shot
+    /// compression of `input_len` bytes at `quality` (`None` on `usize` overflow).
+    pub fn checked_max_required_size_for(quality: u32, input_len: usize) -> Option<usize> {
+        match quality {
+            0 => fast_twopass_checked_max_output_size_for(input_len, ONEPASS_CHUNK_SIZE),
+            1 => fast_twopass_checked_max_output_size_for(input_len, FAST_TWOPASS_CHUNK_SIZE),
+            2..=9 => checked_max_two_pass_output_size(input_len),
+            _ => input_len.checked_mul(2)?.checked_add(1024 + 64),
+        }
+    }
+
+    /// Conservative upper bound on the scratch / output buffer size needed for one-shot
+    /// compression of `input_len` bytes at `quality` (saturating to `usize::MAX` on overflow).
+    pub fn max_required_size_for(quality: u32, input_len: usize) -> usize {
+        Self::checked_max_required_size_for(quality, input_len).unwrap_or(usize::MAX)
     }
 
     /// Conservative upper bound on the scratch / output buffer size needed for one-shot
@@ -2724,9 +2984,42 @@ impl Encoder {
     /// `max_required_size(data.len()) > isize::MAX as usize`; use [`crate::StreamingEncoder`] for
     /// arbitrarily large streams (especially on 32-bit targets).
     pub fn max_required_size(&self, input_len: usize) -> usize {
-        self.inner
-            .checked_max_output_size(input_len)
-            .unwrap_or(usize::MAX)
+        Self::max_required_size_for(self.core.quality, input_len)
+    }
+
+    fn compress_into_bwbuf(&mut self, data: &[u8], dict: OptDict<'_>, max_req: usize) -> &[u8] {
+        const BWBUF_RETAIN_FLOOR: usize = 1 << 20;
+        let retain_cap = max_req.max(BWBUF_RETAIN_FLOOR).saturating_mul(4);
+        if self.bwbuf.capacity() > retain_cap {
+            let mut shrunk = Vec::with_capacity(max_req.max(BWBUF_RETAIN_FLOOR));
+            shrunk.resize(max_req, MaybeUninit::uninit());
+            self.bwbuf = shrunk;
+        } else if self.bwbuf.len() < max_req {
+            self.bwbuf.resize(max_req, MaybeUninit::uninit());
+        }
+        let mut bw = BitWriter::new_uninit(&mut self.bwbuf[..max_req]);
+        self.core.compress_with_bw(data, dict, &mut bw);
+        bw.finalize()
+    }
+
+    fn encode_into_caller<'a>(
+        &mut self,
+        data: &[u8],
+        dict: OptDict<'_>,
+        out_buf: &'a mut [MaybeUninit<u8>],
+    ) -> Option<&'a [u8]> {
+        let dict = dict.filter(|d| !d.is_empty());
+        let max_req = Self::checked_max_required_size_for(self.core.quality, data.len())
+            .filter(|&n| n <= isize::MAX as usize)?;
+        if out_buf.len() >= max_req {
+            let mut bw = BitWriter::new_uninit(out_buf);
+            self.core.compress_with_bw(data, dict, &mut bw);
+            Some(bw.finalize())
+        } else {
+            let encoded = self.compress_into_bwbuf(data, dict, max_req);
+            (encoded.len() <= out_buf.len())
+                .then(|| &*out_buf[..encoded.len()].write_copy_of_slice(encoded))
+        }
     }
 
     fn encode_with<'a>(
@@ -2735,37 +3028,13 @@ impl Encoder {
         dict: OptDict<'_>,
         out_buf: OptOut<'a>,
     ) -> Option<&'a [u8]> {
-        let dict = dict.filter(|d| !d.is_empty());
-        let max_req = self
-            .inner
-            .checked_max_output_size(data.len())
-            .filter(|&n| n <= isize::MAX as usize)?;
         match out_buf {
-            Some(b) if b.len() >= max_req => {
-                let mut bw = BitWriter::new_uninit(b);
-                self.inner.compress_into(data, dict, &mut bw);
-                Some(bw.finalize())
-            }
-            out_buf => {
-                const BWBUF_RETAIN_FLOOR: usize = 1 << 20;
-                let retain_cap = max_req.max(BWBUF_RETAIN_FLOOR).saturating_mul(4);
-                if self.bwbuf.capacity() > retain_cap {
-                    let mut shrunk = Vec::with_capacity(max_req.max(BWBUF_RETAIN_FLOOR));
-                    shrunk.resize(max_req, MaybeUninit::uninit());
-                    self.bwbuf = shrunk;
-                } else if self.bwbuf.len() < max_req {
-                    self.bwbuf.resize(max_req, MaybeUninit::uninit());
-                }
-                let mut bw = BitWriter::new_uninit(&mut self.bwbuf[..max_req]);
-                self.inner.compress_into(data, dict, &mut bw);
-                let encoded = bw.finalize();
-                match out_buf {
-                    Some(b) if encoded.len() <= b.len() => {
-                        Some(b[..encoded.len()].write_copy_of_slice(encoded))
-                    }
-                    Some(_) => None,
-                    None => Some(encoded),
-                }
+            Some(b) => self.encode_into_caller(data, dict, b),
+            None => {
+                let dict = dict.filter(|d| !d.is_empty());
+                let max_req = Self::checked_max_required_size_for(self.core.quality, data.len())
+                    .filter(|&n| n <= isize::MAX as usize)?;
+                Some(self.compress_into_bwbuf(data, dict, max_req))
             }
         }
     }
@@ -2786,6 +3055,67 @@ impl Encoder {
         out_buf: Option<&'a mut [MaybeUninit<u8>]>,
     ) -> Option<&'a [u8]> {
         self.encode_with(data, Some(dict), out_buf)
+    }
+
+    fn with_tls<R>(quality: u32, lgwin: u32, f: impl FnOnce(&mut Encoder) -> R) -> R {
+        TLS_ENCODER.with(|cell| {
+            let enc = cell
+                .try_borrow_mut()
+                .ok()
+                .and_then(|mut slot| slot.take())
+                .map(|mut enc| {
+                    enc.set_quality(quality);
+                    enc.set_lgwin(lgwin);
+                    enc
+                })
+                .unwrap_or_else(|| Box::new(Encoder::with_threads(quality, lgwin, 1)));
+            struct TlsGuard<'a> {
+                cell: &'a std::cell::RefCell<Option<Box<Encoder>>>,
+                enc: Option<Box<Encoder>>,
+            }
+            impl Drop for TlsGuard<'_> {
+                fn drop(&mut self) {
+                    if let Some(mut enc) = self.enc.take() {
+                        enc.trim_scratch(1 << 20);
+                        if let Ok(mut slot) = self.cell.try_borrow_mut() {
+                            if slot.is_none() {
+                                *slot = Some(enc);
+                            }
+                        }
+                    }
+                }
+            }
+            let mut guard = TlsGuard {
+                cell,
+                enc: Some(enc),
+            };
+            f(guard.enc.as_mut().unwrap())
+        })
+    }
+
+    /// One-shot compression using a reusable thread-local encoder into caller-provided `out_buf`.
+    pub fn compress_into_tls<'a>(
+        quality: u32,
+        lgwin: u32,
+        data: &[u8],
+        dict: Option<&PreparedDictionary>,
+        out_buf: &'a mut [MaybeUninit<u8>],
+    ) -> Option<&'a [u8]> {
+        Self::with_tls(quality, lgwin, |enc| {
+            enc.encode_into_caller(data, dict, out_buf)
+        })
+    }
+
+    /// One-shot compression using a reusable thread-local encoder, returning a fresh `Vec<u8>`.
+    pub fn compress_vec_tls(
+        quality: u32,
+        lgwin: u32,
+        data: &[u8],
+        dict: Option<&PreparedDictionary>,
+    ) -> Option<Vec<u8>> {
+        Self::with_tls(quality, lgwin, |enc| {
+            enc.encode_with(data, dict, None).map(<[u8]>::to_vec)
+        })
     }
 
     pub fn is_supported() -> bool {
@@ -2917,13 +3247,13 @@ mod test {
                 pos: start,
                 anchor: start,
                 stream_base: 0,
-                last_distances: self.md.dist_ring,
+                last_distances: self.mid.md.dist_ring,
             };
             let end = (start + len).min(data.len());
             let (ht, md, cost_model, qcfg, lw, wbits) = (
                 &mut self.ht,
-                &mut self.md,
-                &self.cost_model,
+                &mut self.mid.md,
+                &self.mid.cost_model,
                 self.qcfg,
                 self.large_window,
                 self.wbits,
@@ -2959,12 +3289,17 @@ mod test {
             let mut qcfg_eff = qcfg;
             qcfg_eff.ctx_block_split = split;
             let mut e = Self::with_test_tier(layout, wbits, qcfg_eff, lw, log);
-            e.cost_model.ctx_mode = mode;
+            e.mid.cost_model.ctx_mode = mode;
             e.ht.prepare_for_input(window_size(wbits), data.len());
-            e.md.reset(mode, true);
+            e.mid.md.reset(mode, true);
             let mut st = SliceParseState::new();
-            let (ht, md, cost_model, lw, wbits_v) =
-                (&mut e.ht, &mut e.md, &e.cost_model, e.large_window, e.wbits);
+            let (ht, md, cost_model, lw, wbits_v) = (
+                &mut e.ht,
+                &mut e.mid.md,
+                &e.mid.cost_model,
+                e.large_window,
+                e.wbits,
+            );
             md.with_sink(|sink| {
                 ht.parse_slice::<C>(
                     qcfg_eff,
@@ -2984,17 +3319,17 @@ mod test {
             let mut bw = BitWriter::new(&mut out);
             write_window_bits(wbits, lw, &mut bw);
             let fcfg = e.flush_cfg();
-            let _ = e.md.flush_metablock(
+            let _ = e.mid.md.flush_metablock(
                 fcfg,
                 &mut bw,
-                &mut e.hb,
+                &mut e.mid.hb,
                 data,
                 (st.anchor, 0, n),
                 (None, 0),
                 use_simd,
             );
             write_empty_last_metablock(&mut bw);
-            (e.md, bw.finalize().to_vec())
+            (e.mid.md, bw.finalize().to_vec())
         }
 
         fn enc_port(
@@ -3098,15 +3433,15 @@ mod test {
             write_window_bits(self.wbits, self.large_window, &mut bw);
             let (mut pos, mut bi) = (0, 0);
             while pos < data.len() {
-                self.md.reset(ContextMode::Signed, bi == 0);
+                self.mid.md.reset(ContextMode::Signed, bi == 0);
                 let (step, anchor) = self.parse_span(data, pos, step_len(bi, pos));
                 let end = pos + step;
-                let pre_icd = self.md.total_icd;
+                let pre_icd = self.mid.md.total_icd;
                 let fcfg = self.flush_cfg();
-                let uncomp = self.md.flush_metablock(
+                let uncomp = self.mid.md.flush_metablock(
                     fcfg,
                     &mut bw,
-                    &mut self.hb,
+                    &mut self.mid.hb,
                     data,
                     (anchor, pos, end),
                     (None, 0),
@@ -3474,9 +3809,11 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
             false,
         );
         md.dist_ring = INITIAL_LAST_DISTANCES;
+        let mut dist_counts = [[0u32; MAX_HUFFMAN_ALPHABET]; 2];
         let (npostfix, ndirect) = md.select_distance_params(
             FlushCfg::from_qcfg::<ArchQ56>(QualityCfg::Q6, false),
             &mut Vec::new(),
+            &mut dist_counts,
         );
         assert!(npostfix == 2 && (ndirect >> npostfix) < 16);
         assert_roundtrip_matrix(&aligned_bin, &[6, 7, 8, 9], &[22, 28]);
@@ -4183,6 +4520,7 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
             prep: Option<(&PreparedDictionary, &[u8])>,
         ) -> Vec<u8> {
             let mut enc = EncoderInternal::<C>::new(wbits, qcfg, lw, TWO_PASS_TIERS[0]);
+            enc.has_dict = prep.is_some();
             enc.configure_tier(
                 pos_bits,
                 ways,
@@ -4224,10 +4562,10 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
             e.seed_stream_state(data, data.len(), Some(prep));
             let mut fcfg = e.flush_cfg();
             fcfg.multi_context = multi_ctx;
-            e.cost_model.ctx_mode = ContextMode::UTF8;
-            e.md.reset(ContextMode::UTF8, true);
+            e.mid.cost_model.ctx_mode = ContextMode::UTF8;
+            e.mid.md.reset(ContextMode::UTF8, true);
             let mut st = SliceParseState::new();
-            let (ht, md, cost_model) = (&mut e.ht, &mut e.md, &e.cost_model);
+            let (ht, md, cost_model) = (&mut e.ht, &mut e.mid.md, &e.mid.cost_model);
             md.with_sink(|sink| {
                 ht.parse_slice_with_desc::<ArchQ56, _>(
                     d,
@@ -4248,23 +4586,23 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
             });
             md.add_remaining_literals(multi_ctx, data, st.anchor, data.len());
             {
-                let (_, _, lit_hist) = e.hb.ensure_hists();
+                let (_, _, lit_hist) = e.mid.hb.ensure_hists();
                 count_literals_x4(
                     &md.literals[..md.total_literals as usize],
                     &mut lit_hist.data,
                 );
                 lit_hist.total = md.total_literals;
             }
-            let mut clusters = md.prepare_lit_clusters(fcfg, &mut e.hb, 0);
-            let (use_mc, cmap) = clusters
-                .as_ref()
-                .map_or((false, [0u8; 64]), |(_, _, m)| (true, *m));
+            let clusters = md.prepare_lit_clusters(fcfg, &mut e.mid.hb, 0);
+            let (use_mc, cmap) = clusters.map_or((false, [0u8; 64]), |m| (true, m));
             assert_eq!(use_mc, multi_ctx, "expected multi_ctx={multi_ctx}");
-            let (np, nd) = md.select_distance_params(fcfg, &mut e.hb.dist_samples);
+            let mut dist_counts = [[0u32; MAX_HUFFMAN_ALPHABET]; 2];
+            let (np, nd) =
+                md.select_distance_params(fcfg, &mut e.mid.hb.dist_samples, &mut dist_counts);
             let d_alpha = dist_alphabet_size(np, nd, false);
             let trailing_lits = md.total_literals - md.iac_literals;
             {
-                let (iac_hist, dist_hist, _) = e.hb.ensure_hists();
+                let (iac_hist, dist_hist, _) = e.mid.hb.ensure_hists();
                 iac_hist.fill(0);
                 dist_hist[..d_alpha].fill(0);
                 dist_hist[MAX_HUFFMAN_ALPHABET..][..d_alpha].fill(0);
@@ -4276,10 +4614,8 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
             let _ = md.build_codes_and_write_header(
                 fcfg,
                 (data.len(), np, nd),
-                &mut e.hb,
-                clusters
-                    .as_mut()
-                    .map(|(f, t, _)| (f.as_mut_slice(), t.as_slice())),
+                &mut e.mid.hb,
+                use_mc,
                 &cmap,
                 &mut bw,
             );
@@ -4577,6 +4913,58 @@ Strict-Transport-Security: max-age=31536000; includeSubDomains
             );
             enc.trim_scratch(0);
             assert_eq!(enc.bwbuf.capacity(), 0);
+            enc.trim_scratch(1 << 20);
+            assert_eq!(enc.bwbuf.capacity(), 0);
+        }
+    }
+
+    #[test]
+    fn test_set_quality_mixed_size_reuse_and_tls() {
+        let small = tagged_bytes(miri_or(16, 20), b"small_reuse_", 0);
+        let medium = tagged_bytes(miri_or(40, 2600), b"medium_reuse_", 17);
+        let mut enc = Encoder::with_lgwin(5, 22);
+        let c0 = enc.compress(&small, None).unwrap().to_vec();
+        assert_eq!(decompress_brotli(&c0), small);
+        let vpos_after_small = enc.core.ht.max_vpos_used;
+        assert!(vpos_after_small > 0);
+        let c1 = enc.compress(&medium, None).unwrap().to_vec();
+        assert_eq!(decompress_brotli(&c1), medium);
+        assert!(enc.core.ht.max_vpos_used > vpos_after_small);
+        let vpos_after_med = enc.core.ht.max_vpos_used;
+        let c2 = enc.compress(&small, None).unwrap().to_vec();
+        assert_eq!(decompress_brotli(&c2), small);
+        assert!(enc.core.ht.max_vpos_used > vpos_after_med);
+        let vpos_after_small2 = enc.core.ht.max_vpos_used;
+        let _ = enc.compress(&medium, None).unwrap();
+        assert!(enc.core.ht.max_vpos_used > vpos_after_small2);
+
+        let qs = miri_or(
+            &[0u32, 1, 5, 9][..],
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11][..],
+        );
+        let mut switch_enc = Encoder::with_lgwin(qs[0], 22);
+        let mut out_buf =
+            vec![MaybeUninit::uninit(); Encoder::max_required_size_for(11, medium.len())];
+        for &q in qs {
+            switch_enc.set_quality(q);
+            let out_switch = switch_enc.compress(&medium, None).unwrap().to_vec();
+            let mut fresh = Encoder::with_lgwin(q, 22);
+            let out_fresh = fresh.compress(&medium, None).unwrap().to_vec();
+            assert_eq!(out_switch, out_fresh, "set_quality mismatch at q={q}");
+
+            let tls_slice = Encoder::compress_into_tls(q, 22, &medium, None, &mut out_buf).unwrap();
+            assert_eq!(tls_slice, out_fresh.as_slice(), "compress_into_tls q={q}");
+            let tls_vec = Encoder::compress_vec_tls(q, 22, &medium, None).unwrap();
+            assert_eq!(tls_vec, out_fresh, "compress_vec_tls q={q}");
+        }
+
+        if !cfg!(miri) {
+            let mut scratch_enc = Encoder::with_lgwin(5, 22);
+            scratch_enc.trim_scratch(1 << 20);
+            assert_eq!(scratch_enc.bwbuf.capacity(), 0);
+            scratch_enc.bwbuf = Vec::with_capacity(2 << 20);
+            scratch_enc.trim_scratch(1 << 20);
+            assert_eq!(scratch_enc.bwbuf.capacity(), 0);
         }
     }
 

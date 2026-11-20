@@ -717,13 +717,18 @@ fn min_len_for_dist(dist: u32) -> u32 {
 
 #[derive(Default)]
 pub(super) struct MatchGenScratch {
-    buckets: Vec<u32>,
+    buckets: HugePageBuf<u32>,
     bucket_shift: u32,
-    forest: Vec<u32>,
+    forest: HugePageBuf<u32>,
     ring_mask: usize,
     comp_cap: usize,
-    ht3: Vec<[u32; 4]>,
+    ht3: HugePageBuf<[u32; 4]>,
     ht3_shift: u32,
+    vpos_base: usize,
+    max_vpos_used: usize,
+    buf_origin: usize,
+    dirty_buckets: usize,
+    dirty_ht3: usize,
     inc: (usize, usize, usize, usize),
     prev_rep_dist: usize,
     prev_rep_end: usize,
@@ -755,15 +760,44 @@ impl MatchGenScratch {
         {
             return chunk_start;
         }
-        self.buckets.clear();
-        self.buckets.resize(n_buckets, 0);
+        let b_realloc = n_buckets > self.buckets.capacity();
+        self.buckets.resize_or_grow_zeroed(n_buckets);
+        self.dirty_buckets = if b_realloc {
+            n_buckets
+        } else {
+            self.dirty_buckets.max(n_buckets)
+        };
         self.bucket_shift = (32 - bucket_bits) as u32;
         if self.forest.len() < 2 * ring_cap {
-            self.forest.resize(2 * ring_cap, 0);
+            self.forest.resize_or_grow_zeroed(2 * ring_cap);
         }
-        self.ht3.clear();
-        self.ht3.resize(n_ht3, [0; 4]);
+        let h3_realloc = n_ht3 > self.ht3.capacity();
+        self.ht3.resize_or_grow_zeroed(n_ht3);
+        self.dirty_ht3 = if h3_realloc {
+            n_ht3
+        } else {
+            self.dirty_ht3.max(n_ht3)
+        };
         self.ht3_shift = (32 - ht3_bits) as u32;
+        let span = data.len() - buf_start;
+        let gap = 2usize;
+        if self.max_vpos_used == 0 {
+            self.vpos_base = 1;
+        } else if self.max_vpos_used.saturating_add(gap).saturating_add(span)
+            < (u32::MAX as usize) - 2
+        {
+            self.vpos_base = self.max_vpos_used + gap;
+        } else {
+            self.buckets
+                .prefix_of_capacity_mut(self.dirty_buckets)
+                .fill(0);
+            self.ht3.prefix_of_capacity_mut(self.dirty_ht3).fill([0; 4]);
+            self.dirty_buckets = n_buckets;
+            self.dirty_ht3 = n_ht3;
+            self.vpos_base = 1;
+        }
+        self.buf_origin = buf_start;
+        self.max_vpos_used = self.vpos_base + span;
         (self.ring_mask, self.comp_cap) = (ring_cap - 1, comp_cap);
         self.inc = (cur_id, data.len(), buf_start, buf_start);
         (self.prev_rep_dist, self.prev_rep_end) = (0, 0);
@@ -777,17 +811,19 @@ impl MatchGenScratch {
         };
         let h3 = (u32::from_le_bytes([b0, b1, b2, 0]).wrapping_mul(HASH_MUL32) >> self.ht3_shift)
             as usize;
-        let (row, new_p1) = (&mut self.ht3[h3], (pos + 1) as u32);
+        let new_p1 = (self.vpos_base + (pos - self.buf_origin)) as u32;
+        let row = &mut self.ht3[h3];
         for i in 0..4 {
             let p1 = row[i];
-            let d = pos.wrapping_sub((p1 as usize).wrapping_sub(1));
-            if p1 == 0 || d > max_d3 {
+            let d = new_p1.wrapping_sub(p1);
+            if p1 == 0 || d == 0 || (d as usize) > max_d3 {
                 break;
             }
-            if data[pos - d..pos - d + 3] == [b0, b1, b2] {
+            let du = d as usize;
+            if data[pos - du..pos - du + 3] == [b0, b1, b2] {
                 row.copy_within(..i, 1);
                 row[0] = new_p1;
-                return d as u32;
+                return d;
             }
         }
         *row = [new_p1, row[0], row[1], row[2]];
@@ -812,8 +848,9 @@ impl MatchGenScratch {
         }
         let w4_be = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap());
         let h4 = (w4_be.swap_bytes().wrapping_mul(HASH_MUL32) >> self.bucket_shift) as usize;
+        let cur_p1 = (self.vpos_base + (pos - self.buf_origin)) as u32;
         let prev_root = self.buckets[h4];
-        self.buckets[h4] = (pos + 1) as u32;
+        self.buckets[h4] = cur_p1;
 
         let my_node = (pos & self.ring_mask) << 1;
         if prev_root == 0 || max_dist == 0 {
@@ -826,7 +863,7 @@ impl MatchGenScratch {
 
         if pos + comp_cap < self.prev_rep_end {
             let rep_d = self.prev_rep_dist;
-            if rep_d > 0 && rep_d <= max_dist && (prev_root as usize) + rep_d == pos + 1 {
+            if rep_d > 0 && rep_d <= max_dist && cur_p1.wrapping_sub(prev_root) == rep_d as u32 {
                 let lim_end = if rep_d == 1 {
                     data_len
                 } else {
@@ -862,11 +899,11 @@ impl MatchGenScratch {
 
         let (mut cand_p1, mut depth) = (prev_root, 0usize);
         while cand_p1 != 0 {
-            let cand = (cand_p1 - 1) as usize;
-            let dist = pos - cand;
-            if dist > max_dist || depth >= max_depth {
+            let dist = cur_p1.wrapping_sub(cand_p1) as usize;
+            if dist == 0 || dist > max_dist || depth >= max_depth {
                 break;
             }
+            let cand = pos - dist;
             let (cand_node, skip) = ((cand & self.ring_mask) << 1, min_l.min(min_r));
             let cw4 = if skip < 4 {
                 u32::from_be_bytes(data[cand..cand + 4].try_into().unwrap())

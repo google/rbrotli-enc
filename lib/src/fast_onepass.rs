@@ -1888,9 +1888,9 @@ fn drive_fast_chunks(
     }
 }
 
-/// Compact, zero-intermediate-buffer one-pass Brotli encoder (`Q0`).
-pub(crate) struct OnePassEncoder {
-    ht: HashTable,
+/// Hash-table-free state for [`OnePassEncoder`] (`Q0`) so it can share a [`HashTable`] across
+/// qualities in [`crate::Encoder`].
+pub(crate) struct OnePassCore {
     icd_buf: Option<Box<IcdTables>>,
     rolling_buf: HugePageBuf<RollingHist>,
     icd_adapted: bool,
@@ -1901,11 +1901,10 @@ pub(crate) struct OnePassEncoder {
     mls: u8,
 }
 
-impl OnePassEncoder {
+impl OnePassCore {
     pub(crate) fn new(wbits: usize) -> Self {
         let _ = fixed_bank();
         Self {
-            ht: HashTable::new(),
             icd_buf: None,
             rolling_buf: HugePageBuf::new(),
             icd_adapted: false,
@@ -1925,25 +1924,19 @@ impl OnePassEncoder {
         self.icd_age = 0;
     }
 
-    pub(crate) fn configure(&mut self, mls: u8, log: u32) {
+    pub(crate) fn configure(&mut self, ht: &mut HashTable, mls: u8, log: u32) {
         assert!(matches!(mls, 4 | 5));
         self.mls = mls;
-        self.ht.configure_layout(self.pos_bits, 1, 1, log, log);
+        ht.configure_layout(self.pos_bits, 1, 1, log, log);
     }
 
-    pub(crate) fn with_params(wbits: usize, mls: u8, log: u32) -> Self {
-        let mut enc = Self::new(wbits);
-        enc.configure(mls, log);
-        enc
-    }
-
-    fn has_sampled_match(&self, span: ChunkSpan<'_>) -> bool {
+    fn has_sampled_match(&self, ht: &HashTable, span: ChunkSpan<'_>) -> bool {
         let (prefix, chunk_start, chunk_len) =
             (span.prefix, span.start, span.prefix.len() - span.start);
-        let vpos_base = self.ht.next_vpos.wrapping_sub(chunk_start);
+        let vpos_base = ht.next_vpos.wrapping_sub(chunk_start);
         let base_stride = ((chunk_len - 24) / 16) & !15;
         let mut local_pos = [u32::MAX; 128];
-        let (log, mls) = (self.ht.log, self.mls);
+        let (log, mls) = (ht.log, self.mls);
         let shift = 64 - log;
         let mask = (1usize << log) - 1;
         let mls_usize = mls as usize;
@@ -1953,7 +1946,7 @@ impl OnePassEncoder {
             let pos = chunk_start + i * base_stride;
             let w = load_u64_at(prefix, pos);
             let p64 = hash_single_p64(true, mls, w, log).0;
-            let prev = self.ht.table[((p64 >> shift) as usize) & mask] & pos_mask;
+            let prev = ht.table[((p64 >> shift) as usize) & mask] & pos_mask;
             let dist = if prev != 0 {
                 (vpos_base.wrapping_add(pos) as u32).wrapping_sub(prev)
             } else {
@@ -1988,13 +1981,14 @@ impl OnePassEncoder {
     #[inline(always)]
     fn emit_uncompressed_chunk(
         &mut self,
+        ht: &mut HashTable,
         span: ChunkSpan<'_>,
         is_final: bool,
         bw: &mut BitWriter,
     ) -> (usize, bool) {
         (
             span.prefix.len(),
-            emit_uncompressed_fast_chunk(&mut self.ht, (true, true, self.mls), span, is_final, bw),
+            emit_uncompressed_fast_chunk(ht, (true, true, self.mls), span, is_final, bw),
         )
     }
 
@@ -2003,6 +1997,7 @@ impl OnePassEncoder {
     #[allow(clippy::too_many_arguments)]
     fn build_dyn_lit_lut_and_header<D: SimdDescriptor>(
         &self,
+        ht: &HashTable,
         d: D,
         hd: bool,
         span: &mut ChunkSpan<'_>,
@@ -2022,7 +2017,7 @@ impl OnePassEncoder {
             let sum_sq: u64 = raw_sample.iter().map(|&c| (c as u64) * (c as u64)).sum();
             if !hd
                 && 256 * sum_sq <= sample_n * sample_n + 88 * sample_n
-                && !self.has_sampled_match(*span)
+                && !self.has_sampled_match(ht, *span)
             {
                 return None;
             }
@@ -2067,7 +2062,7 @@ impl OnePassEncoder {
             sample_n = (blocks * BSIZE) as u64;
             let sum_sq: u32 = raw_sample.iter().map(|&c| c * c).sum();
             let max_sum_sq: u32 = if blocks == 16 { 5_440 } else { 19_200 };
-            if !hd && sum_sq <= max_sum_sq && !self.has_sampled_match(*span) {
+            if !hd && sum_sq <= max_sum_sq && !self.has_sampled_match(ht, *span) {
                 return None;
             }
             let present_rows = if chunk_len > 32_768 {
@@ -2108,6 +2103,7 @@ impl OnePassEncoder {
     #[inline(never)]
     fn encode_one_chunk<D: SimdDescriptor>(
         &mut self,
+        ht: &mut HashTable,
         d: D,
         hd: bool,
         mut span: ChunkSpan<'_>,
@@ -2120,7 +2116,7 @@ impl OnePassEncoder {
         let mut chunk_len = raw_chunk.len();
         let mut is_final = is_eof && span.prefix.len() == range_end;
         if !hd && chunk_len <= 56 {
-            return self.emit_uncompressed_chunk(span, is_final, bw);
+            return self.emit_uncompressed_chunk(ht, span, is_final, bw);
         }
 
         let lw = self.lw;
@@ -2142,6 +2138,7 @@ impl OnePassEncoder {
         } else {
             let header_icd = adapted_icd.unwrap_or(&bank.icd[di]);
             let Some(he) = self.build_dyn_lit_lut_and_header(
+                ht,
                 d,
                 hd,
                 &mut span,
@@ -2150,7 +2147,7 @@ impl OnePassEncoder {
                 header_icd,
                 &mut dyn_lut,
             ) else {
-                return self.emit_uncompressed_chunk(span, is_final, bw);
+                return self.emit_uncompressed_chunk(ht, span, is_final, bw);
             };
             high_ent_lits = he;
             raw_chunk = &span.prefix[span.start..];
@@ -2171,8 +2168,8 @@ impl OnePassEncoder {
                 None => &bank.icd[di],
             };
 
-        self.ht.ensure_vpos_capacity(span.eff_wsize, chunk_len);
-        let vpos_base = self.ht.next_vpos.wrapping_sub(span.start);
+        ht.ensure_vpos_capacity(span.eff_wsize, chunk_len);
+        let vpos_base = ht.next_vpos.wrapping_sub(span.start);
         let mls = self.mls;
         let abort_uncomp = {
             let rolling = if track {
@@ -2182,7 +2179,7 @@ impl OnePassEncoder {
             } else {
                 None
             };
-            let ts = self.ht.slices1_mut();
+            let ts = ht.slices1_mut();
             let init = OnePassInit {
                 bw,
                 lit_lut,
@@ -2242,8 +2239,8 @@ impl OnePassEncoder {
                 ),
             }
         };
-        self.ht.next_vpos += chunk_len;
-        self.ht.max_vpos_used = self.ht.next_vpos;
+        ht.next_vpos += chunk_len;
+        ht.max_vpos_used = ht.next_vpos;
 
         let uncomp = if abort_uncomp || bw.total_bits() - saved_bits > (chunk_len as u64) * 8 + 32 {
             bw.restore(cp);
@@ -2265,6 +2262,27 @@ impl OnePassEncoder {
             false
         };
         (span.prefix.len(), uncomp)
+    }
+}
+
+/// Compact, zero-intermediate-buffer one-pass Brotli encoder (`Q0`).
+pub(crate) struct OnePassEncoder {
+    ht: HashTable,
+    core: OnePassCore,
+}
+
+impl OnePassEncoder {
+    pub(crate) fn new(wbits: usize) -> Self {
+        Self {
+            ht: HashTable::new(),
+            core: OnePassCore::new(wbits),
+        }
+    }
+
+    pub(crate) fn with_params(wbits: usize, mls: u8, log: u32) -> Self {
+        let mut enc = Self::new(wbits);
+        enc.core.configure(&mut enc.ht, mls, log);
+        enc
     }
 }
 
@@ -2517,11 +2535,9 @@ def_twopass_p2!(
     }
 );
 
-/// Zero-copy 2-pass chunked Brotli encoder (`Q1..=Q2`): Pass 1 emits compact 24-byte `FastCmd`s
-/// and exact symbol histograms; Pass 2 builds exact 15-bit Huffman trees and streams literals
-/// directly from the input slice without intermediate literal/symbol buffers.
-pub(crate) struct FastTwoPassEncoder {
-    ht: HashTable,
+/// Hash-table-free state for [`FastTwoPassEncoder`] (`Q1`) so it can share a [`HashTable`] across
+/// qualities in [`crate::Encoder`].
+pub(crate) struct FastTwoPassCore {
     cmds: Vec<FastCmd>,
     ldm_spans: Vec<FastLdmSpan>,
     scratch: HugePageBuf<TwoPassScratch>,
@@ -2532,11 +2548,10 @@ pub(crate) struct FastTwoPassEncoder {
     mls: u8,
 }
 
-impl FastTwoPassEncoder {
+impl FastTwoPassCore {
     pub(crate) fn new(mode: u8, wbits: usize, chunk_size: usize) -> Self {
         debug_assert!((1..=2).contains(&mode));
         Self {
-            ht: HashTable::new(),
             cmds: Vec::new(),
             ldm_spans: Vec::new(),
             scratch: HugePageBuf::new(),
@@ -2553,22 +2568,53 @@ impl FastTwoPassEncoder {
         self.lw = wbits > STD_MAX_WBITS;
     }
 
-    pub(crate) fn configure_with_pos_bits(&mut self, pos_bits: u8, mls: u8, log: u32, slog: u32) {
+    pub(crate) fn configure_with_pos_bits(
+        &mut self,
+        ht: &mut HashTable,
+        pos_bits: u8,
+        mls: u8,
+        log: u32,
+        slog: u32,
+    ) {
         assert!(matches!(mls, 4..=6));
         self.mls = mls;
-        self.ht.configure_layout(pos_bits, 1, 1, log, slog);
+        ht.configure_layout(pos_bits, 1, 1, log, slog);
         if self.mode >= 2 {
-            self.ht.ensure_ht4_near();
+            ht.ensure_ht4_near();
         }
     }
 
-    pub(crate) fn configure_tiered(&mut self, eff_len: usize, mls: u8, log: u32, slog: u32) {
+    pub(crate) fn configure_tiered(
+        &mut self,
+        ht: &mut HashTable,
+        eff_len: usize,
+        mls: u8,
+        log: u32,
+        slog: u32,
+    ) {
         let pos_bits = if eff_len <= COMPACT_LW_STREAM_MAX {
             25
         } else {
             fast_twopass_stream_pos_bits(self.wbits)
         };
-        self.configure_with_pos_bits(pos_bits, mls, log, slog);
+        self.configure_with_pos_bits(ht, pos_bits, mls, log, slog);
+    }
+}
+
+/// Zero-copy 2-pass chunked Brotli encoder (`Q1..=Q2`): Pass 1 emits compact 24-byte `FastCmd`s
+/// and exact symbol histograms; Pass 2 builds exact 15-bit Huffman trees and streams literals
+/// directly from the input slice without intermediate literal/symbol buffers.
+pub(crate) struct FastTwoPassEncoder {
+    ht: HashTable,
+    core: FastTwoPassCore,
+}
+
+impl FastTwoPassEncoder {
+    pub(crate) fn new(mode: u8, wbits: usize, chunk_size: usize) -> Self {
+        Self {
+            ht: HashTable::new(),
+            core: FastTwoPassCore::new(mode, wbits, chunk_size),
+        }
     }
 
     pub(crate) fn with_params(
@@ -2580,7 +2626,13 @@ impl FastTwoPassEncoder {
         slog: u32,
     ) -> Self {
         let mut enc = Self::new(mode, wbits, chunk_size);
-        enc.configure_with_pos_bits(fast_twopass_stream_pos_bits(wbits), mls, log, slog);
+        enc.core.configure_with_pos_bits(
+            &mut enc.ht,
+            fast_twopass_stream_pos_bits(wbits),
+            mls,
+            log,
+            slog,
+        );
         enc
     }
 }
@@ -2887,9 +2939,9 @@ fn encode_twopass_chunk<D: SimdDescriptor>(
     }
 }
 
-impl ChunkStreamEncoder for OnePassEncoder {
+impl ChunkStreamEncoder for (&mut HashTable, &mut OnePassCore) {
     fn wbits(&self) -> usize {
-        self.wbits
+        self.1.wbits
     }
 
     fn chunk_size(&self) -> usize {
@@ -2897,7 +2949,7 @@ impl ChunkStreamEncoder for OnePassEncoder {
     }
 
     fn retain_window(&self, wsize: usize) -> usize {
-        wsize.min(onepass_max_window(self.pos_bits))
+        wsize.min(onepass_max_window(self.1.pos_bits))
     }
 
     fn run_chunks_with_desc<D: SimdDescriptor>(
@@ -2911,13 +2963,14 @@ impl ChunkStreamEncoder for OnePassEncoder {
         bw: &mut BitWriter<'_>,
     ) {
         if prep_len.is_some() {
-            self.icd_age = 0;
-            self.icd_adapted = false;
+            self.1.icd_age = 0;
+            self.1.icd_adapted = false;
         }
-        let raw_wsize = window_size(self.wbits);
+        let raw_wsize = window_size(self.1.wbits);
         let cap_wsize = self.retain_window(raw_wsize);
-        let dict_info = prepare_fast_ht(&mut self.ht, cap_wsize, prep_len, dict);
+        let dict_info = prepare_fast_ht(self.0, cap_wsize, prep_len, dict);
         let (hd, bank, end) = (dict_info.0, fixed_bank(), range.end);
+        let (ht, core) = (&mut *self.0, &mut *self.1);
         drive_fast_chunks(
             (raw_wsize, cap_wsize, ONEPASS_CHUNK_SIZE),
             dict_info,
@@ -2925,18 +2978,45 @@ impl ChunkStreamEncoder for OnePassEncoder {
             data,
             range,
             bw,
-            |span, bw| self.encode_one_chunk(d, hd, span, (is_eof, end), ring, bw, bank),
+            |span, bw| core.encode_one_chunk(ht, d, hd, span, (is_eof, end), ring, bw, bank),
         );
     }
 }
 
-impl ChunkStreamEncoder for FastTwoPassEncoder {
+impl ChunkStreamEncoder for OnePassEncoder {
     fn wbits(&self) -> usize {
-        self.wbits
+        self.core.wbits
     }
 
     fn chunk_size(&self) -> usize {
-        self.chunk_size
+        ONEPASS_CHUNK_SIZE
+    }
+
+    fn retain_window(&self, wsize: usize) -> usize {
+        wsize.min(onepass_max_window(self.core.pos_bits))
+    }
+
+    fn run_chunks_with_desc<D: SimdDescriptor>(
+        &mut self,
+        d: D,
+        ctx: (Option<usize>, bool, usize),
+        data: &[u8],
+        range: core::ops::Range<usize>,
+        dict: Option<&PreparedDictionary>,
+        ring: &mut [u32; 2],
+        bw: &mut BitWriter<'_>,
+    ) {
+        (&mut self.ht, &mut self.core).run_chunks_with_desc(d, ctx, data, range, dict, ring, bw);
+    }
+}
+
+impl ChunkStreamEncoder for (&mut HashTable, &mut FastTwoPassCore) {
+    fn wbits(&self) -> usize {
+        self.1.wbits
+    }
+
+    fn chunk_size(&self) -> usize {
+        self.1.chunk_size
     }
 
     fn run_chunks_with_desc<D: SimdDescriptor>(
@@ -2949,9 +3029,17 @@ impl ChunkStreamEncoder for FastTwoPassEncoder {
         ring: &mut [u32; 2],
         bw: &mut BitWriter<'_>,
     ) {
-        let raw_wsize = window_size(self.wbits);
-        let dict_info = prepare_fast_ht(&mut self.ht, raw_wsize, prep_len, dict);
-        let (hd, chunk_size, end) = (dict_info.0, self.chunk_size, range.end);
+        let raw_wsize = window_size(self.1.wbits);
+        let dict_info = prepare_fast_ht(self.0, raw_wsize, prep_len, dict);
+        let (hd, chunk_size, end, mode, lw, mls) = (
+            dict_info.0,
+            self.1.chunk_size,
+            range.end,
+            self.1.mode,
+            self.1.lw,
+            self.1.mls,
+        );
+        let (ht, core) = (&mut *self.0, &mut *self.1);
         drive_fast_chunks(
             (raw_wsize, raw_wsize, chunk_size),
             dict_info,
@@ -2963,13 +3051,8 @@ impl ChunkStreamEncoder for FastTwoPassEncoder {
                 let chunk_end = span.prefix.len();
                 let uncomp = encode_twopass_chunk(
                     d,
-                    (
-                        &mut self.ht,
-                        &mut self.cmds,
-                        &mut self.ldm_spans,
-                        &mut self.scratch,
-                    ),
-                    (self.mode, self.lw, self.mls, hd, is_eof && chunk_end == end),
+                    (ht, &mut core.cmds, &mut core.ldm_spans, &mut core.scratch),
+                    (mode, lw, mls, hd, is_eof && chunk_end == end),
                     span,
                     ring,
                     bw,
@@ -2977,6 +3060,29 @@ impl ChunkStreamEncoder for FastTwoPassEncoder {
                 (chunk_end, uncomp)
             },
         );
+    }
+}
+
+impl ChunkStreamEncoder for FastTwoPassEncoder {
+    fn wbits(&self) -> usize {
+        self.core.wbits
+    }
+
+    fn chunk_size(&self) -> usize {
+        self.core.chunk_size
+    }
+
+    fn run_chunks_with_desc<D: SimdDescriptor>(
+        &mut self,
+        d: D,
+        ctx: (Option<usize>, bool, usize),
+        data: &[u8],
+        range: core::ops::Range<usize>,
+        dict: Option<&PreparedDictionary>,
+        ring: &mut [u32; 2],
+        bw: &mut BitWriter<'_>,
+    ) {
+        (&mut self.ht, &mut self.core).run_chunks_with_desc(d, ctx, data, range, dict, ring, bw);
     }
 }
 
@@ -3332,11 +3438,11 @@ mod tests {
                 dict_idx: None,
             }
         }
-        assert!(!q0.has_sampled_match(make_span(&sparse)));
+        assert!(!q0.core.has_sampled_match(&q0.ht, make_span(&sparse)));
         let sample_tag = *b"Q0Sample";
         sparse[HI_START + 4..HI_START + 12].copy_from_slice(&sample_tag);
         sparse[HI_START + 20..HI_START + 28].copy_from_slice(&sample_tag);
-        assert!(q0.has_sampled_match(make_span(&sparse)));
+        assert!(q0.core.has_sampled_match(&q0.ht, make_span(&sparse)));
 
         // Build compressible content at `>= 4 GiB` plus a 1024-byte LDM copy from `HIST_START + 8192`
         // (`dist = 81_920 > FAST_LDM_MIN_DIST`), exercising `FastCmd::lit_start`, `FastLdmSpan`,
@@ -3361,7 +3467,8 @@ mod tests {
             write_uncompressed_metablock(&sparse[HIST_START..HI_START], &mut bw);
             let mut ring = INITIAL_RING01;
             let (end, uncomp) = with_simd_256!(use_simd, |d| {
-                enc0.encode_one_chunk(
+                enc0.core.encode_one_chunk(
+                    &mut enc0.ht,
                     d,
                     false,
                     hi_span,
@@ -3378,7 +3485,8 @@ mod tests {
         for (mode, mls) in [(1u8, 6u8), (2u8, 4u8)] {
             let run_tp = |use_simd: bool| {
                 let mut enc = FastTwoPassEncoder::new(mode, 30, FAST_TWOPASS_CHUNK_SIZE);
-                enc.configure_with_pos_bits(29, mls, 13, 13);
+                enc.core
+                    .configure_with_pos_bits(&mut enc.ht, 29, mls, 13, 13);
                 enc.ht.prepare_for_input(524_288, CHUNK * 2);
                 let vpos_hist = enc.ht.next_vpos.wrapping_sub(HIST_START);
                 with_simd_256!(use_simd, |d| {
@@ -3390,7 +3498,7 @@ mod tests {
                         HI_START - INTERIOR_MARGIN,
                         524_288,
                         vpos_hist,
-                        &mut enc.ldm_spans,
+                        &mut enc.core.ldm_spans,
                     );
                 });
                 enc.ht.next_vpos += CHUNK;
@@ -3406,9 +3514,9 @@ mod tests {
                         d,
                         (
                             &mut enc.ht,
-                            &mut enc.cmds,
-                            &mut enc.ldm_spans,
-                            &mut enc.scratch,
+                            &mut enc.core.cmds,
+                            &mut enc.core.ldm_spans,
+                            &mut enc.core.scratch,
                         ),
                         (mode, true, mls, false, true),
                         hi_span,
@@ -3417,7 +3525,7 @@ mod tests {
                     )
                 });
                 assert!(!uncomp);
-                assert!(!enc.ldm_spans.is_empty());
+                assert!(!enc.core.ldm_spans.is_empty());
                 bw.finalize().to_vec()
             };
             let out_s = run_tp(false);

@@ -773,18 +773,17 @@ fn prescreen_dist_params(
     entropy_fp16 + (hdr_bits << 16)
 }
 
-/// Fast 15-candidate sampled entropy selector for `Q6..=Q9` unsplit metablocks.
-pub(crate) fn select_distance_params_from_samples(
+/// Fast 15-candidate sampled entropy selector for `Q6..=Q9` unsplit metablocks using caller scratch.
+pub(crate) fn select_distance_params_from_samples_with_scratch(
     samples: &[(u8, u32)],
     raw_seen: usize,
     max_raw_d: u32,
     large_window: bool,
+    counts: &mut [[u32; MAX_HUFFMAN_ALPHABET]; 2],
 ) -> (u8, u8) {
     if raw_seen < 48 || samples.len() < 24 {
         return (0, 0);
     }
-    let mut counts_buf = HugePageBuf::<[[u32; MAX_HUFFMAN_ALPHABET]; 2]>::new_zeroed(1);
-    let counts = &mut counts_buf[0];
     #[rustfmt::skip]
     const CANDIDATES: [(u8, u8); 15] = [
         (0, 0), (0, 4), (0, 8), (0, 12), (0, 15),
@@ -820,6 +819,27 @@ pub(crate) fn select_distance_params_from_samples(
     } else {
         (0, 0)
     }
+}
+
+/// Fast 15-candidate sampled entropy selector for `Q6..=Q9` unsplit metablocks.
+#[cfg(test)]
+pub(crate) fn select_distance_params_from_samples(
+    samples: &[(u8, u32)],
+    raw_seen: usize,
+    max_raw_d: u32,
+    large_window: bool,
+) -> (u8, u8) {
+    if raw_seen < 48 || samples.len() < 24 {
+        return (0, 0);
+    }
+    let mut counts_buf = HugePageBuf::<[[u32; MAX_HUFFMAN_ALPHABET]; 2]>::new_zeroed(1);
+    select_distance_params_from_samples_with_scratch(
+        samples,
+        raw_seen,
+        max_raw_d,
+        large_window,
+        &mut counts_buf[0],
+    )
 }
 
 /// Full-grid prescreen -> top-K exact 4-context pricing for `Q10..=Q12` metablocks.

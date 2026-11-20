@@ -326,7 +326,7 @@ pub(crate) fn canonicalize_cmap_ids(cmap: &mut [u8], first_nonempty: Option<usiz
 /// adapted from `jxl-rs` (`fast_math::fast_log2f`). Max error `< 2e-6` bits; zero lookup tables.
 #[inline(always)]
 #[allow(clippy::excessive_precision)]
-pub(crate) fn fast_log2f(x: f32) -> f32 {
+pub(crate) const fn fast_log2f(x: f32) -> f32 {
     const LOG2F_P: [f32; 3] = [
         -1.8503833400518310e-6,
         1.4287160470083755,
@@ -345,18 +345,169 @@ pub(crate) fn fast_log2f(x: f32) -> f32 {
     yp / yq + (exp_shifted as f32)
 }
 
+const XLOG2X_SMALL: [u32; 512] = {
+    let mut tbl = [0u32; 512];
+    let mut i = 2usize;
+    while i < 512 {
+        tbl[i] = ((i as f64) * (fast_log2f(i as f32) as f64) * 65536.0 + 0.5) as u32;
+        i += 1;
+    }
+    tbl
+};
+
 /// Computes `x * log2(x)` in `FP16` fixed-point bits (`65536 == 1.0 bit`, `< 2e-6` bits/sym error).
 #[inline(always)]
 pub(crate) fn xlog2x_fp16(x: u32) -> u64 {
-    if x <= 1 {
-        0
-    } else {
-        ((x as f64) * (fast_log2f(x as f32) as f64) * 65536.0 + 0.5) as u64
+    if let Some(&v) = XLOG2X_SMALL.get(x as usize) {
+        return v as u64;
     }
+    ((x as f64) * (fast_log2f(x as f32) as f64) * 65536.0 + 0.5) as u64
+}
+
+/// Reusable scratch buffers for flat-stride histogram clustering (`0` steady-state heap allocs).
+#[derive(Default)]
+pub(crate) struct ClusterScratch {
+    pub(crate) hists: Vec<u32>,
+    pub(crate) tots: Vec<u32>,
+    pub(crate) cmap: Vec<u8>,
+    seeds: Vec<u32>,
+    seed_tots: Vec<u32>,
+    used: Vec<bool>,
+    hd: Vec<i32>,
 }
 
 /// Flat-stride farthest-first histogram clustering with online center updates
-/// and optional first-appearance canonicalization (`CANONICALIZE`).
+/// and optional first-appearance canonicalization (`CANONICALIZE`), reusing `scratch`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cluster_flat_into<const CANONICALIZE: bool>(
+    scratch: &mut ClusterScratch,
+    hists: &[u32],
+    totals: &[u32],
+    alpha: usize,
+    max_clusters: usize,
+    min_gain: i32,
+    seed_dist: impl Fn(&[u32], u32, &[u32], u32) -> i32,
+    assign_dist: impl Fn(&[u32], u32, &[u32], u32) -> i32,
+) {
+    let n = totals.len();
+    assert!(n > 0 && hists.len() == n * alpha);
+    let max_clusters = max_clusters.clamp(1, 256);
+    scratch.used.clear();
+    scratch.used.resize(n, false);
+    scratch.cmap.clear();
+    scratch.cmap.resize(n, 0);
+    scratch.seeds.clear();
+    scratch.seed_tots.clear();
+
+    let seed0 = (0..n).max_by_key(|&i| totals[i]).unwrap_or(0);
+    scratch
+        .seeds
+        .extend_from_slice(&hists[seed0 * alpha..(seed0 + 1) * alpha]);
+    scratch.seed_tots.push(totals[seed0]);
+    scratch.used[seed0] = true;
+    scratch.cmap[seed0] = 0;
+
+    if scratch.seed_tots[0] == 0 {
+        scratch.hists.clear();
+        scratch.hists.extend_from_slice(&scratch.seeds);
+        scratch.tots.clear();
+        scratch.tots.extend_from_slice(&scratch.seed_tots);
+        return;
+    }
+
+    scratch.hd.clear();
+    scratch
+        .hd
+        .extend(totals.iter().map(|&t| if t > 0 { i32::MAX } else { 0 }));
+    scratch.hd[seed0] = 0;
+
+    while scratch.seed_tots.len() < max_clusters {
+        let last = scratch.seed_tots.len() - 1;
+        let (newest, newest_tot) = (
+            &scratch.seeds[last * alpha..(last + 1) * alpha],
+            scratch.seed_tots[last],
+        );
+        for i in 0..n {
+            if !scratch.used[i] && totals[i] > 0 {
+                let d = seed_dist(
+                    newest,
+                    newest_tot,
+                    &hists[i * alpha..(i + 1) * alpha],
+                    totals[i],
+                );
+                scratch.hd[i] = scratch.hd[i].min(d);
+            }
+        }
+        let (best_idx, gain) = scratch
+            .hd
+            .iter()
+            .copied()
+            .enumerate()
+            .max_by_key(|(_, g)| *g)
+            .unwrap();
+        if gain < min_gain || scratch.used[best_idx] || totals[best_idx] == 0 {
+            break;
+        }
+        scratch.cmap[best_idx] = scratch.seed_tots.len() as u8;
+        scratch
+            .seeds
+            .extend_from_slice(&hists[best_idx * alpha..(best_idx + 1) * alpha]);
+        scratch.seed_tots.push(totals[best_idx]);
+        scratch.used[best_idx] = true;
+        scratch.hd[best_idx] = 0;
+    }
+
+    let k = scratch.seed_tots.len();
+    for i in 0..n {
+        if scratch.used[i] {
+            continue;
+        }
+        let ti = totals[i];
+        if ti == 0 {
+            scratch.cmap[i] = if i > 0 { scratch.cmap[i - 1] } else { 0 };
+            continue;
+        }
+        let hi = &hists[i * alpha..(i + 1) * alpha];
+        let best_c = if k == 1 {
+            0
+        } else {
+            (0..k)
+                .min_by_key(|&c| {
+                    assign_dist(
+                        &scratch.seeds[c * alpha..(c + 1) * alpha],
+                        scratch.seed_tots[c],
+                        hi,
+                        ti,
+                    )
+                })
+                .unwrap_or(0)
+        };
+        scratch.cmap[i] = best_c as u8;
+        scratch.seed_tots[best_c] += ti;
+        add_hist_slice(&mut scratch.seeds[best_c * alpha..(best_c + 1) * alpha], hi);
+    }
+
+    if CANONICALIZE {
+        scratch.hists.clear();
+        scratch.tots.clear();
+        let seeds = &scratch.seeds;
+        let seed_tots = &scratch.seed_tots;
+        let out_hists = &mut scratch.hists;
+        let out_tots = &mut scratch.tots;
+        canonicalize_cmap_with(
+            &mut scratch.cmap,
+            totals.iter().position(|&t| t > 0),
+            |old| {
+                out_hists.extend_from_slice(&seeds[old * alpha..(old + 1) * alpha]);
+                out_tots.push(seed_tots[old]);
+            },
+        );
+    } else {
+        std::mem::swap(&mut scratch.hists, &mut scratch.seeds);
+        std::mem::swap(&mut scratch.tots, &mut scratch.seed_tots);
+    }
+}
+
 pub(crate) fn cluster_flat<const CANONICALIZE: bool>(
     hists: &[u32],
     totals: &[u32],
@@ -366,96 +517,39 @@ pub(crate) fn cluster_flat<const CANONICALIZE: bool>(
     seed_dist: impl Fn(&[u32], u32, &[u32], u32) -> i32,
     assign_dist: impl Fn(&[u32], u32, &[u32], u32) -> i32,
 ) -> (Vec<u32>, Vec<u32>, Vec<u8>) {
-    let n = totals.len();
-    assert!(n > 0 && hists.len() == n * alpha);
-    let max_clusters = max_clusters.clamp(1, 256);
-    let mut used = vec![false; n];
-    let mut cmap = vec![0u8; n];
-    let cap = max_clusters.min(n);
-    let mut seeds = Vec::with_capacity(cap * alpha);
-    let mut seed_tots = Vec::with_capacity(cap);
+    let mut scratch = ClusterScratch::default();
+    cluster_flat_into::<CANONICALIZE>(
+        &mut scratch,
+        hists,
+        totals,
+        alpha,
+        max_clusters,
+        min_gain,
+        seed_dist,
+        assign_dist,
+    );
+    (scratch.hists, scratch.tots, scratch.cmap)
+}
 
-    let seed0 = (0..n).max_by_key(|&i| totals[i]).unwrap_or(0);
-    seeds.extend_from_slice(&hists[seed0 * alpha..(seed0 + 1) * alpha]);
-    seed_tots.push(totals[seed0]);
-    used[seed0] = true;
-    cmap[seed0] = 0;
-
-    if seed_tots[0] == 0 {
-        return (seeds, seed_tots, cmap);
-    }
-
-    let mut hd: Vec<i32> = totals
-        .iter()
-        .map(|&t| if t > 0 { i32::MAX } else { 0 })
-        .collect();
-    hd[seed0] = 0;
-
-    while seed_tots.len() < max_clusters {
-        let last = seed_tots.len() - 1;
-        let (newest, newest_tot) = (&seeds[last * alpha..(last + 1) * alpha], seed_tots[last]);
-        for i in 0..n {
-            if !used[i] && totals[i] > 0 {
-                hd[i] = hd[i].min(seed_dist(
-                    newest,
-                    newest_tot,
-                    &hists[i * alpha..(i + 1) * alpha],
-                    totals[i],
-                ));
-            }
-        }
-        let (best_idx, gain) = hd
-            .iter()
-            .copied()
-            .enumerate()
-            .max_by_key(|(_, g)| *g)
-            .unwrap();
-        if gain < min_gain || used[best_idx] || totals[best_idx] == 0 {
-            break;
-        }
-        cmap[best_idx] = seed_tots.len() as u8;
-        seeds.extend_from_slice(&hists[best_idx * alpha..(best_idx + 1) * alpha]);
-        seed_tots.push(totals[best_idx]);
-        used[best_idx] = true;
-        hd[best_idx] = 0;
-    }
-
-    let k = seed_tots.len();
-    for i in 0..n {
-        if used[i] {
-            continue;
-        }
-        let ti = totals[i];
-        if ti == 0 {
-            cmap[i] = if i > 0 { cmap[i - 1] } else { 0 };
-            continue;
-        }
-        let hi = &hists[i * alpha..(i + 1) * alpha];
-        let best_c = if k == 1 {
-            0
-        } else {
-            (0..k)
-                .min_by_key(|&c| {
-                    assign_dist(&seeds[c * alpha..(c + 1) * alpha], seed_tots[c], hi, ti)
-                })
-                .unwrap_or(0)
-        };
-        cmap[i] = best_c as u8;
-        seed_tots[best_c] += ti;
-        add_hist_slice(&mut seeds[best_c * alpha..(best_c + 1) * alpha], hi);
-    }
-
-    if CANONICALIZE {
-        let mut rh = Vec::with_capacity(seeds.len());
-        let mut rt = Vec::with_capacity(seed_tots.len());
-        canonicalize_cmap_with(&mut cmap, totals.iter().position(|&t| t > 0), |old| {
-            rh.extend_from_slice(&seeds[old * alpha..(old + 1) * alpha]);
-            rt.push(seed_tots[old]);
-        });
-        (rh, rt, cmap)
-    } else {
-        (seeds, seed_tots, cmap)
-    }
+#[inline]
+pub(crate) fn cluster_flat_jsd_into(
+    scratch: &mut ClusterScratch,
+    hists: &[u32],
+    totals: &[u32],
+    alpha: usize,
+    max_clusters: usize,
+    min_gain: i32,
+) {
+    cluster_flat_into::<true>(
+        scratch,
+        hists,
+        totals,
+        alpha,
+        max_clusters,
+        min_gain,
+        histogram_distance_slice,
+        histogram_distance_slice,
+    );
 }
 
 #[inline]

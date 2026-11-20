@@ -129,6 +129,37 @@ bool RBrotliEncCompressWithDict(RBrotliEncoder *encoder,
                                 size_t *out_len);
 
 /**
+ * Compresses `len` bytes at `data` in one shot using a reusable thread-local encoder configured
+ * for `(quality, lgwin)` and optional `dict` (`NULL` = no dictionary; `lgwin == 0` selects `24`).
+ *
+ * Writes into caller-provided `out_data` with entry capacity `*out_len` and stores the
+ * compressed byte count into `*out_len`. Returns `false` on invalid arguments or if `*out_len`
+ * is smaller than the compressed output.
+ *
+ * # Safety
+ * - If non-null, `dict` must be a live `RBrotliEncMakeDictionary` pointer with shared read access.
+ * - If `len > 0`, `data` must point to `len` initialized readable bytes for this call.
+ * - `out_len` must be non-null, aligned, writable, initialized with the byte capacity `*out_len`
+ *   of `out_data`, and must not alias `dict` or `data`.
+ * - `out_data` must be non-null and point to `*out_len` writable bytes that do not alias `dict`,
+ *   `data`, or `out_len`.
+ */
+bool RBrotliEncCompressOneShot(uint32_t quality,
+                               uint32_t lgwin,
+                               const RBrotliDictionary *dict,
+                               const uint8_t *data,
+                               size_t len,
+                               uint8_t *out_data,
+                               size_t *out_len);
+
+/**
+ * Upper bound on compressed byte count for `in_size` input bytes at `quality` (saturates to
+ * `SIZE_MAX` on overflow; one-shot compression returns `false` when this bound exceeds
+ * `SSIZE_MAX`).
+ */
+size_t RBrotliEncMaxRequiredSizeForParams(uint32_t quality, size_t in_size);
+
+/**
  * Upper bound on compressed byte count for `in_size` input bytes (returns `0` if `encoder` is
  * null, and saturates to `SIZE_MAX` on overflow; one-shot `RBrotliEncCompress*` returns `false`
  * when this bound exceeds `SSIZE_MAX`).
@@ -145,6 +176,15 @@ size_t RBrotliEncMaxRequiredSize(const RBrotliEncoder *encoder, size_t in_size);
  * `encoder` must be null or a live `RBrotliEncMakeEncoder*` pointer, not used afterwards.
  */
 void RBrotliEncFreeEncoder(RBrotliEncoder *encoder);
+
+/**
+ * Reconfigures `quality` (`0..=12`) on `encoder` while retaining allocated hash tables, scratch
+ * buffers, and internal output storage across subsequent calls.
+ *
+ * # Safety
+ * If non-null, `encoder` must be a live `RBrotliEncMakeEncoder*` pointer with exclusive access.
+ */
+void RBrotliEncSetQuality(RBrotliEncoder *encoder, uint32_t quality);
 
 /**
  * Reconfigures the LZ77 sliding window (`lgwin` clamped to `10..=30`, `0` selects `24`) for
